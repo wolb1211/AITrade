@@ -357,6 +357,12 @@ def create_mt5_router(
                 server=account.server,
             )
         config = deployment["config"]
+        official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
+        strategy_name = deployment["strategy_name"]
+        strategy_summary = config.get("summary", "")
+        if official_strategy is not None:
+            strategy_name = official_strategy["name"]
+            strategy_summary = official_strategy["summary"]
         return Mt5StrategyInitResponse(
             status="ok",
             protocol_version=1.0,
@@ -364,8 +370,8 @@ def create_mt5_router(
             ea_upgrade_required=False,
             strategy=Mt5StrategyInfo(
                 id=deployment["id"],
-                name=deployment["strategy_name"],
-                summary=config.get("summary", ""),
+                name=strategy_name,
+                summary=strategy_summary,
                 status=deployment["status"],
                 open_data_type=config.get("open_data_type", "kline"),
                 open_kline_count=int(config.get("open_kline_count", 100)),

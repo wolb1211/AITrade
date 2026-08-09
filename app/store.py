@@ -1147,6 +1147,8 @@ class SqliteStore:
         strategy_id = str(payload.get("id") or f"ofs_{uuid4().hex}")
         now = utc_now_iso()
         existing = self.get_official_ai_strategy(strategy_id)
+        strategy_code = str(payload.get("code") or "").strip()
+        strategy_name = str(payload.get("name") or "").strip()
         config = payload.get("default_config")
         if not isinstance(config, dict):
             config = {}
@@ -1184,8 +1186,8 @@ class SqliteStore:
                 """,
                 (
                     strategy_id,
-                    str(payload.get("code") or "").strip(),
-                    str(payload.get("name") or "").strip(),
+                    strategy_code,
+                    strategy_name,
                     str(payload.get("badge") or "Gainlab").strip(),
                     str(payload.get("version") or "1.0").strip(),
                     str(payload.get("status") or "active").strip(),
@@ -1207,6 +1209,15 @@ class SqliteStore:
                     now,
                 ),
             )
+            if strategy_code and strategy_name:
+                connection.execute(
+                    """
+                    UPDATE deployments
+                    SET strategy_name = ?, updated_at = ?
+                    WHERE strategy_code = ?
+                    """,
+                    (strategy_name, now, strategy_code),
+                )
         saved = self.get_official_ai_strategy(strategy_id)
         if saved is None:
             raise RuntimeError("official_strategy_save_failed")
