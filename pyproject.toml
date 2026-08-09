@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gainlab-ai-trading-api"
 version = "0.1.0"
 description = "GainLab AI trading decision API"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115,<1",
     "PyMySQL>=1.1,<2",
