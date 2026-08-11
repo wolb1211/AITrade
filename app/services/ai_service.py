@@ -41,6 +41,7 @@ class AiDecisionClient:
                 "open_logic": deployment["config"].get("open_logic", ""),
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
+                "account": request_payload.account.model_dump(mode="json"),
                 "bid": request_payload.bid,
                 "ask": request_payload.ask,
                 "spread_points": request_payload.spread_points,
@@ -116,6 +117,7 @@ class AiDecisionClient:
                 "position_logic": deployment["config"].get("position_logic", ""),
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
+                "account": request_payload.account.model_dump(mode="json"),
                 "bid": request_payload.bid,
                 "ask": request_payload.ask,
                 "spread_points": request_payload.spread_points,
@@ -208,7 +210,7 @@ class AiDecisionClient:
                 charged_points=int(usage_payload.get("total_tokens") or 0),
             )
             content = _extract_json_object(response_content)
-            self._save_usage(deployment, endpoint, provider_id, model_id, usage, success=True)
+            self._save_usage(deployment, endpoint, provider_id, model_id, usage, request_payload=user_payload, success=True)
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
@@ -219,6 +221,7 @@ class AiDecisionClient:
                 provider_id,
                 model_id,
                 usage,
+                request_payload=user_payload,
                 success=False,
                 error_message=message[:1000],
             )
@@ -280,9 +283,12 @@ class AiDecisionClient:
         model_id: str,
         usage: UsageSummary,
         *,
+        request_payload: dict[str, Any] | None = None,
         success: bool,
         error_message: str = "",
     ) -> None:
+        request_payload = request_payload or {}
+        account = request_payload.get("account") if isinstance(request_payload.get("account"), dict) else {}
         self.store.save_ai_usage_log(
             {
                 "user_id": deployment.get("user_id", ""),
@@ -291,6 +297,10 @@ class AiDecisionClient:
                 "endpoint": endpoint,
                 "provider_id": provider_id,
                 "model_id": model_id,
+                "account_login": str(account.get("login") or ""),
+                "account_server": str(account.get("server") or ""),
+                "symbol": str(request_payload.get("symbol") or "").upper(),
+                "timeframe": str(request_payload.get("timeframe") or "").upper(),
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
                 "total_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens,

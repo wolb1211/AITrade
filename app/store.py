@@ -331,6 +331,10 @@ class SqliteStore:
                     endpoint TEXT NOT NULL DEFAULT '',
                     provider_id TEXT NOT NULL DEFAULT '',
                     model_id TEXT NOT NULL DEFAULT '',
+                    account_login TEXT NOT NULL DEFAULT '',
+                    account_server TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    timeframe TEXT NOT NULL DEFAULT '',
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -393,6 +397,7 @@ class SqliteStore:
             )
             self._ensure_mt5_history_columns(connection)
             self._ensure_decision_columns(connection)
+            self._ensure_ai_usage_columns(connection)
             self._ensure_ai_model_columns(connection)
             self._ensure_official_strategy_seed(connection)
 
@@ -423,6 +428,21 @@ class SqliteStore:
             "account_server": "ALTER TABLE decisions ADD COLUMN account_server TEXT NOT NULL DEFAULT ''",
             "symbol": "ALTER TABLE decisions ADD COLUMN symbol TEXT NOT NULL DEFAULT ''",
             "timeframe": "ALTER TABLE decisions ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+
+    def _ensure_ai_usage_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(ai_usage_logs)").fetchall()
+        }
+        migrations = {
+            "account_login": "ALTER TABLE ai_usage_logs ADD COLUMN account_login TEXT NOT NULL DEFAULT ''",
+            "account_server": "ALTER TABLE ai_usage_logs ADD COLUMN account_server TEXT NOT NULL DEFAULT ''",
+            "symbol": "ALTER TABLE ai_usage_logs ADD COLUMN symbol TEXT NOT NULL DEFAULT ''",
+            "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -1017,6 +1037,9 @@ class SqliteStore:
                 """
                 SELECT
                     deployment_id,
+                    account_login,
+                    account_server,
+                    symbol,
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -1371,7 +1394,7 @@ class SqliteStore:
                 WHERE strategy_code = ?
                   AND created_at >= ?
                   AND created_at <= ?
-                GROUP BY deployment_id
+                GROUP BY deployment_id, account_login, account_server, symbol
                 """,
                 (strategy_code, start_iso, end_iso),
             ).fetchall()
@@ -1530,6 +1553,8 @@ class SqliteStore:
             item["activity_count"] += 1
             item["last_active_at"] = max(str(item["last_active_at"] or ""), str(row["created_at"] or ""))
 
+        usage_account_stats: dict[tuple[str, str, str, str], dict[str, int]] = {}
+        deployment_usage_stats: dict[str, dict[str, int]] = {}
         total_input_tokens = 0
         total_output_tokens = 0
         total_tokens = 0
@@ -1548,11 +1573,45 @@ class SqliteStore:
             total_official_tokens += official_tokens
             total_custom_tokens += custom_tokens
             if item is not None:
-                item["input_tokens"] = input_tokens
-                item["output_tokens"] = output_tokens
-                item["official_tokens"] = official_tokens
-                item["custom_tokens"] = custom_tokens
-                item["total_tokens"] = row_total_tokens
+                deployment_stats = deployment_usage_stats.setdefault(
+                    str(row["deployment_id"] or ""),
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "official_tokens": 0,
+                        "custom_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                )
+                deployment_stats["input_tokens"] += input_tokens
+                deployment_stats["output_tokens"] += output_tokens
+                deployment_stats["official_tokens"] += official_tokens
+                deployment_stats["custom_tokens"] += custom_tokens
+                deployment_stats["total_tokens"] += row_total_tokens
+                account_login = str(row["account_login"] or "")
+                if account_login:
+                    account_server = (
+                        str(row["account_server"] or "")
+                        or preferred_server_by_deployment_login.get((str(row["deployment_id"] or ""), account_login), "")
+                    )
+                    account_symbol = str(row["symbol"] or "").strip().upper()
+                    usage_account_stats[(
+                        str(row["deployment_id"] or ""),
+                        account_login,
+                        account_server,
+                        account_symbol,
+                    )] = {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "official_tokens": official_tokens,
+                        "custom_tokens": custom_tokens,
+                        "total_tokens": row_total_tokens,
+                    }
+
+        for deployment_id, stats in deployment_usage_stats.items():
+            item = by_deployment.get(deployment_id)
+            if item is not None:
+                item.update(stats)
 
         total_pnl = 0.0
         total_close_orders = 0
@@ -1620,22 +1679,36 @@ class SqliteStore:
                     for key in decision_account_stats
                     if key[:3] == account_base_key and key[3]
                 )
-                display_symbols = sorted(symbols) or [""]
-                if not symbols and (*account_base_key, "") in decision_account_stats:
-                    display_symbols = ["未归属"]
+                display_symbols = sorted(symbols)
                 for symbol in display_symbols:
                     account_item = dict(item)
                     account_item["account_login"] = account["login"]
                     account_item["account_provider"] = account["provider"]
                     account_item["account_server"] = account["server"]
                     account_item["account_type"] = account["account_type"]
+                    account_item["analysis_count"] = 0
+                    account_item["signal_count"] = 0
+                    account_item["order_count"] = 0
+                    account_item["input_tokens"] = 0
+                    account_item["output_tokens"] = 0
+                    account_item["official_tokens"] = 0
+                    account_item["custom_tokens"] = 0
+                    account_item["total_tokens"] = 0
+                    account_item["pnl"] = 0.0
+                    account_item["close_order_count"] = 0
                     trade_stats = account_trade_stats.get((*account_base_key, symbol), {})
-                    decision_symbol = "" if symbol == "未归属" else symbol
-                    decision_stats = decision_account_stats.get((*account_base_key, decision_symbol), {})
+                    decision_stats = decision_account_stats.get((*account_base_key, symbol), {})
+                    usage_stats = usage_account_stats.get((*account_base_key, symbol), {})
                     if decision_stats:
                         account_item["analysis_count"] = int(decision_stats.get("analysis_count") or 0)
                         account_item["signal_count"] = int(decision_stats.get("signal_count") or 0)
                         account_item["order_count"] = int(decision_stats.get("order_count") or 0)
+                    if usage_stats:
+                        account_item["input_tokens"] = int(usage_stats.get("input_tokens") or 0)
+                        account_item["output_tokens"] = int(usage_stats.get("output_tokens") or 0)
+                        account_item["official_tokens"] = int(usage_stats.get("official_tokens") or 0)
+                        account_item["custom_tokens"] = int(usage_stats.get("custom_tokens") or 0)
+                        account_item["total_tokens"] = int(usage_stats.get("total_tokens") or 0)
                     account_item["symbol"] = symbol
                     account_item["pnl"] = round(float(trade_stats.get("pnl") or 0), 2)
                     account_item["close_order_count"] = int(trade_stats.get("close_order_count") or 0)
@@ -2425,9 +2498,10 @@ class SqliteStore:
                 """
                 INSERT INTO ai_usage_logs (
                     id, user_id, deployment_id, strategy_code, endpoint,
-                    provider_id, model_id, input_tokens, output_tokens, total_tokens,
+                    provider_id, model_id, account_login, account_server, symbol, timeframe,
+                    input_tokens, output_tokens, total_tokens,
                     official_tokens, custom_tokens, success, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     log_id,
@@ -2437,6 +2511,10 @@ class SqliteStore:
                     str(payload.get("endpoint") or ""),
                     str(payload.get("provider_id") or ""),
                     str(payload.get("model_id") or ""),
+                    str(payload.get("account_login") or ""),
+                    str(payload.get("account_server") or ""),
+                    str(payload.get("symbol") or ""),
+                    str(payload.get("timeframe") or ""),
                     input_tokens,
                     output_tokens,
                     total_tokens,
@@ -2671,6 +2749,7 @@ class MySQLStore(SqliteStore):
         if missing:
             raise RuntimeError(f"mysql_schema_missing_tables:{','.join(missing)}")
         self._ensure_mysql_decision_columns()
+        self._ensure_mysql_ai_usage_columns()
 
     def _ensure_mysql_decision_columns(self) -> None:
         migrations = {
@@ -2686,6 +2765,27 @@ class MySQLStore(SqliteStore):
                 FROM information_schema.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = 'decisions'
+                """,
+            ).fetchall()
+            columns = {str(row["COLUMN_NAME"]) for row in rows}
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
+
+    def _ensure_mysql_ai_usage_columns(self) -> None:
+        migrations = {
+            "account_login": "ALTER TABLE ai_usage_logs ADD COLUMN account_login VARCHAR(64) NOT NULL DEFAULT '' AFTER model_id",
+            "account_server": "ALTER TABLE ai_usage_logs ADD COLUMN account_server VARCHAR(128) NOT NULL DEFAULT '' AFTER account_login",
+            "symbol": "ALTER TABLE ai_usage_logs ADD COLUMN symbol VARCHAR(32) NOT NULL DEFAULT '' AFTER account_server",
+            "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe VARCHAR(16) NOT NULL DEFAULT '' AFTER symbol",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'ai_usage_logs'
                 """,
             ).fetchall()
             columns = {str(row["COLUMN_NAME"]) for row in rows}
