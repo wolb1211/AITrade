@@ -1643,34 +1643,6 @@ class SqliteStore:
                         str(decision_stats.get("last_active_at") or ""),
                     )
                     expanded_deployments.append(account_item)
-                if symbols and any(key[:3] == account_base_key and not key[3] for key in decision_account_stats):
-                    empty_decision_stats = decision_account_stats.get((*account_base_key, ""), {})
-                    primary_symbol = sorted(symbols)[0]
-                    for account_item in expanded_deployments:
-                        if (
-                            account_item.get("id") == deployment_id
-                            and account_item.get("account_login") == account["login"]
-                            and account_item.get("account_server") == account["server"]
-                            and account_item.get("symbol") == primary_symbol
-                        ):
-                            account_item["analysis_count"] = max(
-                                int(account_item.get("analysis_count") or 0),
-                                int(empty_decision_stats.get("analysis_count") or 0),
-                            )
-                            account_item["signal_count"] = max(
-                                int(account_item.get("signal_count") or 0),
-                                int(empty_decision_stats.get("signal_count") or 0),
-                            )
-                            account_item["order_count"] = max(
-                                int(account_item.get("order_count") or 0),
-                                int(empty_decision_stats.get("order_count") or 0),
-                            )
-                            account_item["last_active_at"] = max(
-                                str(account_item.get("last_active_at") or ""),
-                                str(empty_decision_stats.get("last_active_at") or ""),
-                            )
-                            break
-
         expanded_deployments = [
             item
             for item in expanded_deployments
