@@ -1621,6 +1621,8 @@ class SqliteStore:
                     if key[:3] == account_base_key and key[3]
                 )
                 display_symbols = sorted(symbols) or [""]
+                if not symbols and (*account_base_key, "") in decision_account_stats:
+                    display_symbols = ["未归属"]
                 for symbol in display_symbols:
                     account_item = dict(item)
                     account_item["account_login"] = account["login"]
@@ -1628,7 +1630,8 @@ class SqliteStore:
                     account_item["account_server"] = account["server"]
                     account_item["account_type"] = account["account_type"]
                     trade_stats = account_trade_stats.get((*account_base_key, symbol), {})
-                    decision_stats = decision_account_stats.get((*account_base_key, symbol), {})
+                    decision_symbol = "" if symbol == "未归属" else symbol
+                    decision_stats = decision_account_stats.get((*account_base_key, decision_symbol), {})
                     if decision_stats:
                         account_item["analysis_count"] = int(decision_stats.get("analysis_count") or 0)
                         account_item["signal_count"] = int(decision_stats.get("signal_count") or 0)
