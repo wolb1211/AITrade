@@ -204,6 +204,20 @@ def create_api_router(
         for deployment in store.list_web_deployments(user_id):
             config = deployment["config"]
             stats = store.deployment_runtime_stats(deployment["id"])
+            open_ai_provider = config.get("open_ai_provider", "")
+            open_ai_model = config.get("open_ai_model", "")
+            position_ai_provider = config.get("position_ai_provider", "")
+            position_ai_model = config.get("position_ai_model", "")
+            official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
+            if official_strategy is not None:
+                open_model = store.get_ai_model(str(official_strategy.get("open_model_id") or ""))
+                position_model = store.get_ai_model(str(official_strategy.get("position_model_id") or ""))
+                if open_model is not None:
+                    open_ai_provider = open_model["provider_id"]
+                    open_ai_model = open_model["name"]
+                if position_model is not None:
+                    position_ai_provider = position_model["provider_id"]
+                    position_ai_model = position_model["name"]
             deployments.append(
                 WebDeploymentItem(
                     id=deployment["id"],
@@ -216,12 +230,12 @@ def create_api_router(
                     open_logic=config.get("open_logic", ""),
                     position_logic=config.get("position_logic", ""),
                     open_ai_mode=config.get("open_ai_mode", "official"),
-                    open_ai_provider=config.get("open_ai_provider", ""),
-                    open_ai_model=config.get("open_ai_model", ""),
+                    open_ai_provider=open_ai_provider,
+                    open_ai_model=open_ai_model,
                     open_ai_key=config.get("open_ai_key", ""),
                     position_ai_mode=config.get("position_ai_mode", "official"),
-                    position_ai_provider=config.get("position_ai_provider", ""),
-                    position_ai_model=config.get("position_ai_model", ""),
+                    position_ai_provider=position_ai_provider,
+                    position_ai_model=position_ai_model,
                     position_ai_key=config.get("position_ai_key", ""),
                     open_data_type=config.get("open_data_type", "kline"),
                     open_kline_count=int(config.get("open_kline_count", 100)),

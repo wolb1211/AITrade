@@ -180,7 +180,7 @@ class AiDecisionClient:
         system_prompt: str,
         user_payload: dict[str, Any],
     ) -> AiCallResult | None:
-        model = self.store.get_default_ai_model()
+        model = self._select_model(deployment, endpoint)
         if model is None:
             return None
 
@@ -223,6 +223,17 @@ class AiDecisionClient:
                 error_message=message[:1000],
             )
             return None
+
+    def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
+        official_strategy = self.store.get_official_ai_strategy(str(deployment.get("strategy_code") or ""))
+        if official_strategy is not None:
+            model_key = "open_model_id" if endpoint == "open" else "position_model_id"
+            configured_model_id = str(official_strategy.get(model_key) or "").strip()
+            if configured_model_id:
+                model = self.store.get_ai_model(configured_model_id)
+                if model is not None:
+                    return model
+        return self.store.get_default_ai_model()
 
     def _post_chat_completion(
         self,
