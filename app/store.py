@@ -1398,6 +1398,7 @@ class SqliteStore:
                 "account_provider": "",
                 "account_server": "",
                 "account_type": "",
+                "symbol": "",
                 "analysis_count": 0,
                 "signal_count": 0,
                 "order_count": 0,
@@ -1534,8 +1535,12 @@ class SqliteStore:
                     "pnl": 0.0,
                     "close_order_count": 0,
                     "last_active_at": "",
+                    "symbols": set(),
                 },
             )
+            symbol = str(row["symbol"] or "").strip()
+            if symbol:
+                account_stats["symbols"].add(symbol)
             account_stats["pnl"] = round(float(account_stats["pnl"] or 0) + profit, 2)
             account_stats["close_order_count"] = int(account_stats["close_order_count"] or 0) + 1
             account_stats["last_active_at"] = max(
@@ -1563,6 +1568,7 @@ class SqliteStore:
                     (deployment_id, account["login"], account["server"]),
                     {},
                 )
+                account_item["symbol"] = self._format_symbol_set(trade_stats.get("symbols"))
                 account_item["pnl"] = round(float(trade_stats.get("pnl") or 0), 2)
                 account_item["close_order_count"] = int(trade_stats.get("close_order_count") or 0)
                 account_item["last_active_at"] = max(
@@ -2457,6 +2463,16 @@ class SqliteStore:
             key=lambda item: (str(item.get("last_seen_at") or ""), str(item.get("server") or "")),
             reverse=True,
         )
+
+    @staticmethod
+    def _format_symbol_set(symbols: Any) -> str:
+        if not symbols:
+            return ""
+        if isinstance(symbols, set):
+            values = sorted(str(symbol).strip() for symbol in symbols if str(symbol).strip())
+        else:
+            values = [str(symbols).strip()]
+        return ", ".join(values[:4]) + ("..." if len(values) > 4 else "")
 
     @staticmethod
     def _model_row(row: sqlite3.Row) -> dict[str, Any]:
