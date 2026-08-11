@@ -1385,6 +1385,9 @@ class SqliteStore:
                 """
                 SELECT
                     deployment_id,
+                    account_login,
+                    account_server,
+                    symbol,
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -1595,18 +1598,27 @@ class SqliteStore:
                         or preferred_server_by_deployment_login.get((str(row["deployment_id"] or ""), account_login), "")
                     )
                     account_symbol = str(row["symbol"] or "").strip().upper()
-                    usage_account_stats[(
+                    usage_key = (
                         str(row["deployment_id"] or ""),
                         account_login,
                         account_server,
                         account_symbol,
-                    )] = {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "official_tokens": official_tokens,
-                        "custom_tokens": custom_tokens,
-                        "total_tokens": row_total_tokens,
-                    }
+                    )
+                    account_stats = usage_account_stats.setdefault(
+                        usage_key,
+                        {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "official_tokens": 0,
+                            "custom_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    )
+                    account_stats["input_tokens"] += input_tokens
+                    account_stats["output_tokens"] += output_tokens
+                    account_stats["official_tokens"] += official_tokens
+                    account_stats["custom_tokens"] += custom_tokens
+                    account_stats["total_tokens"] += row_total_tokens
 
         for deployment_id, stats in deployment_usage_stats.items():
             item = by_deployment.get(deployment_id)
