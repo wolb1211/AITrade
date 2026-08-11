@@ -1505,6 +1505,7 @@ class SqliteStore:
         total_close_orders = 0
         pnl_buckets: dict[str, float] = {}
         account_trade_stats: dict[tuple[str, str, str], dict[str, Any]] = {}
+        account_symbols: dict[tuple[str, str, str], set[str]] = {}
         for row in history_rows:
             if not _is_profit_deal_entry(str(row["entry"] or "")):
                 continue
@@ -1535,12 +1536,11 @@ class SqliteStore:
                     "pnl": 0.0,
                     "close_order_count": 0,
                     "last_active_at": "",
-                    "symbols": set(),
                 },
             )
             symbol = str(row["symbol"] or "").strip()
             if symbol:
-                account_stats["symbols"].add(symbol)
+                account_symbols.setdefault(account_key, set()).add(symbol)
             account_stats["pnl"] = round(float(account_stats["pnl"] or 0) + profit, 2)
             account_stats["close_order_count"] = int(account_stats["close_order_count"] or 0) + 1
             account_stats["last_active_at"] = max(
@@ -1568,7 +1568,9 @@ class SqliteStore:
                     (deployment_id, account["login"], account["server"]),
                     {},
                 )
-                account_item["symbol"] = self._format_symbol_set(trade_stats.get("symbols"))
+                account_item["symbol"] = self._format_symbol_set(
+                    account_symbols.get((deployment_id, account["login"], account["server"])),
+                )
                 account_item["pnl"] = round(float(trade_stats.get("pnl") or 0), 2)
                 account_item["close_order_count"] = int(trade_stats.get("close_order_count") or 0)
                 account_item["last_active_at"] = max(
