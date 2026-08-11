@@ -2025,10 +2025,7 @@ class SqliteStore:
             ).fetchone()
         if row is None:
             return None
-        data = dict(row)
-        data["enabled"] = bool(data["enabled"])
-        data["is_default"] = bool(data["is_default"])
-        return data
+        return self._private_model_row(row)
 
     def delete_ai_provider(self, provider_id: str) -> None:
         with self._connect() as connection:
@@ -2169,6 +2166,10 @@ class SqliteStore:
         return model
 
     def get_ai_model(self, model_id: str) -> dict[str, Any] | None:
+        model = self.get_private_ai_model(model_id)
+        return self._mask_model_key(model) if model else None
+
+    def get_private_ai_model(self, model_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
@@ -2176,14 +2177,15 @@ class SqliteStore:
                     m.*,
                     p.name AS provider_name,
                     p.provider_type AS provider_type,
-                    COALESCE(NULLIF(m.base_url, ''), p.base_url) AS provider_base_url
+                    COALESCE(NULLIF(m.base_url, ''), p.base_url) AS provider_base_url,
+                    p.api_key AS provider_api_key
                 FROM ai_models m
                 LEFT JOIN ai_providers p ON p.id = m.provider_id
                 WHERE m.id = ?
                 """,
                 (model_id,),
             ).fetchone()
-        return self._model_row(row) if row else None
+        return self._private_model_row(row) if row else None
 
     def delete_ai_model(self, model_id: str) -> None:
         with self._connect() as connection:
@@ -2365,9 +2367,18 @@ class SqliteStore:
 
     @staticmethod
     def _model_row(row: sqlite3.Row) -> dict[str, Any]:
+        return SqliteStore._mask_model_key(SqliteStore._private_model_row(row))
+
+    @staticmethod
+    def _private_model_row(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
         data["enabled"] = bool(data["enabled"])
         data["is_default"] = bool(data["is_default"])
+        return data
+
+    @staticmethod
+    def _mask_model_key(data: dict[str, Any]) -> dict[str, Any]:
+        data = dict(data)
         api_key = str(data.get("provider_api_key") or "")
         data["provider_api_key_masked"] = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("****" if api_key else "")
         data.pop("provider_api_key", None)

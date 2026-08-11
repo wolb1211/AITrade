@@ -230,7 +230,7 @@ class AiDecisionClient:
             model_key = "open_model_id" if endpoint == "open" else "position_model_id"
             configured_model_id = str(official_strategy.get(model_key) or "").strip()
             if configured_model_id:
-                model = self.store.get_ai_model(configured_model_id)
+                model = self.store.get_private_ai_model(configured_model_id)
                 if model is not None:
                     return model
         return self.store.get_default_ai_model()
