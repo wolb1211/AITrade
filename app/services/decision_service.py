@@ -101,5 +101,9 @@ class DecisionService:
             endpoint,
             request.request_id,
             payload,
+            account_login=request.account.login,
+            account_server=request.account.server,
+            symbol=request.symbol.upper(),
+            timeframe=request.timeframe.upper(),
         )
         return TradeDecision.model_validate(saved)

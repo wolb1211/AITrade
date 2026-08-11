@@ -229,6 +229,10 @@ class SqliteStore:
                     deployment_id TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
                     request_id TEXT NOT NULL,
+                    account_login TEXT NOT NULL DEFAULT '',
+                    account_server TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    timeframe TEXT NOT NULL DEFAULT '',
                     response_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(deployment_id, endpoint, request_id),
@@ -388,6 +392,7 @@ class SqliteStore:
                 """
             )
             self._ensure_mt5_history_columns(connection)
+            self._ensure_decision_columns(connection)
             self._ensure_ai_model_columns(connection)
             self._ensure_official_strategy_seed(connection)
 
@@ -407,6 +412,21 @@ class SqliteStore:
                 connection.execute(statement)
         connection.execute("UPDATE mt5_history_deals SET close_price = price WHERE close_price = 0 AND price != 0")
         connection.execute("UPDATE mt5_history_deals SET close_time = deal_time WHERE close_time = 0 AND deal_time != 0")
+
+    def _ensure_decision_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(decisions)").fetchall()
+        }
+        migrations = {
+            "account_login": "ALTER TABLE decisions ADD COLUMN account_login TEXT NOT NULL DEFAULT ''",
+            "account_server": "ALTER TABLE decisions ADD COLUMN account_server TEXT NOT NULL DEFAULT ''",
+            "symbol": "ALTER TABLE decisions ADD COLUMN symbol TEXT NOT NULL DEFAULT ''",
+            "timeframe": "ALTER TABLE decisions ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
 
     def _ensure_ai_model_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -1321,7 +1341,15 @@ class SqliteStore:
             ]
             decision_rows = connection.execute(
                 """
-                SELECT decision.deployment_id, decision.endpoint, decision.response_json, decision.created_at
+                SELECT
+                    decision.deployment_id,
+                    decision.endpoint,
+                    decision.account_login,
+                    decision.account_server,
+                    decision.symbol,
+                    decision.timeframe,
+                    decision.response_json,
+                    decision.created_at
                 FROM decisions decision
                 JOIN deployments dep ON dep.id = decision.deployment_id
                 WHERE dep.strategy_code = ?
@@ -1449,6 +1477,7 @@ class SqliteStore:
         total_signals = 0
         total_orders = 0
         active_deployments: set[str] = set()
+        decision_account_stats: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         for row in decision_rows:
             item = by_deployment.get(row["deployment_id"])
             if item is None:
@@ -1469,6 +1498,29 @@ class SqliteStore:
             if row["endpoint"] == "open" and action in {"BUY", "SELL"}:
                 item["order_count"] += 1
                 total_orders += 1
+            account_login = str(row["account_login"] or "")
+            if account_login:
+                account_server = (
+                    str(row["account_server"] or "")
+                    or preferred_server_by_deployment_login.get((str(row["deployment_id"] or ""), account_login), "")
+                )
+                account_symbol = str(row["symbol"] or "").strip().upper()
+                account_key = (str(row["deployment_id"] or ""), account_login, account_server, account_symbol)
+                account_stat = decision_account_stats.setdefault(
+                    account_key,
+                    {
+                        "analysis_count": 0,
+                        "signal_count": 0,
+                        "order_count": 0,
+                        "last_active_at": "",
+                    },
+                )
+                account_stat["analysis_count"] = int(account_stat["analysis_count"] or 0) + 1
+                account_stat["last_active_at"] = max(str(account_stat["last_active_at"] or ""), str(row["created_at"] or ""))
+                if action and action != "HOLD":
+                    account_stat["signal_count"] = int(account_stat["signal_count"] or 0) + 1
+                if row["endpoint"] == "open" and action in {"BUY", "SELL"}:
+                    account_stat["order_count"] = int(account_stat["order_count"] or 0) + 1
 
         for row in activity_rows:
             item = by_deployment.get(row["deployment_id"])
@@ -1505,7 +1557,7 @@ class SqliteStore:
         total_pnl = 0.0
         total_close_orders = 0
         pnl_buckets: dict[str, float] = {}
-        account_trade_stats: dict[tuple[str, str, str], dict[str, Any]] = {}
+        account_trade_stats: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         account_symbols: dict[tuple[str, str, str], set[str]] = {}
         for row in history_rows:
             if not _is_profit_deal_entry(str(row["entry"] or "")):
@@ -1522,7 +1574,8 @@ class SqliteStore:
                 item["last_active_at"] = max(str(item["last_active_at"] or ""), str(row["updated_at"] or ""))
                 item["pnl"] = round(float(item["pnl"]) + profit, 2)
                 item["close_order_count"] += 1
-            account_key = (
+            symbol = str(row["symbol"] or "").strip().upper()
+            account_base_key = (
                 str(row["deployment_id"] or ""),
                 str(row["account_login"] or ""),
                 str(row["account_server"] or "")
@@ -1531,6 +1584,7 @@ class SqliteStore:
                     "",
                 ),
             )
+            account_key = (*account_base_key, symbol)
             account_stats = account_trade_stats.setdefault(
                 account_key,
                 {
@@ -1539,9 +1593,8 @@ class SqliteStore:
                     "last_active_at": "",
                 },
             )
-            symbol = str(row["symbol"] or "").strip()
             if symbol:
-                account_symbols.setdefault(account_key, set()).add(symbol)
+                account_symbols.setdefault(account_base_key, set()).add(symbol)
             account_stats["pnl"] = round(float(account_stats["pnl"] or 0) + profit, 2)
             account_stats["close_order_count"] = int(account_stats["close_order_count"] or 0) + 1
             account_stats["last_active_at"] = max(
@@ -1560,26 +1613,36 @@ class SqliteStore:
                 expanded_deployments.append(item)
                 continue
             for account in accounts:
-                account_item = dict(item)
-                account_item["account_login"] = account["login"]
-                account_item["account_provider"] = account["provider"]
-                account_item["account_server"] = account["server"]
-                account_item["account_type"] = account["account_type"]
-                trade_stats = account_trade_stats.get(
-                    (deployment_id, account["login"], account["server"]),
-                    {},
+                account_base_key = (deployment_id, account["login"], account["server"])
+                symbols = set(account_symbols.get(account_base_key) or set())
+                symbols.update(
+                    key[3]
+                    for key in decision_account_stats
+                    if key[:3] == account_base_key and key[3]
                 )
-                account_item["symbol"] = self._format_symbol_set(
-                    account_symbols.get((deployment_id, account["login"], account["server"])),
-                )
-                account_item["pnl"] = round(float(trade_stats.get("pnl") or 0), 2)
-                account_item["close_order_count"] = int(trade_stats.get("close_order_count") or 0)
-                account_item["last_active_at"] = max(
-                    str(account_item.get("last_active_at") or ""),
-                    str(account.get("last_seen_at") or ""),
-                    str(trade_stats.get("last_active_at") or ""),
-                )
-                expanded_deployments.append(account_item)
+                display_symbols = sorted(symbols) or [""]
+                for symbol in display_symbols:
+                    account_item = dict(item)
+                    account_item["account_login"] = account["login"]
+                    account_item["account_provider"] = account["provider"]
+                    account_item["account_server"] = account["server"]
+                    account_item["account_type"] = account["account_type"]
+                    trade_stats = account_trade_stats.get((*account_base_key, symbol), {})
+                    decision_stats = decision_account_stats.get((*account_base_key, symbol), {})
+                    if decision_stats:
+                        account_item["analysis_count"] = int(decision_stats.get("analysis_count") or 0)
+                        account_item["signal_count"] = int(decision_stats.get("signal_count") or 0)
+                        account_item["order_count"] = int(decision_stats.get("order_count") or 0)
+                    account_item["symbol"] = symbol
+                    account_item["pnl"] = round(float(trade_stats.get("pnl") or 0), 2)
+                    account_item["close_order_count"] = int(trade_stats.get("close_order_count") or 0)
+                    account_item["last_active_at"] = max(
+                        str(account_item.get("last_active_at") or ""),
+                        str(account.get("last_seen_at") or ""),
+                        str(trade_stats.get("last_active_at") or ""),
+                        str(decision_stats.get("last_active_at") or ""),
+                    )
+                    expanded_deployments.append(account_item)
 
         deployments_list = sorted(
             expanded_deployments,
@@ -1684,6 +1747,11 @@ class SqliteStore:
         endpoint: str,
         request_id: str,
         response: dict[str, Any],
+        *,
+        account_login: str = "",
+        account_server: str = "",
+        symbol: str = "",
+        timeframe: str = "",
     ) -> dict[str, Any]:
         with self._connect() as connection:
             try:
@@ -1691,14 +1759,19 @@ class SqliteStore:
                     """
                     INSERT INTO decisions (
                         id, deployment_id, endpoint, request_id,
+                        account_login, account_server, symbol, timeframe,
                         response_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         response["decision_id"],
                         deployment_id,
                         endpoint,
                         request_id,
+                        account_login,
+                        account_server,
+                        symbol,
+                        timeframe,
                         json.dumps(response),
                         utc_now_iso(),
                     ),
@@ -2584,3 +2657,25 @@ class MySQLStore(SqliteStore):
         missing = sorted(required_tables - existing)
         if missing:
             raise RuntimeError(f"mysql_schema_missing_tables:{','.join(missing)}")
+        self._ensure_mysql_decision_columns()
+
+    def _ensure_mysql_decision_columns(self) -> None:
+        migrations = {
+            "account_login": "ALTER TABLE decisions ADD COLUMN account_login VARCHAR(64) NOT NULL DEFAULT '' AFTER request_id",
+            "account_server": "ALTER TABLE decisions ADD COLUMN account_server VARCHAR(128) NOT NULL DEFAULT '' AFTER account_login",
+            "symbol": "ALTER TABLE decisions ADD COLUMN symbol VARCHAR(32) NOT NULL DEFAULT '' AFTER account_server",
+            "timeframe": "ALTER TABLE decisions ADD COLUMN timeframe VARCHAR(16) NOT NULL DEFAULT '' AFTER symbol",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'decisions'
+                """,
+            ).fetchall()
+            columns = {str(row["COLUMN_NAME"]) for row in rows}
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
