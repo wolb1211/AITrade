@@ -814,33 +814,36 @@ class SqliteStore:
                 (deployment_id, start_ts, end_ts),
             ).fetchall()
 
-        account_map = {
-            (str(row["login"] or ""), str(row["server"] or "")): {
-                "provider": str(row["provider"] or ""),
-                "server": str(row["server"] or ""),
-                "last_seen_at": str(row["last_seen_at"] or ""),
-            }
-            for row in account_rows
-        }
-        latest_account_by_login: dict[str, dict[str, str]] = {}
-        for row in account_rows:
-            login = str(row["login"] or "")
-            current = latest_account_by_login.get(login)
-            if current is None or str(row["last_seen_at"] or "") > str(current.get("last_seen_at") or ""):
-                latest_account_by_login[login] = {
+        normalized_accounts = self._normalized_account_items(
+            [
+                {
+                    "login": str(row["login"] or ""),
                     "provider": str(row["provider"] or ""),
                     "server": str(row["server"] or ""),
                     "last_seen_at": str(row["last_seen_at"] or ""),
                 }
+                for row in account_rows
+            ],
+        )
+        account_map = {
+            (account["login"], account["server"]): account
+            for account in normalized_accounts
+        }
+        preferred_server_by_login = {
+            account["login"]: account["server"]
+            for account in normalized_accounts
+            if account["login"] and account["server"]
+        }
         groups: dict[tuple[str, str, str], dict[str, Any]] = {}
         for row in history_rows:
             if not _is_profit_deal_entry("out"):
                 continue
             login = str(row["account_login"] or "")
-            server = str(row["account_server"] or "")
+            raw_server = str(row["account_server"] or "")
+            server = raw_server or preferred_server_by_login.get(login, "")
             symbol = str(row["symbol"] or "")
             key = (login, server, symbol)
-            account_info = account_map.get((login, server), {}) or latest_account_by_login.get(login, {})
+            account_info = account_map.get((login, server), {})
             item = groups.setdefault(
                 key,
                 {
@@ -918,7 +921,7 @@ class SqliteStore:
             where.append("account_login = ?")
             params.append(account_login)
         if account_server:
-            where.append("account_server = ?")
+            where.append("(account_server = ? OR account_server = '')")
             params.append(account_server)
         if symbol:
             where.append("symbol = ?")
@@ -1410,9 +1413,9 @@ class SqliteStore:
                 "last_active_at": "",
             }
 
-        accounts_by_deployment: dict[str, list[dict[str, Any]]] = {}
+        raw_accounts_by_deployment: dict[str, list[dict[str, Any]]] = {}
         for row in account_rows:
-            accounts_by_deployment.setdefault(str(row["deployment_id"] or ""), []).append(
+            raw_accounts_by_deployment.setdefault(str(row["deployment_id"] or ""), []).append(
                 {
                     "login": str(row["login"] or ""),
                     "provider": str(row["provider"] or ""),
@@ -1428,6 +1431,17 @@ class SqliteStore:
             item["account_provider"] = row["provider"]
             item["account_server"] = row["server"]
             item["account_type"] = "demo" if row["is_demo"] else "real"
+
+        accounts_by_deployment = {
+            deployment_id: self._normalized_account_items(accounts)
+            for deployment_id, accounts in raw_accounts_by_deployment.items()
+        }
+        preferred_server_by_deployment_login = {
+            (deployment_id, account["login"]): account["server"]
+            for deployment_id, accounts in accounts_by_deployment.items()
+            for account in accounts
+            if account["login"] and account["server"]
+        }
 
         total_analysis = 0
         total_signals = 0
@@ -1508,7 +1522,11 @@ class SqliteStore:
             account_key = (
                 str(row["deployment_id"] or ""),
                 str(row["account_login"] or ""),
-                str(row["account_server"] or ""),
+                str(row["account_server"] or "")
+                or preferred_server_by_deployment_login.get(
+                    (str(row["deployment_id"] or ""), str(row["account_login"] or "")),
+                    "",
+                ),
             )
             account_stats = account_trade_stats.setdefault(
                 account_key,
@@ -1732,8 +1750,31 @@ class SqliteStore:
         login = str(login or "").strip()
         if not login or login == "unknown":
             return
+        server = str(server or "").strip()
+        provider = str(provider or "").strip()
         now = utc_now_iso()
         with self._connect() as connection:
+            if not server:
+                existing_with_server = connection.execute(
+                    """
+                    SELECT id
+                    FROM deployment_accounts
+                    WHERE deployment_id = ? AND login = ? AND server != ''
+                    ORDER BY last_seen_at DESC
+                    LIMIT 1
+                    """,
+                    (deployment["id"], login),
+                ).fetchone()
+                if existing_with_server is not None:
+                    connection.execute(
+                        """
+                        UPDATE deployment_accounts
+                        SET last_seen_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, existing_with_server["id"]),
+                    )
+                    return
             existing = connection.execute(
                 """
                 SELECT id, first_seen_at
@@ -1770,6 +1811,14 @@ class SqliteStore:
                     now,
                 ),
             )
+            if server:
+                connection.execute(
+                    """
+                    DELETE FROM deployment_accounts
+                    WHERE deployment_id = ? AND login = ? AND server = ''
+                    """,
+                    (deployment["id"], login),
+                )
 
     def save_execution_report(
         self,
@@ -2364,6 +2413,50 @@ class SqliteStore:
         public["api_key_masked"] = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("****" if api_key else "")
         public.pop("api_key", None)
         return public
+
+    @staticmethod
+    def _normalized_account_items(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        preferred_server_by_login: dict[str, dict[str, Any]] = {}
+        for account in accounts:
+            login = str(account.get("login") or "")
+            server = str(account.get("server") or "")
+            if not login or not server:
+                continue
+            current = preferred_server_by_login.get(login)
+            if current is None or str(account.get("last_seen_at") or "") > str(current.get("last_seen_at") or ""):
+                preferred_server_by_login[login] = account
+
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        for account in accounts:
+            login = str(account.get("login") or "")
+            if not login:
+                continue
+            server = str(account.get("server") or "")
+            preferred = preferred_server_by_login.get(login)
+            if not server and preferred is not None:
+                server = str(preferred.get("server") or "")
+            key = (login, server)
+            item = merged.setdefault(
+                key,
+                {
+                    **account,
+                    "login": login,
+                    "server": server,
+                    "provider": "",
+                    "last_seen_at": "",
+                },
+            )
+            item["provider"] = str(item.get("provider") or account.get("provider") or "")
+            item["last_seen_at"] = max(str(item.get("last_seen_at") or ""), str(account.get("last_seen_at") or ""))
+            if preferred is not None:
+                item["provider"] = str(item.get("provider") or preferred.get("provider") or "")
+                item["account_type"] = item.get("account_type") or preferred.get("account_type")
+
+        return sorted(
+            merged.values(),
+            key=lambda item: (str(item.get("last_seen_at") or ""), str(item.get("server") or "")),
+            reverse=True,
+        )
 
     @staticmethod
     def _model_row(row: sqlite3.Row) -> dict[str, Any]:
