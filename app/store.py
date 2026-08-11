@@ -789,6 +789,10 @@ class SqliteStore:
             ).fetchone()
             if deployment is None:
                 raise RuntimeError("deployment_not_found")
+            deployment_data = self._deployment_row(deployment)
+            official_strategy = self.get_official_ai_strategy(str(deployment_data["strategy_code"] or ""))
+            if official_strategy is not None:
+                deployment_data["strategy_name"] = official_strategy["name"]
             account_rows = connection.execute(
                 """
                 SELECT login, provider, server, last_seen_at
@@ -841,7 +845,7 @@ class SqliteStore:
                 key,
                 {
                     "deployment_id": deployment_id,
-                    "user_id": str(deployment["user_id"] or ""),
+                    "user_id": str(deployment_data["user_id"] or ""),
                     "account_login": login,
                     "order_account_server": server,
                     "account_provider": str(account_info.get("provider") or ""),
@@ -877,7 +881,7 @@ class SqliteStore:
             item["win_rate"] = round((int(item["win_count"] or 0) / closed_count) * 100, 2) if closed_count else 0.0
             items.append(item)
         return {
-            "deployment": self._deployment_row(deployment),
+            "deployment": deployment_data,
             "list": sorted(
                 items,
                 key=lambda item: (
@@ -1281,13 +1285,23 @@ class SqliteStore:
         strategy = self.get_official_ai_strategy(strategy_id)
         if strategy is None:
             raise RuntimeError("official_strategy_not_found")
-        stats = self._admin_strategy_code_stats(str(strategy["code"]), period=period)
+        stats = self._admin_strategy_code_stats(
+            str(strategy["code"]),
+            period=period,
+            strategy_name=str(strategy["name"] or ""),
+        )
         return {
             "strategy": strategy,
             **stats,
         }
 
-    def _admin_strategy_code_stats(self, strategy_code: str, *, period: str = "all") -> dict[str, Any]:
+    def _admin_strategy_code_stats(
+        self,
+        strategy_code: str,
+        *,
+        period: str = "all",
+        strategy_name: str = "",
+    ) -> dict[str, Any]:
         start_iso, end_iso, start_ts, end_ts, bucket = _period_bounds(period)
         with self._connect() as connection:
             deployments = [
@@ -1367,7 +1381,7 @@ class SqliteStore:
             by_deployment[deployment["id"]] = {
                 "id": deployment["id"],
                 "user_id": deployment["user_id"],
-                "name": deployment["strategy_name"],
+                "name": strategy_name or deployment["strategy_name"],
                 "status": deployment["status"],
                 "account_login": "",
                 "account_provider": "",
