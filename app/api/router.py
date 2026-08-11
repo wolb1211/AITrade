@@ -139,6 +139,13 @@ def create_api_router(
             **store.list_public_ai_model_options(),
         }
 
+    @router.get("/web/official-strategies")
+    def web_official_strategies() -> dict[str, object]:
+        return {
+            "ok": True,
+            **store.list_public_official_ai_strategies(),
+        }
+
     @router.post(
         "/web/deployments/upsert",
         response_model=WebDeploymentUpsertResponse,

@@ -1223,6 +1223,60 @@ class SqliteStore:
             raise RuntimeError("official_strategy_save_failed")
         return saved
 
+    def list_public_official_ai_strategies(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    s.*,
+                    open_model.provider_id AS open_provider_id,
+                    open_provider.name AS open_provider_name,
+                    open_model.name AS open_model_name,
+                    open_model.display_name AS open_model_display_name,
+                    position_model.provider_id AS position_provider_id,
+                    position_provider.name AS position_provider_name,
+                    position_model.name AS position_model_name,
+                    position_model.display_name AS position_model_display_name
+                FROM official_ai_strategies s
+                LEFT JOIN ai_models open_model ON open_model.id = s.open_model_id
+                LEFT JOIN ai_providers open_provider ON open_provider.id = open_model.provider_id
+                LEFT JOIN ai_models position_model ON position_model.id = s.position_model_id
+                LEFT JOIN ai_providers position_provider ON position_provider.id = position_model.provider_id
+                WHERE s.enabled = 1
+                ORDER BY s.sort ASC, s.updated_at DESC
+                """
+            ).fetchall()
+        return {
+            "list": [
+                {
+                    "id": str(row["id"] or ""),
+                    "code": str(row["code"] or ""),
+                    "name": str(row["name"] or ""),
+                    "badge": str(row["badge"] or "Gainlab"),
+                    "version": str(row["version"] or "1.0"),
+                    "status": str(row["status"] or "active"),
+                    "summary": str(row["summary"] or ""),
+                    "open_logic": str(row["open_logic"] or ""),
+                    "position_logic": str(row["position_logic"] or ""),
+                    "open_data_type": str(row["open_data_type"] or "kline"),
+                    "open_kline_count": int(row["open_kline_count"] or 100),
+                    "position_data_type": str(row["position_data_type"] or "kline"),
+                    "position_kline_count": int(row["position_kline_count"] or 100),
+                    "call_mode": str(row["call_mode"] or "bar"),
+                    "call_val": float(row["call_value"] or 1),
+                    "open_ai_provider": str(row["open_provider_id"] or ""),
+                    "open_ai_provider_name": str(row["open_provider_name"] or ""),
+                    "open_ai_model": str(row["open_model_name"] or ""),
+                    "open_ai_model_display_name": str(row["open_model_display_name"] or ""),
+                    "position_ai_provider": str(row["position_provider_id"] or ""),
+                    "position_ai_provider_name": str(row["position_provider_name"] or ""),
+                    "position_ai_model": str(row["position_model_name"] or ""),
+                    "position_ai_model_display_name": str(row["position_model_display_name"] or ""),
+                }
+                for row in rows
+            ],
+        }
+
     def admin_official_strategy_detail(self, strategy_id: str, *, period: str = "all") -> dict[str, Any]:
         strategy = self.get_official_ai_strategy(strategy_id)
         if strategy is None:
