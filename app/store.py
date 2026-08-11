@@ -1644,6 +1644,17 @@ class SqliteStore:
                     )
                     expanded_deployments.append(account_item)
 
+        expanded_deployments = [
+            item
+            for item in expanded_deployments
+            if str(item.get("symbol") or "")
+            or float(item.get("pnl") or 0)
+            or int(item.get("close_order_count") or 0)
+            or int(item.get("analysis_count") or 0)
+            or int(item.get("signal_count") or 0)
+            or int(item.get("order_count") or 0)
+        ]
+
         deployments_list = sorted(
             expanded_deployments,
             key=lambda item: (
