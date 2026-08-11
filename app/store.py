@@ -1346,7 +1346,15 @@ class SqliteStore:
             ).fetchall()
             history_rows = connection.execute(
                 """
-                SELECT h.deployment_id, h.entry, h.net_profit, h.close_time, h.deal_time, h.updated_at
+                SELECT
+                    h.deployment_id,
+                    h.account_login,
+                    h.account_server,
+                    h.entry,
+                    h.net_profit,
+                    h.close_time,
+                    h.deal_time,
+                    h.updated_at
                 FROM mt5_history_deals h
                 JOIN deployments d ON d.id = h.deployment_id
                 WHERE d.strategy_code = ?
@@ -1402,7 +1410,17 @@ class SqliteStore:
                 "last_active_at": "",
             }
 
+        accounts_by_deployment: dict[str, list[dict[str, Any]]] = {}
         for row in account_rows:
+            accounts_by_deployment.setdefault(str(row["deployment_id"] or ""), []).append(
+                {
+                    "login": str(row["login"] or ""),
+                    "provider": str(row["provider"] or ""),
+                    "server": str(row["server"] or ""),
+                    "account_type": "demo" if row["is_demo"] else "real",
+                    "last_seen_at": str(row["last_seen_at"] or ""),
+                },
+            )
             item = by_deployment.get(row["deployment_id"])
             if item is None or item["account_login"]:
                 continue
@@ -1471,6 +1489,7 @@ class SqliteStore:
         total_pnl = 0.0
         total_close_orders = 0
         pnl_buckets: dict[str, float] = {}
+        account_trade_stats: dict[tuple[str, str, str], dict[str, Any]] = {}
         for row in history_rows:
             if not _is_profit_deal_entry(str(row["entry"] or "")):
                 continue
@@ -1486,13 +1505,57 @@ class SqliteStore:
                 item["last_active_at"] = max(str(item["last_active_at"] or ""), str(row["updated_at"] or ""))
                 item["pnl"] = round(float(item["pnl"]) + profit, 2)
                 item["close_order_count"] += 1
+            account_key = (
+                str(row["deployment_id"] or ""),
+                str(row["account_login"] or ""),
+                str(row["account_server"] or ""),
+            )
+            account_stats = account_trade_stats.setdefault(
+                account_key,
+                {
+                    "pnl": 0.0,
+                    "close_order_count": 0,
+                    "last_active_at": "",
+                },
+            )
+            account_stats["pnl"] = round(float(account_stats["pnl"] or 0) + profit, 2)
+            account_stats["close_order_count"] = int(account_stats["close_order_count"] or 0) + 1
+            account_stats["last_active_at"] = max(
+                str(account_stats["last_active_at"] or ""),
+                str(row["updated_at"] or ""),
+            )
 
         for item in by_deployment.values():
             if not item["last_active_at"]:
                 item["last_active_at"] = item["updated_at"]
 
+        expanded_deployments: list[dict[str, Any]] = []
+        for deployment_id, item in by_deployment.items():
+            accounts = accounts_by_deployment.get(deployment_id) or []
+            if not accounts:
+                expanded_deployments.append(item)
+                continue
+            for account in accounts:
+                account_item = dict(item)
+                account_item["account_login"] = account["login"]
+                account_item["account_provider"] = account["provider"]
+                account_item["account_server"] = account["server"]
+                account_item["account_type"] = account["account_type"]
+                trade_stats = account_trade_stats.get(
+                    (deployment_id, account["login"], account["server"]),
+                    {},
+                )
+                account_item["pnl"] = round(float(trade_stats.get("pnl") or 0), 2)
+                account_item["close_order_count"] = int(trade_stats.get("close_order_count") or 0)
+                account_item["last_active_at"] = max(
+                    str(account_item.get("last_active_at") or ""),
+                    str(account.get("last_seen_at") or ""),
+                    str(trade_stats.get("last_active_at") or ""),
+                )
+                expanded_deployments.append(account_item)
+
         deployments_list = sorted(
-            by_deployment.values(),
+            expanded_deployments,
             key=lambda item: (
                 str(item.get("last_active_at") or item.get("updated_at") or ""),
                 int(item["activity_count"]),
