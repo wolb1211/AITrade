@@ -1353,6 +1353,7 @@ class SqliteStore:
                     h.deployment_id,
                     h.account_login,
                     h.account_server,
+                    h.symbol,
                     h.entry,
                     h.net_profit,
                     h.close_time,
