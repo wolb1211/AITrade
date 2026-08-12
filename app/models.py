@@ -383,10 +383,12 @@ class WebDeploymentUpsertRequest(StrictModel):
     open_ai_mode: Literal["official", "custom"] = "official"
     open_ai_provider: str = ""
     open_ai_model: str = ""
+    open_ai_base_url: str = ""
     open_ai_key: str = ""
     position_ai_mode: Literal["official", "custom"] = "official"
     position_ai_provider: str = ""
     position_ai_model: str = ""
+    position_ai_base_url: str = ""
     position_ai_key: str = ""
 
 
@@ -410,10 +412,12 @@ class WebDeploymentItem(StrictModel):
     open_ai_mode: Literal["official", "custom"] = "official"
     open_ai_provider: str = ""
     open_ai_model: str = ""
+    open_ai_base_url: str = ""
     open_ai_key: str = ""
     position_ai_mode: Literal["official", "custom"] = "official"
     position_ai_provider: str = ""
     position_ai_model: str = ""
+    position_ai_base_url: str = ""
     position_ai_key: str = ""
     open_data_type: Mt5DataType = "kline"
     open_kline_count: int = 100

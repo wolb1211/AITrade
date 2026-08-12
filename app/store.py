@@ -312,6 +312,38 @@ class SqliteStore:
                     FOREIGN KEY(provider_id) REFERENCES ai_providers(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS ai_templates (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    request_type TEXT NOT NULL DEFAULT 'openai_compatible',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    remark TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_endpoints (
+                    id TEXT PRIMARY KEY,
+                    owner_type TEXT NOT NULL DEFAULT 'gl',
+                    user_id TEXT NOT NULL DEFAULT '',
+                    template_code TEXT NOT NULL DEFAULT 'openai_compatible',
+                    name TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    api_key TEXT NOT NULL DEFAULT '',
+                    context_window INTEGER NOT NULL DEFAULT 0,
+                    input_token_rate REAL NOT NULL DEFAULT 1,
+                    output_token_rate REAL NOT NULL DEFAULT 1,
+                    billing_multiplier REAL NOT NULL DEFAULT 1,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    selectable_by_user INTEGER NOT NULL DEFAULT 0,
+                    sort INTEGER NOT NULL DEFAULT 9999,
+                    remark TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS ai_user_quotas (
                     user_id TEXT PRIMARY KEY,
                     monthly_quota INTEGER NOT NULL DEFAULT 0,
@@ -363,6 +395,8 @@ class SqliteStore:
                     call_value INTEGER NOT NULL DEFAULT 1,
                     open_model_id TEXT NOT NULL DEFAULT '',
                     position_model_id TEXT NOT NULL DEFAULT '',
+                    open_ai_endpoint_id TEXT NOT NULL DEFAULT '',
+                    position_ai_endpoint_id TEXT NOT NULL DEFAULT '',
                     default_config_json TEXT NOT NULL DEFAULT '{}',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     sort INTEGER NOT NULL DEFAULT 9999,
@@ -399,6 +433,8 @@ class SqliteStore:
             self._ensure_decision_columns(connection)
             self._ensure_ai_usage_columns(connection)
             self._ensure_ai_model_columns(connection)
+            self._ensure_ai_endpoint_tables(connection)
+            self._ensure_official_strategy_columns(connection)
             self._ensure_official_strategy_seed(connection)
 
     def _ensure_mt5_history_columns(self, connection: sqlite3.Connection) -> None:
@@ -466,6 +502,150 @@ class SqliteStore:
             WHERE base_url = ''
             """,
         )
+
+    def _ensure_ai_endpoint_tables(self, connection: sqlite3.Connection) -> None:
+        now = utc_now_iso()
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_templates (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                request_type TEXT NOT NULL DEFAULT 'openai_compatible',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_endpoints (
+                id TEXT PRIMARY KEY,
+                owner_type TEXT NOT NULL DEFAULT 'gl',
+                user_id TEXT NOT NULL DEFAULT '',
+                template_code TEXT NOT NULL DEFAULT 'openai_compatible',
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                context_window INTEGER NOT NULL DEFAULT 0,
+                input_token_rate REAL NOT NULL DEFAULT 1,
+                output_token_rate REAL NOT NULL DEFAULT 1,
+                billing_multiplier REAL NOT NULL DEFAULT 1,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                selectable_by_user INTEGER NOT NULL DEFAULT 0,
+                sort INTEGER NOT NULL DEFAULT 9999,
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(ai_endpoints)").fetchall()
+        }
+        migrations = {
+            "owner_type": "ALTER TABLE ai_endpoints ADD COLUMN owner_type TEXT NOT NULL DEFAULT 'gl'",
+            "user_id": "ALTER TABLE ai_endpoints ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
+            "template_code": "ALTER TABLE ai_endpoints ADD COLUMN template_code TEXT NOT NULL DEFAULT 'openai_compatible'",
+            "name": "ALTER TABLE ai_endpoints ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+            "base_url": "ALTER TABLE ai_endpoints ADD COLUMN base_url TEXT NOT NULL DEFAULT ''",
+            "model": "ALTER TABLE ai_endpoints ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+            "api_key": "ALTER TABLE ai_endpoints ADD COLUMN api_key TEXT NOT NULL DEFAULT ''",
+            "context_window": "ALTER TABLE ai_endpoints ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0",
+            "input_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN input_token_rate REAL NOT NULL DEFAULT 1",
+            "output_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN output_token_rate REAL NOT NULL DEFAULT 1",
+            "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier REAL NOT NULL DEFAULT 1",
+            "is_default": "ALTER TABLE ai_endpoints ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
+            "enabled": "ALTER TABLE ai_endpoints ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+            "selectable_by_user": "ALTER TABLE ai_endpoints ADD COLUMN selectable_by_user INTEGER NOT NULL DEFAULT 0",
+            "sort": "ALTER TABLE ai_endpoints ADD COLUMN sort INTEGER NOT NULL DEFAULT 9999",
+            "remark": "ALTER TABLE ai_endpoints ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
+            "created_at": "ALTER TABLE ai_endpoints ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "updated_at": "ALTER TABLE ai_endpoints ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO ai_templates (
+                code, name, request_type, enabled, remark, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "openai_compatible",
+                "OpenAI 兼容接口",
+                "openai_compatible",
+                1,
+                "适用于 OpenAI、DeepSeek、通义千问兼容模式和大多数中转商。",
+                now,
+                now,
+            ),
+        )
+        count_row = connection.execute("SELECT COUNT(*) FROM ai_endpoints").fetchone()
+        if int(count_row[0] if count_row else 0) > 0:
+            return
+        rows = connection.execute(
+            """
+            SELECT
+                m.*,
+                p.name AS provider_name,
+                p.api_key AS provider_api_key,
+                COALESCE(NULLIF(m.base_url, ''), p.base_url) AS endpoint_base_url
+            FROM ai_models m
+            JOIN ai_providers p ON p.id = m.provider_id
+            WHERE m.enabled = 1 AND p.enabled = 1 AND p.api_key <> ''
+            ORDER BY m.is_default DESC, p.sort ASC, m.sort ASC, m.updated_at DESC
+            """
+        ).fetchall()
+        for index, row in enumerate(rows):
+            connection.execute(
+                """
+                INSERT INTO ai_endpoints (
+                    id, owner_type, user_id, template_code, name, base_url, model, api_key,
+                    context_window, input_token_rate, output_token_rate, billing_multiplier,
+                    is_default, enabled, selectable_by_user, sort, remark, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"aie_{uuid4().hex}",
+                    "gl",
+                    "",
+                    "openai_compatible",
+                    f"{row['provider_name']} / {row['display_name'] or row['name']}",
+                    str(row["endpoint_base_url"] or ""),
+                    str(row["name"] or ""),
+                    str(row["provider_api_key"] or ""),
+                    int(row["context_window"] or 0),
+                    float(row["input_token_rate"] or 1),
+                    float(row["output_token_rate"] or 1),
+                    float(row["billing_multiplier"] or 1),
+                    1 if (index == 0 or row["is_default"]) else 0,
+                    1,
+                    1,
+                    int(row["sort"] or 9999),
+                    str(row["remark"] or ""),
+                    now,
+                    now,
+                ),
+            )
+
+    def _ensure_official_strategy_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(official_ai_strategies)").fetchall()
+        }
+        migrations = {
+            "open_ai_endpoint_id": "ALTER TABLE official_ai_strategies ADD COLUMN open_ai_endpoint_id TEXT NOT NULL DEFAULT ''",
+            "position_ai_endpoint_id": "ALTER TABLE official_ai_strategies ADD COLUMN position_ai_endpoint_id TEXT NOT NULL DEFAULT ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
 
     def _ensure_official_strategy_seed(self, connection: sqlite3.Connection) -> None:
         now = utc_now_iso()
@@ -1209,9 +1389,9 @@ class SqliteStore:
                     id, code, name, badge, version, status, summary,
                     open_logic, position_logic, open_data_type, open_kline_count,
                     position_data_type, position_kline_count, call_mode, call_value,
-                    open_model_id, position_model_id, default_config_json,
-                    enabled, sort, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    open_model_id, position_model_id, open_ai_endpoint_id, position_ai_endpoint_id,
+                    default_config_json, enabled, sort, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     code = excluded.code,
                     name = excluded.name,
@@ -1229,6 +1409,8 @@ class SqliteStore:
                     call_value = excluded.call_value,
                     open_model_id = excluded.open_model_id,
                     position_model_id = excluded.position_model_id,
+                    open_ai_endpoint_id = excluded.open_ai_endpoint_id,
+                    position_ai_endpoint_id = excluded.position_ai_endpoint_id,
                     default_config_json = excluded.default_config_json,
                     enabled = excluded.enabled,
                     sort = excluded.sort,
@@ -1252,6 +1434,8 @@ class SqliteStore:
                     int(payload.get("call_value") or 1),
                     str(payload.get("open_model_id") or ""),
                     str(payload.get("position_model_id") or ""),
+                    str(payload.get("open_ai_endpoint_id") or ""),
+                    str(payload.get("position_ai_endpoint_id") or ""),
                     json.dumps(config, ensure_ascii=False),
                     1 if payload.get("enabled", True) else 0,
                     int(payload.get("sort") or 9999),
@@ -1279,6 +1463,10 @@ class SqliteStore:
                 """
                 SELECT
                     s.*,
+                    open_endpoint.name AS open_endpoint_name,
+                    open_endpoint.model AS open_endpoint_model,
+                    position_endpoint.name AS position_endpoint_name,
+                    position_endpoint.model AS position_endpoint_model,
                     open_model.provider_id AS open_provider_id,
                     open_provider.name AS open_provider_name,
                     open_model.name AS open_model_name,
@@ -1288,6 +1476,8 @@ class SqliteStore:
                     position_model.name AS position_model_name,
                     position_model.display_name AS position_model_display_name
                 FROM official_ai_strategies s
+                LEFT JOIN ai_endpoints open_endpoint ON open_endpoint.id = s.open_ai_endpoint_id
+                LEFT JOIN ai_endpoints position_endpoint ON position_endpoint.id = s.position_ai_endpoint_id
                 LEFT JOIN ai_models open_model ON open_model.id = s.open_model_id
                 LEFT JOIN ai_providers open_provider ON open_provider.id = open_model.provider_id
                 LEFT JOIN ai_models position_model ON position_model.id = s.position_model_id
@@ -1314,14 +1504,20 @@ class SqliteStore:
                     "position_kline_count": int(row["position_kline_count"] or 100),
                     "call_mode": str(row["call_mode"] or "bar"),
                     "call_val": float(row["call_value"] or 1),
-                    "open_ai_provider": str(row["open_provider_id"] or ""),
-                    "open_ai_provider_name": str(row["open_provider_name"] or ""),
-                    "open_ai_model": str(row["open_model_name"] or ""),
-                    "open_ai_model_display_name": str(row["open_model_display_name"] or ""),
-                    "position_ai_provider": str(row["position_provider_id"] or ""),
-                    "position_ai_provider_name": str(row["position_provider_name"] or ""),
-                    "position_ai_model": str(row["position_model_name"] or ""),
-                    "position_ai_model_display_name": str(row["position_model_display_name"] or ""),
+                    "open_ai_endpoint_id": str(row["open_ai_endpoint_id"] or ""),
+                    "open_ai_endpoint_name": str(row["open_endpoint_name"] or ""),
+                    "open_ai_endpoint_model": str(row["open_endpoint_model"] or ""),
+                    "open_ai_provider": str(row["open_ai_endpoint_id"] or row["open_provider_id"] or ""),
+                    "open_ai_provider_name": str(row["open_endpoint_name"] or row["open_provider_name"] or ""),
+                    "open_ai_model": str(row["open_endpoint_model"] or row["open_model_name"] or ""),
+                    "open_ai_model_display_name": str(row["open_endpoint_model"] or row["open_model_display_name"] or ""),
+                    "position_ai_endpoint_id": str(row["position_ai_endpoint_id"] or ""),
+                    "position_ai_endpoint_name": str(row["position_endpoint_name"] or ""),
+                    "position_ai_endpoint_model": str(row["position_endpoint_model"] or ""),
+                    "position_ai_provider": str(row["position_ai_endpoint_id"] or row["position_provider_id"] or ""),
+                    "position_ai_provider_name": str(row["position_endpoint_name"] or row["position_provider_name"] or ""),
+                    "position_ai_model": str(row["position_endpoint_model"] or row["position_model_name"] or ""),
+                    "position_ai_model_display_name": str(row["position_endpoint_model"] or row["position_model_display_name"] or ""),
                 }
                 for row in rows
             ],
@@ -2230,6 +2426,202 @@ class SqliteStore:
             raise RuntimeError("ai_provider_save_failed")
         return self._mask_provider(provider)
 
+    def list_ai_endpoints(
+        self,
+        *,
+        page: int,
+        size: int,
+        keyword: str = "",
+        owner_type: str = "",
+        user_id: str = "",
+        selectable_only: bool = False,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if keyword:
+            clauses.append("(name LIKE ? OR model LIKE ? OR base_url LIKE ? OR remark LIKE ?)")
+            like = f"%{keyword}%"
+            params.extend([like, like, like, like])
+        if owner_type:
+            clauses.append("owner_type = ?")
+            params.append(owner_type)
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if selectable_only:
+            clauses.append("selectable_by_user = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._paged_query(
+            table="ai_endpoints",
+            where=where,
+            params=params,
+            page=page,
+            size=size,
+            order_by="sort ASC, is_default DESC, updated_at DESC",
+            mapper=self._public_ai_endpoint_row,
+        )
+
+    def save_ai_endpoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        endpoint_id = str(payload.get("id") or f"aie_{uuid4().hex}")
+        existing = self.get_private_ai_endpoint(endpoint_id)
+        api_key = str(payload.get("api_key") or "")
+        if not api_key and existing:
+            api_key = str(existing.get("api_key") or "")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_endpoints (
+                    id, owner_type, user_id, template_code, name, base_url, model,
+                    api_key, context_window, input_token_rate, output_token_rate,
+                    billing_multiplier, is_default, enabled, selectable_by_user,
+                    sort, remark, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    owner_type = excluded.owner_type,
+                    user_id = excluded.user_id,
+                    template_code = excluded.template_code,
+                    name = excluded.name,
+                    base_url = excluded.base_url,
+                    model = excluded.model,
+                    api_key = excluded.api_key,
+                    context_window = excluded.context_window,
+                    input_token_rate = excluded.input_token_rate,
+                    output_token_rate = excluded.output_token_rate,
+                    billing_multiplier = excluded.billing_multiplier,
+                    is_default = excluded.is_default,
+                    enabled = excluded.enabled,
+                    selectable_by_user = excluded.selectable_by_user,
+                    sort = excluded.sort,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    endpoint_id,
+                    str(payload.get("owner_type") or "gl"),
+                    str(payload.get("user_id") or ""),
+                    str(payload.get("template_code") or "openai_compatible"),
+                    str(payload.get("name") or "").strip(),
+                    str(payload.get("base_url") or "").strip(),
+                    str(payload.get("model") or "").strip(),
+                    api_key.strip(),
+                    int(payload.get("context_window") or 0),
+                    float(payload.get("input_token_rate") or 1),
+                    float(payload.get("output_token_rate") or 1),
+                    float(payload.get("billing_multiplier") or 1),
+                    1 if payload.get("is_default", False) else 0,
+                    1 if payload.get("enabled", True) else 0,
+                    1 if payload.get("selectable_by_user", False) else 0,
+                    int(payload.get("sort") or 9999),
+                    str(payload.get("remark") or ""),
+                    existing["created_at"] if existing else now,
+                    now,
+                ),
+            )
+        endpoint = self.get_ai_endpoint(endpoint_id)
+        if endpoint is None:
+            raise RuntimeError("ai_endpoint_save_failed")
+        return endpoint
+
+    def get_ai_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
+        endpoint = self.get_private_ai_endpoint(endpoint_id)
+        return self._mask_ai_endpoint_key(endpoint) if endpoint else None
+
+    def get_private_ai_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
+        if not endpoint_id:
+            return None
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM ai_endpoints WHERE id = ?", (endpoint_id,)).fetchone()
+        return self._private_ai_endpoint_row(row) if row else None
+
+    def get_default_ai_endpoint(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM ai_endpoints
+                WHERE owner_type = 'gl' AND enabled = 1 AND api_key <> ''
+                ORDER BY is_default DESC, sort ASC, updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._private_ai_endpoint_row(row) if row else None
+
+    def delete_ai_endpoint(self, endpoint_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM ai_endpoints WHERE id = ?", (endpoint_id,))
+
+    def list_ai_templates(
+        self,
+        *,
+        page: int,
+        size: int,
+        keyword: str = "",
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if keyword:
+            clauses.append("(code LIKE ? OR name LIKE ? OR request_type LIKE ? OR remark LIKE ?)")
+            like = f"%{keyword}%"
+            params.extend([like, like, like, like])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._paged_query(
+            table="ai_templates",
+            where=where,
+            params=params,
+            page=page,
+            size=size,
+            order_by="enabled DESC, code ASC",
+            mapper=self._template_row,
+        )
+
+    def save_ai_template(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        code = str(payload.get("code") or "").strip()
+        if not code:
+            raise RuntimeError("template_code_required")
+        existing = self.get_ai_template(code)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_templates (
+                    code, name, request_type, enabled, remark, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name = excluded.name,
+                    request_type = excluded.request_type,
+                    enabled = excluded.enabled,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    code,
+                    str(payload.get("name") or "").strip(),
+                    str(payload.get("request_type") or "openai_compatible").strip(),
+                    1 if payload.get("enabled", True) else 0,
+                    str(payload.get("remark") or ""),
+                    existing["created_at"] if existing else now,
+                    now,
+                ),
+            )
+        template = self.get_ai_template(code)
+        if template is None:
+            raise RuntimeError("ai_template_save_failed")
+        return template
+
+    def get_ai_template(self, code: str) -> dict[str, Any] | None:
+        if not code:
+            return None
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM ai_templates WHERE code = ?", (code,)).fetchone()
+        return self._template_row(row) if row else None
+
+    def delete_ai_template(self, code: str) -> None:
+        if not code:
+            return
+        with self._connect() as connection:
+            connection.execute("DELETE FROM ai_templates WHERE code = ?", (code,))
+
     def get_ai_provider(self, provider_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM ai_providers WHERE id = ?", (provider_id,)).fetchone()
@@ -2308,6 +2700,34 @@ class SqliteStore:
         )
 
     def list_public_ai_model_options(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            endpoint_rows = connection.execute(
+                """
+                SELECT *
+                FROM ai_endpoints
+                WHERE owner_type = 'gl'
+                  AND enabled = 1
+                  AND api_key <> ''
+                ORDER BY is_default DESC, sort ASC, updated_at DESC
+                """,
+            ).fetchall()
+        if endpoint_rows:
+            return {
+                "list": [
+                    {
+                        "id": str(row["id"] or ""),
+                        "provider_id": str(row["id"] or ""),
+                        "provider_name": str(row["name"] or ""),
+                        "provider_type": str(row["template_code"] or "openai_compatible"),
+                        "model": str(row["model"] or ""),
+                        "display_name": str(row["model"] or row["name"] or ""),
+                        "base_url": str(row["base_url"] or ""),
+                        "is_default": bool(row["is_default"]),
+                        "official_available": True,
+                    }
+                    for row in endpoint_rows
+                ],
+            }
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -2673,6 +3093,39 @@ class SqliteStore:
         return data
 
     @staticmethod
+    def _private_ai_endpoint_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        data["enabled"] = bool(data["enabled"])
+        data["is_default"] = bool(data["is_default"])
+        data["selectable_by_user"] = bool(data["selectable_by_user"])
+        data["provider_id"] = str(data.get("id") or "")
+        data["model_id"] = str(data.get("id") or "")
+        data["provider_name"] = str(data.get("name") or "")
+        data["provider_type"] = str(data.get("template_code") or "openai_compatible")
+        data["provider_base_url"] = str(data.get("base_url") or "")
+        data["provider_api_key"] = str(data.get("api_key") or "")
+        return data
+
+    @classmethod
+    def _public_ai_endpoint_row(cls, row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        return cls._mask_ai_endpoint_key(cls._private_ai_endpoint_row(row))
+
+    @staticmethod
+    def _mask_ai_endpoint_key(data: dict[str, Any]) -> dict[str, Any]:
+        public = dict(data)
+        api_key = str(public.get("api_key") or public.get("provider_api_key") or "")
+        public["api_key_masked"] = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("****" if api_key else "")
+        public.pop("api_key", None)
+        public.pop("provider_api_key", None)
+        return public
+
+    @staticmethod
+    def _template_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        data["enabled"] = bool(data["enabled"])
+        return data
+
+    @staticmethod
     def _quota_row(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
         data["available_tokens"] = int(data["monthly_quota"]) + int(data["extra_quota"]) - int(data["used_tokens"])
@@ -2742,6 +3195,8 @@ class MySQLStore(SqliteStore):
             "mt5_history_deals",
             "ai_providers",
             "ai_models",
+            "ai_templates",
+            "ai_endpoints",
             "ai_user_quotas",
             "ai_usage_logs",
             "official_ai_strategies",
@@ -2762,6 +3217,8 @@ class MySQLStore(SqliteStore):
             raise RuntimeError(f"mysql_schema_missing_tables:{','.join(missing)}")
         self._ensure_mysql_decision_columns()
         self._ensure_mysql_ai_usage_columns()
+        self._ensure_mysql_official_strategy_columns()
+        self._ensure_mysql_ai_template_endpoint_seed()
 
     def _ensure_mysql_decision_columns(self) -> None:
         migrations = {
@@ -2777,6 +3234,25 @@ class MySQLStore(SqliteStore):
                 FROM information_schema.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = 'decisions'
+                """,
+            ).fetchall()
+            columns = {str(row["COLUMN_NAME"]) for row in rows}
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
+
+    def _ensure_mysql_official_strategy_columns(self) -> None:
+        migrations = {
+            "open_ai_endpoint_id": "ALTER TABLE official_ai_strategies ADD COLUMN open_ai_endpoint_id VARCHAR(64) NOT NULL DEFAULT '' AFTER position_model_id",
+            "position_ai_endpoint_id": "ALTER TABLE official_ai_strategies ADD COLUMN position_ai_endpoint_id VARCHAR(64) NOT NULL DEFAULT '' AFTER open_ai_endpoint_id",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'official_ai_strategies'
                 """,
             ).fetchall()
             columns = {str(row["COLUMN_NAME"]) for row in rows}
@@ -2804,3 +3280,110 @@ class MySQLStore(SqliteStore):
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+
+    def _ensure_mysql_ai_template_endpoint_seed(self) -> None:
+        now = utc_now_iso()
+        endpoint_migrations = {
+            "owner_type": "ALTER TABLE ai_endpoints ADD COLUMN owner_type VARCHAR(32) NOT NULL DEFAULT 'gl'",
+            "user_id": "ALTER TABLE ai_endpoints ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT ''",
+            "template_code": "ALTER TABLE ai_endpoints ADD COLUMN template_code VARCHAR(64) NOT NULL DEFAULT 'openai_compatible'",
+            "name": "ALTER TABLE ai_endpoints ADD COLUMN name VARCHAR(128) NOT NULL DEFAULT ''",
+            "base_url": "ALTER TABLE ai_endpoints ADD COLUMN base_url VARCHAR(512) NOT NULL DEFAULT ''",
+            "model": "ALTER TABLE ai_endpoints ADD COLUMN model VARCHAR(128) NOT NULL DEFAULT ''",
+            "api_key": "ALTER TABLE ai_endpoints ADD COLUMN api_key VARCHAR(512) NOT NULL DEFAULT ''",
+            "context_window": "ALTER TABLE ai_endpoints ADD COLUMN context_window INT NOT NULL DEFAULT 0",
+            "input_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN input_token_rate DOUBLE NOT NULL DEFAULT 1",
+            "output_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN output_token_rate DOUBLE NOT NULL DEFAULT 1",
+            "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier DOUBLE NOT NULL DEFAULT 1",
+            "is_default": "ALTER TABLE ai_endpoints ADD COLUMN is_default TINYINT NOT NULL DEFAULT 0",
+            "enabled": "ALTER TABLE ai_endpoints ADD COLUMN enabled TINYINT NOT NULL DEFAULT 1",
+            "selectable_by_user": "ALTER TABLE ai_endpoints ADD COLUMN selectable_by_user TINYINT NOT NULL DEFAULT 0",
+            "sort": "ALTER TABLE ai_endpoints ADD COLUMN sort INT NOT NULL DEFAULT 9999",
+            "remark": "ALTER TABLE ai_endpoints ADD COLUMN remark TEXT NULL",
+            "created_at": "ALTER TABLE ai_endpoints ADD COLUMN created_at VARCHAR(40) NOT NULL DEFAULT ''",
+            "updated_at": "ALTER TABLE ai_endpoints ADD COLUMN updated_at VARCHAR(40) NOT NULL DEFAULT ''",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'ai_endpoints'
+                """,
+            ).fetchall()
+            columns = {str(row["COLUMN_NAME"]) for row in rows}
+            for column, statement in endpoint_migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
+
+            connection.execute(
+                """
+                INSERT INTO ai_templates (
+                    code, name, request_type, enabled, remark, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name = excluded.name,
+                    request_type = excluded.request_type,
+                    enabled = excluded.enabled,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    "openai_compatible",
+                    "OpenAI 兼容接口",
+                    "openai_compatible",
+                    1,
+                    "适用于 OpenAI、DeepSeek、通义千问兼容模式和大多数中转商。",
+                    now,
+                    now,
+                ),
+            )
+
+            count_row = connection.execute("SELECT COUNT(*) FROM ai_endpoints").fetchone()
+            if int(count_row[0] if count_row else 0) > 0:
+                return
+            rows = connection.execute(
+                """
+                SELECT
+                    m.*,
+                    p.name AS provider_name,
+                    p.api_key AS provider_api_key,
+                    COALESCE(NULLIF(m.base_url, ''), p.base_url) AS endpoint_base_url
+                FROM ai_models m
+                JOIN ai_providers p ON p.id = m.provider_id
+                WHERE m.enabled = 1 AND p.enabled = 1 AND p.api_key <> ''
+                ORDER BY m.is_default DESC, p.sort ASC, m.sort ASC, m.updated_at DESC
+                """
+            ).fetchall()
+            for index, row in enumerate(rows):
+                connection.execute(
+                    """
+                    INSERT INTO ai_endpoints (
+                        id, owner_type, user_id, template_code, name, base_url, model, api_key,
+                        context_window, input_token_rate, output_token_rate, billing_multiplier,
+                        is_default, enabled, selectable_by_user, sort, remark, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"aie_{uuid4().hex}",
+                        "gl",
+                        "",
+                        "openai_compatible",
+                        f"{row['provider_name']} / {row['display_name'] or row['name']}",
+                        str(row["endpoint_base_url"] or ""),
+                        str(row["name"] or ""),
+                        str(row["provider_api_key"] or ""),
+                        int(row["context_window"] or 0),
+                        float(row["input_token_rate"] or 1),
+                        float(row["output_token_rate"] or 1),
+                        float(row["billing_multiplier"] or 1),
+                        1 if (index == 0 or row["is_default"]) else 0,
+                        1,
+                        1,
+                        int(row["sort"] or 9999),
+                        str(row["remark"] or ""),
+                        now,
+                        now,
+                    ),
+                )

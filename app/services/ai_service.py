@@ -188,6 +188,7 @@ class AiDecisionClient:
 
         provider_id = str(model["provider_id"])
         model_id = str(model["id"])
+        is_custom = bool(model.get("is_custom"))
         prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
         response_content = ""
         usage = UsageSummary(ai_called=True)
@@ -210,7 +211,7 @@ class AiDecisionClient:
                 charged_points=int(usage_payload.get("total_tokens") or 0),
             )
             content = _extract_json_object(response_content)
-            self._save_usage(deployment, endpoint, provider_id, model_id, usage, request_payload=user_payload, success=True)
+            self._save_usage(deployment, endpoint, provider_id, model_id, usage, request_payload=user_payload, success=True, is_custom=is_custom)
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
@@ -223,19 +224,45 @@ class AiDecisionClient:
                 usage,
                 request_payload=user_payload,
                 success=False,
+                is_custom=is_custom,
                 error_message=message[:1000],
             )
             return None
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        prefix = "open" if endpoint == "open" else "position"
+        if str(config.get(f"{prefix}_ai_mode") or "official") == "custom":
+            base_url = str(config.get(f"{prefix}_ai_base_url") or config.get(f"{prefix}_ai_provider") or "").strip()
+            model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
+            api_key = str(config.get(f"{prefix}_ai_key") or "").strip()
+            if base_url and model_name and api_key:
+                return {
+                    "id": f"custom_{prefix}",
+                    "provider_id": f"custom_{prefix}",
+                    "name": model_name,
+                    "provider_base_url": base_url,
+                    "provider_api_key": api_key,
+                    "provider_type": "openai_compatible",
+                    "is_custom": True,
+                }
         official_strategy = self.store.get_official_ai_strategy(str(deployment.get("strategy_code") or ""))
         if official_strategy is not None:
+            endpoint_key = "open_ai_endpoint_id" if endpoint == "open" else "position_ai_endpoint_id"
+            configured_endpoint_id = str(config.get(f"{prefix}_ai_provider") or official_strategy.get(endpoint_key) or "").strip()
+            if configured_endpoint_id:
+                configured_endpoint = self.store.get_private_ai_endpoint(configured_endpoint_id)
+                if configured_endpoint is not None:
+                    return configured_endpoint
             model_key = "open_model_id" if endpoint == "open" else "position_model_id"
             configured_model_id = str(official_strategy.get(model_key) or "").strip()
             if configured_model_id:
                 model = self.store.get_private_ai_model(configured_model_id)
                 if model is not None:
                     return model
+        default_endpoint = self.store.get_default_ai_endpoint()
+        if default_endpoint is not None:
+            return default_endpoint
         return self.store.get_default_ai_model()
 
     def _post_chat_completion(
@@ -285,6 +312,7 @@ class AiDecisionClient:
         *,
         request_payload: dict[str, Any] | None = None,
         success: bool,
+        is_custom: bool = False,
         error_message: str = "",
     ) -> None:
         request_payload = request_payload or {}
@@ -304,8 +332,8 @@ class AiDecisionClient:
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
                 "total_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens,
-                "official_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens,
-                "custom_tokens": 0,
+                "official_tokens": 0 if is_custom else usage.charged_points or usage.input_tokens + usage.output_tokens,
+                "custom_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens if is_custom else 0,
                 "success": success,
                 "error_message": error_message,
             },
