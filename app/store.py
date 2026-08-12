@@ -1432,8 +1432,8 @@ class SqliteStore:
                     int(payload.get("position_kline_count") or 100),
                     str(payload.get("call_mode") or "bar"),
                     int(payload.get("call_value") or 1),
-                    str(payload.get("open_model_id") or ""),
-                    str(payload.get("position_model_id") or ""),
+                    "",
+                    "",
                     str(payload.get("open_ai_endpoint_id") or ""),
                     str(payload.get("position_ai_endpoint_id") or ""),
                     json.dumps(config, ensure_ascii=False),
@@ -1466,22 +1466,10 @@ class SqliteStore:
                     open_endpoint.name AS open_endpoint_name,
                     open_endpoint.model AS open_endpoint_model,
                     position_endpoint.name AS position_endpoint_name,
-                    position_endpoint.model AS position_endpoint_model,
-                    open_model.provider_id AS open_provider_id,
-                    open_provider.name AS open_provider_name,
-                    open_model.name AS open_model_name,
-                    open_model.display_name AS open_model_display_name,
-                    position_model.provider_id AS position_provider_id,
-                    position_provider.name AS position_provider_name,
-                    position_model.name AS position_model_name,
-                    position_model.display_name AS position_model_display_name
+                    position_endpoint.model AS position_endpoint_model
                 FROM official_ai_strategies s
                 LEFT JOIN ai_endpoints open_endpoint ON open_endpoint.id = s.open_ai_endpoint_id
                 LEFT JOIN ai_endpoints position_endpoint ON position_endpoint.id = s.position_ai_endpoint_id
-                LEFT JOIN ai_models open_model ON open_model.id = s.open_model_id
-                LEFT JOIN ai_providers open_provider ON open_provider.id = open_model.provider_id
-                LEFT JOIN ai_models position_model ON position_model.id = s.position_model_id
-                LEFT JOIN ai_providers position_provider ON position_provider.id = position_model.provider_id
                 WHERE s.enabled = 1
                 ORDER BY s.sort ASC, s.updated_at DESC
                 """
@@ -1507,17 +1495,9 @@ class SqliteStore:
                     "open_ai_endpoint_id": str(row["open_ai_endpoint_id"] or ""),
                     "open_ai_endpoint_name": str(row["open_endpoint_name"] or ""),
                     "open_ai_endpoint_model": str(row["open_endpoint_model"] or ""),
-                    "open_ai_provider": str(row["open_ai_endpoint_id"] or row["open_provider_id"] or ""),
-                    "open_ai_provider_name": str(row["open_endpoint_name"] or row["open_provider_name"] or ""),
-                    "open_ai_model": str(row["open_endpoint_model"] or row["open_model_name"] or ""),
-                    "open_ai_model_display_name": str(row["open_endpoint_model"] or row["open_model_display_name"] or ""),
                     "position_ai_endpoint_id": str(row["position_ai_endpoint_id"] or ""),
                     "position_ai_endpoint_name": str(row["position_endpoint_name"] or ""),
                     "position_ai_endpoint_model": str(row["position_endpoint_model"] or ""),
-                    "position_ai_provider": str(row["position_ai_endpoint_id"] or row["position_provider_id"] or ""),
-                    "position_ai_provider_name": str(row["position_endpoint_name"] or row["position_provider_name"] or ""),
-                    "position_ai_model": str(row["position_endpoint_model"] or row["position_model_name"] or ""),
-                    "position_ai_model_display_name": str(row["position_endpoint_model"] or row["position_model_display_name"] or ""),
                 }
                 for row in rows
             ],
@@ -2347,85 +2327,6 @@ class SqliteStore:
             "net_profit": round(net_profit_total, 2),
         }
 
-    def list_ai_providers(
-        self,
-        *,
-        page: int,
-        size: int,
-        keyword: str = "",
-        official_only: bool = False,
-    ) -> dict[str, Any]:
-        conditions: list[str] = []
-        params: list[Any] = []
-        if official_only:
-            conditions.append("api_key <> ''")
-        if keyword:
-            conditions.append("(name LIKE ? OR provider_type LIKE ? OR base_url LIKE ?)")
-            like = f"%{keyword}%"
-            params.extend([like, like, like])
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        return self._paged_query(
-            table="ai_providers",
-            where=where,
-            params=params,
-            page=page,
-            size=size,
-            order_by="sort ASC, updated_at DESC",
-            mapper=self._public_provider_row,
-        )
-
-    def save_ai_provider(self, payload: dict[str, Any]) -> dict[str, Any]:
-        now = utc_now_iso()
-        provider_name = str(payload.get("name") or "").strip()
-        provider_id = str(payload.get("id") or "")
-        if not provider_id and provider_name:
-            with self._connect() as connection:
-                row = connection.execute("SELECT * FROM ai_providers WHERE name = ?", (provider_name,)).fetchone()
-            if row:
-                provider_id = str(row["id"])
-        provider_id = provider_id or f"aip_{uuid4().hex}"
-        existing = self.get_ai_provider(provider_id)
-        api_key = str(payload.get("api_key") or "")
-        if not api_key and existing:
-            api_key = existing["api_key"]
-        base_url = str(payload.get("base_url") or "").strip()
-        if not base_url and existing:
-            base_url = str(existing.get("base_url") or "")
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO ai_providers (
-                    id, name, provider_type, base_url, api_key, enabled, sort,
-                    remark, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    provider_type = excluded.provider_type,
-                    base_url = excluded.base_url,
-                    api_key = excluded.api_key,
-                    enabled = excluded.enabled,
-                    sort = excluded.sort,
-                    remark = excluded.remark,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    provider_id,
-                    provider_name,
-                    str(payload.get("provider_type") or "openai_compatible").strip(),
-                    base_url,
-                    api_key.strip(),
-                    1 if payload.get("enabled", True) else 0,
-                    int(payload.get("sort") or 9999),
-                    str(payload.get("remark") or ""),
-                    now,
-                    now,
-                ),
-            )
-        provider = self.get_ai_provider(provider_id)
-        if provider is None:
-            raise RuntimeError("ai_provider_save_failed")
-        return self._mask_provider(provider)
-
     def list_ai_endpoints(
         self,
         *,
@@ -2622,83 +2523,6 @@ class SqliteStore:
         with self._connect() as connection:
             connection.execute("DELETE FROM ai_templates WHERE code = ?", (code,))
 
-    def get_ai_provider(self, provider_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT * FROM ai_providers WHERE id = ?", (provider_id,)).fetchone()
-        return self._provider_row(row) if row else None
-
-    def get_default_ai_model(self) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT
-                    m.*,
-                    p.name AS provider_name,
-                    p.provider_type AS provider_type,
-                    COALESCE(NULLIF(m.base_url, ''), p.base_url) AS provider_base_url,
-                    p.api_key AS provider_api_key
-                FROM ai_models m
-                JOIN ai_providers p ON p.id = m.provider_id
-                WHERE m.enabled = 1 AND p.enabled = 1
-                ORDER BY m.is_default DESC, m.sort ASC, m.updated_at DESC
-                LIMIT 1
-                """,
-            ).fetchone()
-        if row is None:
-            return None
-        return self._private_model_row(row)
-
-    def delete_ai_provider(self, provider_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute("DELETE FROM ai_models WHERE provider_id = ?", (provider_id,))
-            connection.execute("DELETE FROM ai_providers WHERE id = ?", (provider_id,))
-
-    def clear_ai_provider_key(self, provider_id: str) -> None:
-        now = utc_now_iso()
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE ai_providers SET api_key = '', updated_at = ? WHERE id = ?",
-                (now, provider_id),
-            )
-
-    def list_ai_models(
-        self,
-        *,
-        page: int,
-        size: int,
-        keyword: str = "",
-        provider_id: str = "",
-    ) -> dict[str, Any]:
-        clauses = []
-        params: list[Any] = []
-        if keyword:
-            clauses.append("(m.name LIKE ? OR m.display_name LIKE ? OR p.name LIKE ?)")
-            like = f"%{keyword}%"
-            params.extend([like, like, like])
-        if provider_id:
-            clauses.append("m.provider_id = ?")
-            params.append(provider_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return self._paged_query_sql(
-            count_sql=f"SELECT COUNT(*) FROM ai_models m LEFT JOIN ai_providers p ON p.id = m.provider_id {where}",
-            list_sql=f"""
-                SELECT
-                    m.*,
-                    p.name AS provider_name,
-                    p.provider_type AS provider_type,
-                    p.api_key AS provider_api_key
-                FROM ai_models m
-                LEFT JOIN ai_providers p ON p.id = m.provider_id
-                {where}
-                ORDER BY m.sort ASC, m.updated_at DESC
-                LIMIT ? OFFSET ?
-            """,
-            params=params,
-            page=page,
-            size=size,
-            mapper=self._model_row,
-        )
-
     def list_public_ai_model_options(self) -> dict[str, Any]:
         with self._connect() as connection:
             endpoint_rows = connection.execute(
@@ -2716,7 +2540,6 @@ class SqliteStore:
             "list": [
                 {
                     "id": str(row["id"] or ""),
-                    "provider_id": str(row["id"] or ""),
                     "provider_name": str(row["name"] or ""),
                     "provider_type": str(row["template_code"] or "openai_compatible"),
                     "model": str(row["model"] or ""),
@@ -2728,81 +2551,6 @@ class SqliteStore:
                 for row in endpoint_rows
             ],
         }
-
-    def save_ai_model(self, payload: dict[str, Any]) -> dict[str, Any]:
-        now = utc_now_iso()
-        model_id = str(payload.get("id") or f"aim_{uuid4().hex}")
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO ai_models (
-                    id, provider_id, name, display_name, base_url, context_window,
-                    input_token_rate, output_token_rate, billing_multiplier,
-                    is_default, enabled, sort, remark, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    provider_id = excluded.provider_id,
-                    name = excluded.name,
-                    display_name = excluded.display_name,
-                    base_url = excluded.base_url,
-                    context_window = excluded.context_window,
-                    input_token_rate = excluded.input_token_rate,
-                    output_token_rate = excluded.output_token_rate,
-                    billing_multiplier = excluded.billing_multiplier,
-                    is_default = excluded.is_default,
-                    enabled = excluded.enabled,
-                    sort = excluded.sort,
-                    remark = excluded.remark,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    model_id,
-                    str(payload.get("provider_id") or ""),
-                    str(payload.get("name") or "").strip(),
-                    str(payload.get("display_name") or "").strip(),
-                    str(payload.get("base_url") or "").strip(),
-                    int(payload.get("context_window") or 0),
-                    float(payload.get("input_token_rate") or 0),
-                    float(payload.get("output_token_rate") or 0),
-                    float(payload.get("billing_multiplier") or 1),
-                    1 if payload.get("is_default", False) else 0,
-                    1 if payload.get("enabled", True) else 0,
-                    int(payload.get("sort") or 9999),
-                    str(payload.get("remark") or ""),
-                    now,
-                    now,
-                ),
-            )
-        model = self.get_ai_model(model_id)
-        if model is None:
-            raise RuntimeError("ai_model_save_failed")
-        return model
-
-    def get_ai_model(self, model_id: str) -> dict[str, Any] | None:
-        model = self.get_private_ai_model(model_id)
-        return self._mask_model_key(model) if model else None
-
-    def get_private_ai_model(self, model_id: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT
-                    m.*,
-                    p.name AS provider_name,
-                    p.provider_type AS provider_type,
-                    COALESCE(NULLIF(m.base_url, ''), p.base_url) AS provider_base_url,
-                    p.api_key AS provider_api_key
-                FROM ai_models m
-                LEFT JOIN ai_providers p ON p.id = m.provider_id
-                WHERE m.id = ?
-                """,
-                (model_id,),
-            ).fetchone()
-        return self._private_model_row(row) if row else None
-
-    def delete_ai_model(self, model_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute("DELETE FROM ai_models WHERE id = ?", (model_id,))
 
     def list_ai_user_quotas(self, *, page: int, size: int, keyword: str = "") -> dict[str, Any]:
         where = ""
@@ -2966,24 +2714,6 @@ class SqliteStore:
         }
 
     @staticmethod
-    def _provider_row(row: sqlite3.Row) -> dict[str, Any]:
-        data = dict(row)
-        data["enabled"] = bool(data["enabled"])
-        return data
-
-    @classmethod
-    def _public_provider_row(cls, row: sqlite3.Row) -> dict[str, Any]:
-        return cls._mask_provider(cls._provider_row(row))
-
-    @staticmethod
-    def _mask_provider(data: dict[str, Any]) -> dict[str, Any]:
-        public = dict(data)
-        api_key = str(public.get("api_key") or "")
-        public["api_key_masked"] = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("****" if api_key else "")
-        public.pop("api_key", None)
-        return public
-
-    @staticmethod
     def _normalized_account_items(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         preferred_server_by_login: dict[str, dict[str, Any]] = {}
         for account in accounts:
@@ -3036,25 +2766,6 @@ class SqliteStore:
         else:
             values = [str(symbols).strip()]
         return ", ".join(values[:4]) + ("..." if len(values) > 4 else "")
-
-    @staticmethod
-    def _model_row(row: sqlite3.Row) -> dict[str, Any]:
-        return SqliteStore._mask_model_key(SqliteStore._private_model_row(row))
-
-    @staticmethod
-    def _private_model_row(row: sqlite3.Row) -> dict[str, Any]:
-        data = dict(row)
-        data["enabled"] = bool(data["enabled"])
-        data["is_default"] = bool(data["is_default"])
-        return data
-
-    @staticmethod
-    def _mask_model_key(data: dict[str, Any]) -> dict[str, Any]:
-        data = dict(data)
-        api_key = str(data.get("provider_api_key") or "")
-        data["provider_api_key_masked"] = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("****" if api_key else "")
-        data.pop("provider_api_key", None)
-        return data
 
     @staticmethod
     def _private_ai_endpoint_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
@@ -3157,8 +2868,6 @@ class MySQLStore(SqliteStore):
             "heartbeats",
             "execution_reports",
             "mt5_history_deals",
-            "ai_providers",
-            "ai_models",
             "ai_templates",
             "ai_endpoints",
             "ai_user_quotas",
@@ -3306,6 +3015,17 @@ class MySQLStore(SqliteStore):
 
             count_row = connection.execute("SELECT COUNT(*) FROM ai_endpoints").fetchone()
             if int(count_row[0] if count_row else 0) > 0:
+                return
+            legacy_rows = connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name IN ('ai_providers', 'ai_models')
+                """
+            ).fetchall()
+            legacy_tables = {str(row["table_name"]) for row in legacy_rows}
+            if {"ai_providers", "ai_models"} - legacy_tables:
                 return
             rows = connection.execute(
                 """

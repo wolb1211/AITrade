@@ -249,21 +249,15 @@ class AiDecisionClient:
         official_strategy = self.store.get_official_ai_strategy(str(deployment.get("strategy_code") or ""))
         if official_strategy is not None:
             endpoint_key = "open_ai_endpoint_id" if endpoint == "open" else "position_ai_endpoint_id"
-            configured_endpoint_id = str(config.get(f"{prefix}_ai_provider") or official_strategy.get(endpoint_key) or "").strip()
+            configured_endpoint_id = str(config.get(f"{prefix}_ai_endpoint_id") or official_strategy.get(endpoint_key) or "").strip()
             if configured_endpoint_id:
                 configured_endpoint = self.store.get_private_ai_endpoint(configured_endpoint_id)
                 if configured_endpoint is not None:
                     return configured_endpoint
-            model_key = "open_model_id" if endpoint == "open" else "position_model_id"
-            configured_model_id = str(official_strategy.get(model_key) or "").strip()
-            if configured_model_id:
-                model = self.store.get_private_ai_model(configured_model_id)
-                if model is not None:
-                    return model
         default_endpoint = self.store.get_default_ai_endpoint()
         if default_endpoint is not None:
             return default_endpoint
-        return self.store.get_default_ai_model()
+        return None
 
     def _post_chat_completion(
         self,

@@ -185,12 +185,12 @@ def create_api_router(
                 "open_logic": request.open_logic,
                 "position_logic": request.position_logic,
                 "open_ai_mode": request.open_ai_mode,
-                "open_ai_provider": request.open_ai_provider,
+                "open_ai_endpoint_id": request.open_ai_endpoint_id,
                 "open_ai_model": request.open_ai_model,
                 "open_ai_base_url": request.open_ai_base_url,
                 "open_ai_key": request.open_ai_key,
                 "position_ai_mode": request.position_ai_mode,
-                "position_ai_provider": request.position_ai_provider,
+                "position_ai_endpoint_id": request.position_ai_endpoint_id,
                 "position_ai_model": request.position_ai_model,
                 "position_ai_base_url": request.position_ai_base_url,
                 "position_ai_key": request.position_ai_key,
@@ -213,32 +213,24 @@ def create_api_router(
         for deployment in store.list_web_deployments(user_id):
             config = deployment["config"]
             stats = store.deployment_runtime_stats(deployment["id"])
-            open_ai_provider = config.get("open_ai_provider", "")
-            open_ai_model = config.get("open_ai_model", "")
-            position_ai_provider = config.get("position_ai_provider", "")
-            position_ai_model = config.get("position_ai_model", "")
+            open_ai_endpoint_id = str(config.get("open_ai_endpoint_id") or "")
+            position_ai_endpoint_id = str(config.get("position_ai_endpoint_id") or "")
+            open_ai_endpoint_name = ""
+            open_ai_endpoint_model = ""
+            position_ai_endpoint_name = ""
+            position_ai_endpoint_model = ""
             official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
             if official_strategy is not None:
-                open_endpoint_id = str(open_ai_provider or official_strategy.get("open_ai_endpoint_id") or "")
-                position_endpoint_id = str(position_ai_provider or official_strategy.get("position_ai_endpoint_id") or "")
-                open_endpoint = store.get_ai_endpoint(open_endpoint_id)
-                position_endpoint = store.get_ai_endpoint(position_endpoint_id)
+                open_ai_endpoint_id = open_ai_endpoint_id or str(official_strategy.get("open_ai_endpoint_id") or "")
+                position_ai_endpoint_id = position_ai_endpoint_id or str(official_strategy.get("position_ai_endpoint_id") or "")
+                open_endpoint = store.get_ai_endpoint(open_ai_endpoint_id)
+                position_endpoint = store.get_ai_endpoint(position_ai_endpoint_id)
                 if open_endpoint is not None:
-                    open_ai_provider = open_endpoint["id"]
-                    open_ai_model = open_endpoint["model"]
-                else:
-                    open_model = store.get_ai_model(str(official_strategy.get("open_model_id") or ""))
-                    if open_model is not None:
-                        open_ai_provider = open_model["provider_id"]
-                        open_ai_model = open_model["name"]
+                    open_ai_endpoint_name = str(open_endpoint["name"] or "")
+                    open_ai_endpoint_model = str(open_endpoint["model"] or "")
                 if position_endpoint is not None:
-                    position_ai_provider = position_endpoint["id"]
-                    position_ai_model = position_endpoint["model"]
-                else:
-                    position_model = store.get_ai_model(str(official_strategy.get("position_model_id") or ""))
-                    if position_model is not None:
-                        position_ai_provider = position_model["provider_id"]
-                        position_ai_model = position_model["name"]
+                    position_ai_endpoint_name = str(position_endpoint["name"] or "")
+                    position_ai_endpoint_model = str(position_endpoint["model"] or "")
             deployments.append(
                 WebDeploymentItem(
                     id=deployment["id"],
@@ -251,13 +243,17 @@ def create_api_router(
                     open_logic=config.get("open_logic", ""),
                     position_logic=config.get("position_logic", ""),
                     open_ai_mode=config.get("open_ai_mode", "official"),
-                    open_ai_provider=open_ai_provider,
-                    open_ai_model=open_ai_model,
+                    open_ai_endpoint_id=open_ai_endpoint_id,
+                    open_ai_endpoint_name=open_ai_endpoint_name,
+                    open_ai_endpoint_model=open_ai_endpoint_model,
+                    open_ai_model=config.get("open_ai_model", ""),
                     open_ai_base_url=config.get("open_ai_base_url", ""),
                     open_ai_key=config.get("open_ai_key", ""),
                     position_ai_mode=config.get("position_ai_mode", "official"),
-                    position_ai_provider=position_ai_provider,
-                    position_ai_model=position_ai_model,
+                    position_ai_endpoint_id=position_ai_endpoint_id,
+                    position_ai_endpoint_name=position_ai_endpoint_name,
+                    position_ai_endpoint_model=position_ai_endpoint_model,
+                    position_ai_model=config.get("position_ai_model", ""),
                     position_ai_base_url=config.get("position_ai_base_url", ""),
                     position_ai_key=config.get("position_ai_key", ""),
                     open_data_type=config.get("open_data_type", "kline"),
@@ -609,31 +605,6 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
             raise HTTPException(status_code=400, detail="strategy_code_required")
         return ok(store.save_official_ai_strategy(payload), "saved")
 
-    @router.post("/provider/list")
-    def provider_list(payload: dict[str, object] | None = None) -> dict[str, object]:
-        payload = payload or {}
-        data = store.list_ai_providers(
-            page=int(payload.get("page") or 1),
-            size=int(payload.get("size") or 20),
-            keyword=str(payload.get("keyword") or "").strip(),
-            official_only=bool(payload.get("official_only", False)),
-        )
-        return ok(data)
-
-    @router.post("/provider/save")
-    def provider_save(payload: dict[str, object]) -> dict[str, object]:
-        if not str(payload.get("name") or "").strip():
-            raise HTTPException(status_code=400, detail="provider_name_required")
-        return ok(store.save_ai_provider(payload), "保存成功")
-
-    @router.post("/provider/delete")
-    def provider_delete(payload: dict[str, object]) -> dict[str, object]:
-        provider_id = str(payload.get("id") or "").strip()
-        if not provider_id:
-            raise HTTPException(status_code=400, detail="provider_id_required")
-        store.clear_ai_provider_key(provider_id)
-        return ok(message="删除成功")
-
     @router.post("/endpoint/list")
     def endpoint_list(payload: dict[str, object] | None = None) -> dict[str, object]:
         payload = payload or {}
@@ -690,37 +661,6 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
             raise HTTPException(status_code=400, detail="template_code_required")
         store.delete_ai_template(code)
         return ok(message="deleted")
-
-    @router.post("/model/list")
-    def model_list(payload: dict[str, object] | None = None) -> dict[str, object]:
-        payload = payload or {}
-        data = store.list_ai_models(
-            page=int(payload.get("page") or 1),
-            size=int(payload.get("size") or 20),
-            keyword=str(payload.get("keyword") or "").strip(),
-            provider_id=str(payload.get("provider_id") or "").strip(),
-        )
-        return ok(data)
-
-    @router.post("/model/save")
-    def model_save(payload: dict[str, object]) -> dict[str, object]:
-        if not str(payload.get("provider_id") or "").strip():
-            raise HTTPException(status_code=400, detail="provider_id_required")
-        if not str(payload.get("name") or "").strip():
-            raise HTTPException(status_code=400, detail="model_name_required")
-        if not str(payload.get("base_url") or "").strip():
-            raise HTTPException(status_code=400, detail="model_base_url_required")
-        if not str(payload.get("display_name") or "").strip():
-            payload["display_name"] = payload["name"]
-        return ok(store.save_ai_model(payload), "保存成功")
-
-    @router.post("/model/delete")
-    def model_delete(payload: dict[str, object]) -> dict[str, object]:
-        model_id = str(payload.get("id") or "").strip()
-        if not model_id:
-            raise HTTPException(status_code=400, detail="model_id_required")
-        store.delete_ai_model(model_id)
-        return ok(message="删除成功")
 
     @router.post("/quota/list")
     def quota_list(payload: dict[str, object] | None = None) -> dict[str, object]:
