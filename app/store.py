@@ -2336,6 +2336,7 @@ class SqliteStore:
         owner_type: str = "",
         user_id: str = "",
         selectable_only: bool = False,
+        enabled_only: bool = False,
     ) -> dict[str, Any]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -2349,6 +2350,8 @@ class SqliteStore:
         if user_id:
             clauses.append("user_id = ?")
             params.append(user_id)
+        if enabled_only:
+            clauses.append("enabled = 1")
         if selectable_only:
             clauses.append("selectable_by_user = 1")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""

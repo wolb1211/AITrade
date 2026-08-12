@@ -615,6 +615,7 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
             owner_type=str(payload.get("owner_type") or "").strip(),
             user_id=str(payload.get("user_id") or "").strip(),
             selectable_only=bool(payload.get("selectable_only", False)),
+            enabled_only=bool(payload.get("enabled_only", False)),
         )
         return ok(data)
 
