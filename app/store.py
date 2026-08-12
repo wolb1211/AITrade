@@ -2708,60 +2708,24 @@ class SqliteStore:
                 WHERE owner_type = 'gl'
                   AND enabled = 1
                   AND api_key <> ''
+                  AND selectable_by_user = 1
                 ORDER BY is_default DESC, sort ASC, updated_at DESC
-                """,
-            ).fetchall()
-        if endpoint_rows:
-            return {
-                "list": [
-                    {
-                        "id": str(row["id"] or ""),
-                        "provider_id": str(row["id"] or ""),
-                        "provider_name": str(row["name"] or ""),
-                        "provider_type": str(row["template_code"] or "openai_compatible"),
-                        "model": str(row["model"] or ""),
-                        "display_name": str(row["model"] or row["name"] or ""),
-                        "base_url": str(row["base_url"] or ""),
-                        "is_default": bool(row["is_default"]),
-                        "official_available": True,
-                    }
-                    for row in endpoint_rows
-                ],
-            }
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT
-                    m.id,
-                    m.provider_id,
-                    m.name,
-                    m.display_name,
-                    COALESCE(NULLIF(m.base_url, ''), p.base_url) AS base_url,
-                    m.is_default,
-                    m.sort,
-                    p.name AS provider_name,
-                    p.provider_type AS provider_type,
-                    CASE WHEN p.api_key <> '' THEN 1 ELSE 0 END AS official_available
-                FROM ai_models m
-                JOIN ai_providers p ON p.id = m.provider_id
-                WHERE m.enabled = 1 AND p.enabled = 1
-                ORDER BY p.sort ASC, m.sort ASC, m.updated_at DESC
                 """,
             ).fetchall()
         return {
             "list": [
                 {
                     "id": str(row["id"] or ""),
-                    "provider_id": str(row["provider_id"] or ""),
-                    "provider_name": str(row["provider_name"] or ""),
-                    "provider_type": str(row["provider_type"] or ""),
-                    "model": str(row["name"] or ""),
-                    "display_name": str(row["display_name"] or row["name"] or ""),
+                    "provider_id": str(row["id"] or ""),
+                    "provider_name": str(row["name"] or ""),
+                    "provider_type": str(row["template_code"] or "openai_compatible"),
+                    "model": str(row["model"] or ""),
+                    "display_name": str(row["model"] or row["name"] or ""),
                     "base_url": str(row["base_url"] or ""),
                     "is_default": bool(row["is_default"]),
-                    "official_available": bool(row["official_available"]),
+                    "official_available": True,
                 }
-                for row in rows
+                for row in endpoint_rows
             ],
         }
 
