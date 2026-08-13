@@ -201,6 +201,7 @@ class AiDecisionClient:
                 model=str(model.get("model") or model.get("name") or ""),
                 system_prompt=system_prompt,
                 user_prompt=prompt,
+                max_tokens=900 if endpoint == "open" else 600,
             )
             parsed = json.loads(raw)
             response_content = str(parsed["choices"][0]["message"]["content"])
@@ -269,6 +270,7 @@ class AiDecisionClient:
         model: str,
         system_prompt: str,
         user_prompt: str,
+        max_tokens: int,
     ) -> str:
         url = f"{base_url.rstrip('/')}/chat/completions"
         body = {
@@ -278,6 +280,7 @@ class AiDecisionClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
+            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         }
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
