@@ -2624,7 +2624,7 @@ class SqliteStore:
             clauses.append("user_id = ?")
             params.append(user_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return self._paged_query(
+        data = self._paged_query(
             table="ai_usage_logs",
             where=where,
             params=params,
@@ -2633,6 +2633,8 @@ class SqliteStore:
             order_by="created_at DESC",
             mapper=self._usage_row,
         )
+        data["list"] = self._with_ai_usage_display_names(data["list"])
+        return data
 
     def save_ai_usage_log(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now_iso()
@@ -2673,7 +2675,71 @@ class SqliteStore:
                 ),
             )
             row = connection.execute("SELECT * FROM ai_usage_logs WHERE id = ?", (log_id,)).fetchone()
-        return self._usage_row(row)
+        data = self._usage_row(row)
+        enriched = self._with_ai_usage_display_names([data])
+        return enriched[0] if enriched else data
+
+    def _with_ai_usage_display_names(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ids = sorted(
+            {
+                str(value)
+                for row in rows
+                for value in (row.get("provider_id"), row.get("model_id"))
+                if str(value or "").strip()
+            }
+        )
+        if not ids:
+            return rows
+
+        placeholders = ",".join("?" for _ in ids)
+        endpoint_map: dict[str, dict[str, Any]] = {}
+        provider_map: dict[str, str] = {}
+        model_map: dict[str, dict[str, str]] = {}
+        with self._connect() as connection:
+            for endpoint in connection.execute(
+                f"SELECT id, name, model FROM ai_endpoints WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall():
+                endpoint_map[str(endpoint["id"])] = dict(endpoint)
+
+            for provider in connection.execute(
+                f"SELECT id, name FROM ai_providers WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall():
+                provider_map[str(provider["id"])] = str(provider["name"] or "")
+
+            for model in connection.execute(
+                f"SELECT id, provider_id, name, display_name FROM ai_models WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall():
+                model_map[str(model["id"])] = {
+                    "provider_id": str(model["provider_id"] or ""),
+                    "name": str(model["name"] or ""),
+                    "display_name": str(model["display_name"] or ""),
+                }
+
+        for row in rows:
+            provider_id = str(row.get("provider_id") or "")
+            model_id = str(row.get("model_id") or "")
+            provider_endpoint = endpoint_map.get(provider_id)
+            model_endpoint = endpoint_map.get(model_id)
+            legacy_model = model_map.get(model_id, {})
+
+            row["provider_name"] = (
+                str((provider_endpoint or {}).get("name") or "")
+                or str((model_endpoint or {}).get("name") or "")
+                or provider_map.get(provider_id, "")
+                or provider_map.get(legacy_model.get("provider_id", ""), "")
+                or provider_id
+            )
+            row["model_name"] = (
+                str((model_endpoint or {}).get("model") or "")
+                or str((provider_endpoint or {}).get("model") or "")
+                or legacy_model.get("display_name", "")
+                or legacy_model.get("name", "")
+                or model_id
+            )
+        return rows
 
     def _paged_query(
         self,
