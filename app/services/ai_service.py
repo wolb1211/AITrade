@@ -202,7 +202,7 @@ class AiDecisionClient:
                 model=str(model.get("model") or model.get("name") or ""),
                 system_prompt=system_prompt,
                 user_prompt=prompt,
-                max_tokens=2200 if endpoint == "open" else 1400,
+                max_tokens=3200 if endpoint == "open" else 1800,
             )
             parsed = json.loads(raw_response)
             choice = (parsed.get("choices") or [{}])[0]
@@ -227,16 +227,36 @@ class AiDecisionClient:
             )
             try:
                 content = _extract_json_object(response_content)
-            except (json.JSONDecodeError, ValueError):
-                fixed_response = self._repair_json_response(
-                    base_url=str(model["provider_base_url"]),
-                    api_key=str(model["provider_api_key"]),
-                    model=str(model.get("model") or model.get("name") or ""),
-                    endpoint=endpoint,
-                    response_content=response_content,
-                )
-                response_content = fixed_response
-                content = _extract_json_object(response_content)
+            except (json.JSONDecodeError, ValueError) as parse_exc:
+                try:
+                    fixed_response = self._repair_json_response(
+                        base_url=str(model["provider_base_url"]),
+                        api_key=str(model["provider_api_key"]),
+                        model=str(model.get("model") or model.get("name") or ""),
+                        endpoint=endpoint,
+                        response_content=response_content,
+                    )
+                    response_content = fixed_response
+                    content = _extract_json_object(response_content)
+                except Exception as repair_exc:  # noqa: BLE001
+                    message = (
+                        f"{type(parse_exc).__name__}: {parse_exc}; "
+                        f"repair_failed={type(repair_exc).__name__}: {repair_exc}; "
+                        f"response_preview={_preview_text(response_content)}"
+                    )
+                    logger.warning("AI decision JSON repair failed: %s", message)
+                    self._save_usage(
+                        deployment,
+                        endpoint,
+                        provider_id,
+                        model_id,
+                        usage,
+                        request_payload=user_payload,
+                        success=False,
+                        is_custom=is_custom,
+                        error_message=message[:1000],
+                    )
+                    return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
             self._save_usage(deployment, endpoint, provider_id, model_id, usage, request_payload=user_payload, success=True, is_custom=is_custom)
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
@@ -257,7 +277,7 @@ class AiDecisionClient:
                 is_custom=is_custom,
                 error_message=message[:1000],
             )
-            return None
+            return AiCallResult(content=_fallback_decision(endpoint, "AI调用失败，保守观望"), usage=usage)
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
@@ -366,7 +386,12 @@ class AiDecisionClient:
         message_payload = choice.get("message") if isinstance(choice, dict) else {}
         if not isinstance(message_payload, dict):
             return raw_response
-        return str(message_payload.get("content") or "").strip()
+        content = str(message_payload.get("content") or "").strip()
+        if not content and message_payload.get("reasoning_content"):
+            content = str(message_payload.get("reasoning_content") or "").strip()
+        if not content:
+            raise ValueError(f"AI repair response content empty; raw_preview={_preview_text(raw_response)}")
+        return content
 
     def _save_usage(
         self,
@@ -456,6 +481,29 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
     return parsed
+
+
+def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
+    if endpoint == "open":
+        return {
+            "should_open": False,
+            "direction": None,
+            "confidence": 0,
+            "lot": 0,
+            "sl_distance_price": 0,
+            "tp_distance_price": 0,
+            "reason": reason,
+        }
+    return {
+        "action": "hold",
+        "ticket": None,
+        "direction": None,
+        "confidence": 0,
+        "lot": 0,
+        "sl": None,
+        "tp": None,
+        "reason": reason,
+    }
 
 
 def _preview_text(value: str, limit: int = 500) -> str:
