@@ -255,15 +255,29 @@ class AiDecisionClient:
                         success=False,
                         is_custom=is_custom,
                         error_message=message[:1000],
+                        response_preview=_preview_text(response_content, 2000),
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
-            self._save_usage(deployment, endpoint, provider_id, model_id, usage, request_payload=user_payload, success=True, is_custom=is_custom)
+            self._save_usage(
+                deployment,
+                endpoint,
+                provider_id,
+                model_id,
+                usage,
+                request_payload=user_payload,
+                success=True,
+                is_custom=is_custom,
+                response_preview=_preview_text(json.dumps(content, ensure_ascii=False), 2000),
+            )
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
+            response_preview = ""
             if response_content:
+                response_preview = _preview_text(response_content, 2000)
                 message = f"{message}; response_preview={_preview_text(response_content)}"
             elif raw_response:
+                response_preview = _preview_text(raw_response, 2000)
                 message = f"{message}; raw_preview={_preview_text(raw_response)}"
             logger.warning("AI decision call failed: %s", message)
             self._save_usage(
@@ -276,6 +290,7 @@ class AiDecisionClient:
                 success=False,
                 is_custom=is_custom,
                 error_message=message[:1000],
+                response_preview=response_preview,
             )
             return AiCallResult(content=_fallback_decision(endpoint, "AI调用失败，保守观望"), usage=usage)
 
@@ -405,6 +420,7 @@ class AiDecisionClient:
         success: bool,
         is_custom: bool = False,
         error_message: str = "",
+        response_preview: str = "",
     ) -> None:
         request_payload = request_payload or {}
         account = request_payload.get("account") if isinstance(request_payload.get("account"), dict) else {}
@@ -427,6 +443,7 @@ class AiDecisionClient:
                 "custom_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens if is_custom else 0,
                 "success": success,
                 "error_message": error_message,
+                "response_preview": response_preview,
             },
         )
 

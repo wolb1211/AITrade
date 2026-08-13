@@ -374,6 +374,7 @@ class SqliteStore:
                     custom_tokens INTEGER NOT NULL DEFAULT 0,
                     success INTEGER NOT NULL DEFAULT 1,
                     error_message TEXT NOT NULL DEFAULT '',
+                    response_preview TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
 
@@ -479,6 +480,7 @@ class SqliteStore:
             "account_server": "ALTER TABLE ai_usage_logs ADD COLUMN account_server TEXT NOT NULL DEFAULT ''",
             "symbol": "ALTER TABLE ai_usage_logs ADD COLUMN symbol TEXT NOT NULL DEFAULT ''",
             "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
+            "response_preview": "ALTER TABLE ai_usage_logs ADD COLUMN response_preview TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -2617,9 +2619,9 @@ class SqliteStore:
         clauses = []
         params: list[Any] = []
         if keyword:
-            clauses.append("(deployment_id LIKE ? OR strategy_code LIKE ? OR endpoint LIKE ? OR error_message LIKE ?)")
+            clauses.append("(deployment_id LIKE ? OR strategy_code LIKE ? OR endpoint LIKE ? OR error_message LIKE ? OR response_preview LIKE ?)")
             like = f"%{keyword}%"
-            params.extend([like, like, like, like])
+            params.extend([like, like, like, like, like])
         if user_id:
             clauses.append("user_id = ?")
             params.append(user_id)
@@ -2649,8 +2651,8 @@ class SqliteStore:
                     id, user_id, deployment_id, strategy_code, endpoint,
                     provider_id, model_id, account_login, account_server, symbol, timeframe,
                     input_tokens, output_tokens, total_tokens,
-                    official_tokens, custom_tokens, success, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    official_tokens, custom_tokens, success, error_message, response_preview, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     log_id,
@@ -2671,6 +2673,7 @@ class SqliteStore:
                     int(payload.get("custom_tokens") or 0),
                     1 if payload.get("success", True) else 0,
                     str(payload.get("error_message") or ""),
+                    str(payload.get("response_preview") or ""),
                     now,
                 ),
             )
@@ -3008,6 +3011,7 @@ class MySQLStore(SqliteStore):
             "account_server": "ALTER TABLE ai_usage_logs ADD COLUMN account_server VARCHAR(128) NOT NULL DEFAULT '' AFTER account_login",
             "symbol": "ALTER TABLE ai_usage_logs ADD COLUMN symbol VARCHAR(32) NOT NULL DEFAULT '' AFTER account_server",
             "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe VARCHAR(16) NOT NULL DEFAULT '' AFTER symbol",
+            "response_preview": "ALTER TABLE ai_usage_logs ADD COLUMN response_preview TEXT NULL AFTER error_message",
         }
         with self._connect() as connection:
             rows = connection.execute(
