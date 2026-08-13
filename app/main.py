@@ -47,7 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
     else:
         store = SqliteStore(resolved.database_path)
-    ai_client = AiDecisionClient(store)
+    ai_client = AiDecisionClient(store, timeout=resolved.ai_timeout)
     strategies = [
         PaMockStrategy(),
         PaAgentLiteStrategy(ai_client),

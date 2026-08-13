@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from socket import timeout as SocketTimeout
 from typing import Any
 from urllib import error, request
 
@@ -296,6 +297,10 @@ class AiDecisionClient:
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"AI provider HTTP {exc.code}: {detail[:500]}") from exc
+        except TimeoutError as exc:
+            raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+        except SocketTimeout as exc:
+            raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
 
     def _save_usage(
         self,

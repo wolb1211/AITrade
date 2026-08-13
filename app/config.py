@@ -36,6 +36,7 @@ class Settings:
     mysql_database: str = ""
     mysql_user: str = ""
     mysql_password: str = ""
+    ai_timeout: float = 30.0
     demo_deployment_key: str = "gl_demo_pa_key"
 
     @classmethod
@@ -56,6 +57,7 @@ class Settings:
             mysql_database=os.getenv("GAINLAB_MYSQL_DATABASE", ""),
             mysql_user=os.getenv("GAINLAB_MYSQL_USER", ""),
             mysql_password=os.getenv("GAINLAB_MYSQL_PASSWORD", ""),
+            ai_timeout=float(os.getenv("GAINLAB_AI_TIMEOUT", "30")),
             demo_deployment_key=os.getenv(
                 "GAINLAB_DEMO_DEPLOYMENT_KEY",
                 "gl_demo_pa_key",
