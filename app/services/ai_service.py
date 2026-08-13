@@ -226,7 +226,7 @@ class AiDecisionClient:
                 charged_points=int(usage_payload.get("total_tokens") or 0),
             )
             try:
-                content = _extract_json_object(response_content)
+                content = _extract_json_object(response_content, endpoint=endpoint)
             except (json.JSONDecodeError, ValueError) as parse_exc:
                 original_response_content = response_content
                 try:
@@ -238,7 +238,7 @@ class AiDecisionClient:
                         response_content=response_content,
                     )
                     response_content = fixed_response
-                    content = _extract_json_object(response_content)
+                    content = _extract_json_object(response_content, endpoint=endpoint)
                 except Exception as repair_exc:  # noqa: BLE001
                     message = (
                         f"{type(parse_exc).__name__}: {parse_exc}; "
@@ -478,7 +478,7 @@ def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any
     ]
 
 
-def _extract_json_object(content: str) -> dict[str, Any]:
+def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
     stripped = content.strip()
     if not stripped:
         raise ValueError("AI response content empty")
@@ -489,19 +489,47 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
-        json_object = _find_first_json_object(stripped)
+        json_object = _find_decision_json_object(stripped, endpoint=endpoint)
         if json_object is None:
             raise
         parsed = json.loads(json_object)
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
+    required_key = "should_open" if endpoint == "open" else "action" if endpoint == "position" else ""
+    if required_key and required_key not in parsed:
+        raise ValueError(f"AI response missing required key: {required_key}")
     return parsed
 
 
-def _find_first_json_object(value: str) -> str | None:
-    start = value.find("{")
-    if start < 0:
-        return None
+def _find_decision_json_object(value: str, *, endpoint: str = "") -> str | None:
+    required_key = "should_open" if endpoint == "open" else "action" if endpoint == "position" else ""
+    candidates = _iter_json_objects(value)
+    fallback = None
+    for candidate in candidates:
+        if fallback is None:
+            fallback = candidate
+        if not required_key:
+            return candidate
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and required_key in parsed:
+            return candidate
+    return fallback if not required_key else None
+
+
+def _iter_json_objects(value: str) -> list[str]:
+    objects: list[str] = []
+    starts = [index for index, char in enumerate(value) if char == "{"]
+    for start in starts:
+        obj = _scan_json_object(value, start)
+        if obj is not None:
+            objects.append(obj)
+    return objects
+
+
+def _scan_json_object(value: str, start: int) -> str | None:
     depth = 0
     in_string = False
     escaped = False
