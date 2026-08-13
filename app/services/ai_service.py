@@ -202,7 +202,7 @@ class AiDecisionClient:
                 model=str(model.get("model") or model.get("name") or ""),
                 system_prompt=system_prompt,
                 user_prompt=prompt,
-                max_tokens=1400 if endpoint == "open" else 1000,
+                max_tokens=2200 if endpoint == "open" else 1400,
             )
             parsed = json.loads(raw_response)
             choice = (parsed.get("choices") or [{}])[0]
@@ -225,7 +225,18 @@ class AiDecisionClient:
                 output_tokens=int(usage_payload.get("completion_tokens") or 0),
                 charged_points=int(usage_payload.get("total_tokens") or 0),
             )
-            content = _extract_json_object(response_content)
+            try:
+                content = _extract_json_object(response_content)
+            except (json.JSONDecodeError, ValueError):
+                fixed_response = self._repair_json_response(
+                    base_url=str(model["provider_base_url"]),
+                    api_key=str(model["provider_api_key"]),
+                    model=str(model.get("model") or model.get("name") or ""),
+                    endpoint=endpoint,
+                    response_content=response_content,
+                )
+                response_content = fixed_response
+                content = _extract_json_object(response_content)
             self._save_usage(deployment, endpoint, provider_id, model_id, usage, request_payload=user_payload, success=True, is_custom=is_custom)
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
@@ -321,6 +332,41 @@ class AiDecisionClient:
             raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
         except SocketTimeout as exc:
             raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+
+    def _repair_json_response(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        endpoint: str,
+        response_content: str,
+    ) -> str:
+        schema = (
+            '{"should_open":false,"direction":null,"confidence":0,'
+            '"lot":0,"sl_distance_price":0,"tp_distance_price":0,"reason":"..."}'
+            if endpoint == "open"
+            else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
+            '"lot":0,"sl":null,"tp":null,"reason":"..."}'
+        )
+        raw_response = self._post_chat_completion(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system_prompt=(
+                "Convert the provided assistant output into exactly one valid JSON object. "
+                "Return JSON only. No Markdown, no explanation. "
+                f"Use this schema shape: {schema}"
+            ),
+            user_prompt=response_content[:6000],
+            max_tokens=600,
+        )
+        parsed = json.loads(raw_response)
+        choice = (parsed.get("choices") or [{}])[0]
+        message_payload = choice.get("message") if isinstance(choice, dict) else {}
+        if not isinstance(message_payload, dict):
+            return raw_response
+        return str(message_payload.get("content") or "").strip()
 
     def _save_usage(
         self,
