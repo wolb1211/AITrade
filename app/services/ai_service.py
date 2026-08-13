@@ -475,10 +475,10 @@ def _pa_system_prompt() -> str:
 def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
     schema = (
         '{"should_open":false,"direction":null,"confidence":0,'
-        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,"reason":"观望原因"}'
+        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,"reason":"根据行情给出具体原因"}'
         if endpoint == "open"
         else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
-        '"lot":0,"sl":null,"tp":null,"reason":"观望原因"}'
+        '"lot":0,"sl":null,"tp":null,"reason":"根据行情给出具体原因"}'
     )
     return (
         "You are a strict JSON API endpoint, not a chat assistant. "
@@ -489,7 +489,8 @@ def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
         "Do not use chain-of-thought. Make the decision silently. "
         "If uncertain or unsafe, return the safe object directly. "
         f"Required JSON shape: {schema}. "
-        "Reason must be concise Chinese, max 40 characters. "
+        "Reason must be a concrete concise Chinese market/strategy reason, max 40 characters. "
+        "Never copy placeholder text such as 观望原因, 根据行情给出具体原因, reason, or .... "
         f"Task: {task_prompt}"
     )
 
@@ -536,7 +537,30 @@ def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
     required_key = "should_open" if endpoint == "open" else "action" if endpoint == "position" else ""
     if required_key and required_key not in parsed:
         raise ValueError(f"AI response missing required key: {required_key}")
+    _normalize_decision_reason(parsed, endpoint=endpoint)
     return parsed
+
+
+def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") -> None:
+    reason = str(parsed.get("reason") or "").strip()
+    placeholder_reasons = {
+        "",
+        "...",
+        "reason",
+        "观望原因",
+        "根据行情给出具体原因",
+        "具体原因",
+        "原因",
+    }
+    if reason.lower() not in placeholder_reasons:
+        return
+    if endpoint == "open":
+        parsed["reason"] = "开单条件不足，继续观望"
+        return
+    if endpoint == "position":
+        parsed["reason"] = "风控条件未触发，继续持有"
+        return
+    parsed["reason"] = "条件不足，继续观望"
 
 
 def _find_decision_json_object(value: str, *, endpoint: str = "") -> str | None:
