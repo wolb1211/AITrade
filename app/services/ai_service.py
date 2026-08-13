@@ -197,7 +197,7 @@ class AiDecisionClient:
             raw = self._post_chat_completion(
                 base_url=str(model["provider_base_url"]),
                 api_key=str(model["provider_api_key"]),
-                model=str(model["name"]),
+                model=str(model.get("model") or model.get("name") or ""),
                 system_prompt=system_prompt,
                 user_prompt=prompt,
             )
@@ -241,6 +241,7 @@ class AiDecisionClient:
                     "id": f"custom_{prefix}",
                     "provider_id": f"custom_{prefix}",
                     "name": model_name,
+                    "model": model_name,
                     "provider_base_url": base_url,
                     "provider_api_key": api_key,
                     "provider_type": "openai_compatible",
