@@ -200,9 +200,9 @@ class AiDecisionClient:
                 base_url=str(model["provider_base_url"]),
                 api_key=str(model["provider_api_key"]),
                 model=str(model.get("model") or model.get("name") or ""),
-                system_prompt=system_prompt,
+                system_prompt=_json_api_system_prompt(endpoint, system_prompt),
                 user_prompt=prompt,
-                max_tokens=1200,
+                max_tokens=_max_tokens_for_endpoint(endpoint),
                 strict_json=bool(model.get("strict_json", True)),
             )
             parsed = json.loads(raw_response)
@@ -395,15 +395,16 @@ class AiDecisionClient:
             base_url=base_url,
             api_key=api_key,
             model=model,
-            system_prompt=(
-                "You are a JSON repair function. Return exactly one minified JSON object. "
-                "First character must be { and last character must be }. "
-                "No prose, no Markdown, no explanation, no analysis. "
-                "If the input does not contain a recoverable decision, return the safe hold/no-open object. "
-                f"Use this schema shape: {schema}"
+            system_prompt=_json_api_system_prompt(
+                endpoint,
+                (
+                    "Repair the supplied decision into one valid JSON object. "
+                    "If the input does not contain a recoverable decision, return the safe hold/no-open object. "
+                    f"Use this schema shape: {schema}"
+                ),
             ),
             user_prompt=response_content[:6000],
-            max_tokens=600,
+            max_tokens=320,
             strict_json=strict_json,
         )
         parsed = json.loads(raw_response)
@@ -469,6 +470,36 @@ def _pa_system_prompt() -> str:
         "For position endpoint use keys: action, ticket, direction, confidence, lot, sl, tp, reason. "
         "reason <= 40 Chinese characters. Never invent prices. Use price distances for SL/TP."
     )
+
+
+def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
+    schema = (
+        '{"should_open":false,"direction":null,"confidence":0,'
+        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,"reason":"观望原因"}'
+        if endpoint == "open"
+        else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
+        '"lot":0,"sl":null,"tp":null,"reason":"观望原因"}'
+    )
+    return (
+        "You are a strict JSON API endpoint, not a chat assistant. "
+        "Return exactly one minified JSON object only. "
+        "The first character of your response must be { and the last character must be }. "
+        "Do not output reasoning, analysis, thoughts, markdown, code fences, explanations, prefixes, or suffixes. "
+        "Never say what you need to do. Never mention JSON rules. "
+        "Do not use chain-of-thought. Make the decision silently. "
+        "If uncertain or unsafe, return the safe object directly. "
+        f"Required JSON shape: {schema}. "
+        "Reason must be concise Chinese, max 40 characters. "
+        f"Task: {task_prompt}"
+    )
+
+
+def _max_tokens_for_endpoint(endpoint: str) -> int:
+    if endpoint == "open":
+        return 420
+    if endpoint == "position":
+        return 520
+    return 500
 
 
 def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any]]:
