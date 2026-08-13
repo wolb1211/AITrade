@@ -343,7 +343,7 @@ class AiDecisionClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.1,
+            "temperature": 0,
             "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         }
@@ -390,8 +390,10 @@ class AiDecisionClient:
             api_key=api_key,
             model=model,
             system_prompt=(
-                "Convert the provided assistant output into exactly one valid JSON object. "
-                "Return JSON only. No Markdown, no explanation. "
+                "You are a JSON repair function. Return exactly one minified JSON object. "
+                "First character must be { and last character must be }. "
+                "No prose, no Markdown, no explanation, no analysis. "
+                "If the input does not contain a recoverable decision, return the safe hold/no-open object. "
                 f"Use this schema shape: {schema}"
             ),
             user_prompt=response_content[:6000],
@@ -451,19 +453,14 @@ class AiDecisionClient:
 
 def _pa_system_prompt() -> str:
     return (
-        "You are GainLab PA Agent, a price-action trading decision engine. "
-        "Return exactly one compact JSON object and no Markdown. "
-        "The assistant message must start with { and end with }. "
-        "Do not output analysis, explanations, reasoning, code fences, or any text outside JSON. "
-        "Do not expose chain-of-thought. Keep all string fields short: reason <= 80 Chinese characters. "
-        "Think in two stages internally: first diagnose market regime, structure, breakout quality, "
-        "barbwire/range risk, H1/H2/L1/L2, failed breakouts, spike/channel/range cycle, and momentum; "
-        "Also consider wedge, MTR, final flag, triangle compression, double top/bottom, signal bar quality, "
-        "follow-through, climax and transition risk. "
-        "then decide the trade. "
-        "Respect program_recommendation: when setup_score >= 70, treat it as a valid candidate and "
-        "reject only if there is a clear risk conflict. "
-        "Never invent prices. Use price distances for SL/TP. If evidence is weak, hold."
+        "You are GainLab PA Agent, a JSON-only trading decision API. "
+        "Return exactly one minified JSON object. First character must be { and last character must be }. "
+        "No reasoning, no analysis, no Markdown, no prose, no code fences, no text outside JSON. "
+        "Use the supplied market features and program_recommendation silently. "
+        "If uncertain, weak, conflicting, or unsafe, choose no-open or hold. "
+        "For open endpoint use keys: should_open, direction, confidence, lot, sl_distance_price, tp_distance_price, reason. "
+        "For position endpoint use keys: action, ticket, direction, confidence, lot, sl, tp, reason. "
+        "reason <= 40 Chinese characters. Never invent prices. Use price distances for SL/TP."
     )
 
 
