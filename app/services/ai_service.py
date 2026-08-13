@@ -228,6 +228,7 @@ class AiDecisionClient:
             try:
                 content = _extract_json_object(response_content)
             except (json.JSONDecodeError, ValueError) as parse_exc:
+                original_response_content = response_content
                 try:
                     fixed_response = self._repair_json_response(
                         base_url=str(model["provider_base_url"]),
@@ -255,7 +256,7 @@ class AiDecisionClient:
                         success=False,
                         is_custom=is_custom,
                         error_message=message[:1000],
-                        response_preview=_preview_text(response_content, 2000),
+                        response_preview=_format_response_preview(raw=original_response_content or response_content),
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
             self._save_usage(
@@ -267,7 +268,7 @@ class AiDecisionClient:
                 request_payload=user_payload,
                 success=True,
                 is_custom=is_custom,
-                response_preview=_preview_text(json.dumps(content, ensure_ascii=False), 2000),
+                response_preview=_format_response_preview(raw=response_content, parsed=content),
             )
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
@@ -498,6 +499,16 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
     return parsed
+
+
+def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = None) -> str:
+    parts: list[str] = []
+    raw = str(raw or "").strip()
+    if raw:
+        parts.append(f"原始返回:\n{_preview_text(raw, 1600)}")
+    if parsed is not None:
+        parts.append(f"解析结果:\n{_preview_text(json.dumps(parsed, ensure_ascii=False), 1600)}")
+    return "\n\n".join(parts)[:3200]
 
 
 def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
