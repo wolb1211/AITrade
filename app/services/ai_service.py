@@ -202,7 +202,7 @@ class AiDecisionClient:
                 model=str(model.get("model") or model.get("name") or ""),
                 system_prompt=system_prompt,
                 user_prompt=prompt,
-                max_tokens=3200 if endpoint == "open" else 1800,
+                max_tokens=1200,
             )
             parsed = json.loads(raw_response)
             choice = (parsed.get("choices") or [{}])[0]
@@ -452,9 +452,10 @@ class AiDecisionClient:
 def _pa_system_prompt() -> str:
     return (
         "You are GainLab PA Agent, a price-action trading decision engine. "
-        "Return exactly one JSON object and no Markdown. "
+        "Return exactly one compact JSON object and no Markdown. "
         "The assistant message must start with { and end with }. "
-        "Do not output analysis, explanations, code fences, or any text outside JSON. "
+        "Do not output analysis, explanations, reasoning, code fences, or any text outside JSON. "
+        "Do not expose chain-of-thought. Keep all string fields short: reason <= 80 Chinese characters. "
         "Think in two stages internally: first diagnose market regime, structure, breakout quality, "
         "barbwire/range risk, H1/H2/L1/L2, failed breakouts, spike/channel/range cycle, and momentum; "
         "Also consider wedge, MTR, final flag, triangle compression, double top/bottom, signal bar quality, "
@@ -491,14 +492,41 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     try:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start < 0 or end <= start:
+        json_object = _find_first_json_object(stripped)
+        if json_object is None:
             raise
-        parsed = json.loads(stripped[start : end + 1])
+        parsed = json.loads(json_object)
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
     return parsed
+
+
+def _find_first_json_object(value: str) -> str | None:
+    start = value.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(value)):
+        char = value[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start : index + 1]
+    return None
 
 
 def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = None) -> str:
