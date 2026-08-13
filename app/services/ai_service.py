@@ -192,10 +192,11 @@ class AiDecisionClient:
         is_custom = bool(model.get("is_custom"))
         prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
         response_content = ""
+        raw_response = ""
         usage = UsageSummary(ai_called=True)
 
         try:
-            raw = self._post_chat_completion(
+            raw_response = self._post_chat_completion(
                 base_url=str(model["provider_base_url"]),
                 api_key=str(model["provider_api_key"]),
                 model=str(model.get("model") or model.get("name") or ""),
@@ -203,8 +204,20 @@ class AiDecisionClient:
                 user_prompt=prompt,
                 max_tokens=1400 if endpoint == "open" else 1000,
             )
-            parsed = json.loads(raw)
-            response_content = str(parsed["choices"][0]["message"]["content"])
+            parsed = json.loads(raw_response)
+            choice = (parsed.get("choices") or [{}])[0]
+            message_payload = choice.get("message") if isinstance(choice, dict) else {}
+            if not isinstance(message_payload, dict):
+                message_payload = {}
+            response_content = str(message_payload.get("content") or "").strip()
+            if not response_content and message_payload.get("reasoning_content"):
+                response_content = str(message_payload.get("reasoning_content") or "").strip()
+            if not response_content:
+                raise ValueError(
+                    "AI response content empty; "
+                    f"message_preview={_preview_json(message_payload)}; "
+                    f"raw_preview={_preview_text(raw_response)}"
+                )
             usage_payload = parsed.get("usage") or {}
             usage = UsageSummary(
                 ai_called=True,
@@ -218,8 +231,9 @@ class AiDecisionClient:
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
             if response_content:
-                preview = response_content.replace("\r", " ").replace("\n", " ").strip()
-                message = f"{message}; response_preview={preview[:500]}"
+                message = f"{message}; response_preview={_preview_text(response_content)}"
+            elif raw_response:
+                message = f"{message}; raw_preview={_preview_text(raw_response)}"
             logger.warning("AI decision call failed: %s", message)
             self._save_usage(
                 deployment,
@@ -379,6 +393,8 @@ def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any
 
 def _extract_json_object(content: str) -> dict[str, Any]:
     stripped = content.strip()
+    if not stripped:
+        raise ValueError("AI response content empty")
     if stripped.startswith("```"):
         stripped = stripped.strip("`")
         if stripped.lower().startswith("json"):
@@ -394,3 +410,14 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
     return parsed
+
+
+def _preview_text(value: str, limit: int = 500) -> str:
+    return value.replace("\r", " ").replace("\n", " ").strip()[:limit]
+
+
+def _preview_json(value: Any, limit: int = 500) -> str:
+    try:
+        return _preview_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")), limit)
+    except TypeError:
+        return _preview_text(str(value), limit)
