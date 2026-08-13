@@ -201,7 +201,7 @@ class AiDecisionClient:
                 model=str(model.get("model") or model.get("name") or ""),
                 system_prompt=system_prompt,
                 user_prompt=prompt,
-                max_tokens=900 if endpoint == "open" else 600,
+                max_tokens=1400 if endpoint == "open" else 1000,
             )
             parsed = json.loads(raw)
             response_content = str(parsed["choices"][0]["message"]["content"])
@@ -217,6 +217,9 @@ class AiDecisionClient:
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
+            if response_content:
+                preview = response_content.replace("\r", " ").replace("\n", " ").strip()
+                message = f"{message}; response_preview={preview[:500]}"
             logger.warning("AI decision call failed: %s", message)
             self._save_usage(
                 deployment,
@@ -347,6 +350,8 @@ def _pa_system_prompt() -> str:
     return (
         "You are GainLab PA Agent, a price-action trading decision engine. "
         "Return exactly one JSON object and no Markdown. "
+        "The assistant message must start with { and end with }. "
+        "Do not output analysis, explanations, code fences, or any text outside JSON. "
         "Think in two stages internally: first diagnose market regime, structure, breakout quality, "
         "barbwire/range risk, H1/H2/L1/L2, failed breakouts, spike/channel/range cycle, and momentum; "
         "Also consider wedge, MTR, final flag, triangle compression, double top/bottom, signal bar quality, "
