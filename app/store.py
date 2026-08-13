@@ -331,6 +331,7 @@ class SqliteStore:
                     base_url TEXT NOT NULL,
                     model TEXT NOT NULL,
                     api_key TEXT NOT NULL DEFAULT '',
+                    strict_json INTEGER NOT NULL DEFAULT 1,
                     context_window INTEGER NOT NULL DEFAULT 0,
                     input_token_rate REAL NOT NULL DEFAULT 1,
                     output_token_rate REAL NOT NULL DEFAULT 1,
@@ -531,6 +532,7 @@ class SqliteStore:
                 base_url TEXT NOT NULL,
                 model TEXT NOT NULL,
                 api_key TEXT NOT NULL DEFAULT '',
+                strict_json INTEGER NOT NULL DEFAULT 1,
                 context_window INTEGER NOT NULL DEFAULT 0,
                 input_token_rate REAL NOT NULL DEFAULT 1,
                 output_token_rate REAL NOT NULL DEFAULT 1,
@@ -557,6 +559,7 @@ class SqliteStore:
             "base_url": "ALTER TABLE ai_endpoints ADD COLUMN base_url TEXT NOT NULL DEFAULT ''",
             "model": "ALTER TABLE ai_endpoints ADD COLUMN model TEXT NOT NULL DEFAULT ''",
             "api_key": "ALTER TABLE ai_endpoints ADD COLUMN api_key TEXT NOT NULL DEFAULT ''",
+            "strict_json": "ALTER TABLE ai_endpoints ADD COLUMN strict_json INTEGER NOT NULL DEFAULT 1",
             "context_window": "ALTER TABLE ai_endpoints ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0",
             "input_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN input_token_rate REAL NOT NULL DEFAULT 1",
             "output_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN output_token_rate REAL NOT NULL DEFAULT 1",
@@ -2379,10 +2382,10 @@ class SqliteStore:
                 """
                 INSERT INTO ai_endpoints (
                     id, owner_type, user_id, template_code, name, base_url, model,
-                    api_key, context_window, input_token_rate, output_token_rate,
+                    api_key, strict_json, context_window, input_token_rate, output_token_rate,
                     billing_multiplier, is_default, enabled, selectable_by_user,
                     sort, remark, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     owner_type = excluded.owner_type,
                     user_id = excluded.user_id,
@@ -2391,6 +2394,7 @@ class SqliteStore:
                     base_url = excluded.base_url,
                     model = excluded.model,
                     api_key = excluded.api_key,
+                    strict_json = excluded.strict_json,
                     context_window = excluded.context_window,
                     input_token_rate = excluded.input_token_rate,
                     output_token_rate = excluded.output_token_rate,
@@ -2411,6 +2415,7 @@ class SqliteStore:
                     str(payload.get("base_url") or "").strip(),
                     str(payload.get("model") or "").strip(),
                     api_key.strip(),
+                    1 if payload.get("strict_json", True) else 0,
                     int(payload.get("context_window") or 0),
                     float(payload.get("input_token_rate") or 1),
                     float(payload.get("output_token_rate") or 1),
@@ -2845,6 +2850,7 @@ class SqliteStore:
         data["enabled"] = bool(data["enabled"])
         data["is_default"] = bool(data["is_default"])
         data["selectable_by_user"] = bool(data["selectable_by_user"])
+        data["strict_json"] = bool(data.get("strict_json", 1))
         data["provider_id"] = str(data.get("id") or "")
         data["model_id"] = str(data.get("id") or "")
         data["provider_name"] = str(data.get("name") or "")
@@ -3037,6 +3043,7 @@ class MySQLStore(SqliteStore):
             "base_url": "ALTER TABLE ai_endpoints ADD COLUMN base_url VARCHAR(512) NOT NULL DEFAULT ''",
             "model": "ALTER TABLE ai_endpoints ADD COLUMN model VARCHAR(128) NOT NULL DEFAULT ''",
             "api_key": "ALTER TABLE ai_endpoints ADD COLUMN api_key VARCHAR(512) NOT NULL DEFAULT ''",
+            "strict_json": "ALTER TABLE ai_endpoints ADD COLUMN strict_json TINYINT NOT NULL DEFAULT 1",
             "context_window": "ALTER TABLE ai_endpoints ADD COLUMN context_window INT NOT NULL DEFAULT 0",
             "input_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN input_token_rate DOUBLE NOT NULL DEFAULT 1",
             "output_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN output_token_rate DOUBLE NOT NULL DEFAULT 1",

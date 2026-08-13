@@ -203,6 +203,7 @@ class AiDecisionClient:
                 system_prompt=system_prompt,
                 user_prompt=prompt,
                 max_tokens=1200,
+                strict_json=bool(model.get("strict_json", True)),
             )
             parsed = json.loads(raw_response)
             choice = (parsed.get("choices") or [{}])[0]
@@ -236,6 +237,7 @@ class AiDecisionClient:
                         model=str(model.get("model") or model.get("name") or ""),
                         endpoint=endpoint,
                         response_content=response_content,
+                        strict_json=bool(model.get("strict_json", True)),
                     )
                     response_content = fixed_response
                     content = _extract_json_object(response_content, endpoint=endpoint)
@@ -311,6 +313,7 @@ class AiDecisionClient:
                     "provider_base_url": base_url,
                     "provider_api_key": api_key,
                     "provider_type": "openai_compatible",
+                    "strict_json": True,
                     "is_custom": True,
                 }
         official_strategy = self.store.get_official_ai_strategy(str(deployment.get("strategy_code") or ""))
@@ -335,6 +338,7 @@ class AiDecisionClient:
         system_prompt: str,
         user_prompt: str,
         max_tokens: int,
+        strict_json: bool = True,
     ) -> str:
         url = f"{base_url.rstrip('/')}/chat/completions"
         body = {
@@ -345,8 +349,9 @@ class AiDecisionClient:
             ],
             "temperature": 0,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
         }
+        if strict_json:
+            body["response_format"] = {"type": "json_object"}
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = request.Request(
             url,
@@ -377,6 +382,7 @@ class AiDecisionClient:
         model: str,
         endpoint: str,
         response_content: str,
+        strict_json: bool = True,
     ) -> str:
         schema = (
             '{"should_open":false,"direction":null,"confidence":0,'
@@ -398,6 +404,7 @@ class AiDecisionClient:
             ),
             user_prompt=response_content[:6000],
             max_tokens=600,
+            strict_json=strict_json,
         )
         parsed = json.loads(raw_response)
         choice = (parsed.get("choices") or [{}])[0]
