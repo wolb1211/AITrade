@@ -94,9 +94,7 @@ class PaAgentLiteStrategy:
             return _hold(request, self._decision_id(), "PA Agent strategy requires at least 30 candles")
 
         ai_decision = self._evaluate_open_with_ai(request, deployment, features)
-        if ai_decision is not None and (
-            ai_decision.action != "HOLD" or features.setup_score < 70
-        ):
+        if ai_decision is not None:
             return ai_decision
 
         if _is_choppy(features):
