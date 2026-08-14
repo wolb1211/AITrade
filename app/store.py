@@ -2703,6 +2703,15 @@ class SqliteStore:
         endpoint_map: dict[str, dict[str, Any]] = {}
         provider_map: dict[str, str] = {}
         model_map: dict[str, dict[str, str]] = {}
+        deployment_configs: dict[str, dict[str, Any]] = {}
+        custom_deployment_ids = sorted(
+            {
+                str(row.get("deployment_id") or "")
+                for row in rows
+                if str(row.get("provider_id") or "").startswith("custom_")
+                and str(row.get("deployment_id") or "").strip()
+            }
+        )
         with self._connect() as connection:
             for endpoint in connection.execute(
                 f"SELECT id, name, model FROM ai_endpoints WHERE id IN ({placeholders})",
@@ -2726,6 +2735,27 @@ class SqliteStore:
                     "display_name": str(model["display_name"] or ""),
                 }
 
+            if custom_deployment_ids:
+                deployment_placeholders = ",".join("?" for _ in custom_deployment_ids)
+                for deployment in connection.execute(
+                    f"SELECT id, config_json FROM deployments WHERE id IN ({deployment_placeholders})",
+                    custom_deployment_ids,
+                ).fetchall():
+                    try:
+                        config = json.loads(str(deployment["config_json"] or "{}"))
+                    except json.JSONDecodeError:
+                        config = {}
+                    deployment_configs[str(deployment["id"])] = config if isinstance(config, dict) else {}
+
+        custom_model_placeholders = {
+            "",
+            "custom",
+            "custom_ai",
+            "custom_model",
+            "custom_open",
+            "custom_position",
+            "自定义模型",
+        }
         for row in rows:
             provider_id = str(row.get("provider_id") or "")
             model_id = str(row.get("model_id") or "")
@@ -2751,7 +2781,17 @@ class SqliteStore:
             )
             if is_custom_provider:
                 provider_name = "自定义AI"
-                model_name = "自定义模型" if is_custom_model else model_name
+                custom_model_name = model_id.strip()
+                if custom_model_name in custom_model_placeholders:
+                    config = deployment_configs.get(str(row.get("deployment_id") or ""), {})
+                    endpoint = str(row.get("endpoint") or "")
+                    prefix = "position" if endpoint == "position" else "open"
+                    custom_model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
+                model_name = (
+                    custom_model_name
+                    if custom_model_name and custom_model_name not in custom_model_placeholders
+                    else "自定义模型"
+                )
 
             row["provider_name"] = provider_name
             row["model_name"] = model_name
