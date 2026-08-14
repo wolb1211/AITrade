@@ -232,6 +232,24 @@ class AiDecisionClient:
                 content = _extract_json_object(response_content, endpoint=endpoint)
             except (json.JSONDecodeError, ValueError) as parse_exc:
                 original_response_content = response_content
+                recovered = _recover_decision_from_text(original_response_content, endpoint=endpoint)
+                if recovered is not None:
+                    logger.warning(
+                        "AI decision JSON recovered locally: %s",
+                        f"{type(parse_exc).__name__}: {parse_exc}; response_preview={_preview_text(original_response_content)}",
+                    )
+                    self._save_usage(
+                        deployment,
+                        endpoint,
+                        provider_id,
+                        model_id,
+                        usage,
+                        request_payload=user_payload,
+                        success=True,
+                        is_custom=is_custom,
+                        response_preview=_format_response_preview(raw=original_response_content, parsed=recovered),
+                    )
+                    return AiCallResult(content=recovered, usage=usage)
                 try:
                     fixed_response = self._repair_json_response(
                         base_url=str(model["provider_base_url"]),
@@ -388,10 +406,12 @@ class AiDecisionClient:
     ) -> str:
         schema = (
             '{"should_open":false,"direction":null,"confidence":0,'
-            '"lot":0,"sl_distance_price":0,"tp_distance_price":0,"reason":"..."}'
+            '"lot":0,"sl_distance_price":0,"tp_distance_price":0,'
+            '"reason":"具体原因","analysis":"详细中文行情和风控说明"}'
             if endpoint == "open"
             else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
-            '"lot":0,"sl":null,"tp":null,"reason":"..."}'
+            '"lot":0,"sl":null,"tp":null,'
+            '"reason":"具体原因","analysis":"详细中文持仓和风控说明"}'
         )
         raw_response = self._post_chat_completion(
             base_url=base_url,
@@ -400,13 +420,14 @@ class AiDecisionClient:
             system_prompt=_json_api_system_prompt(
                 endpoint,
                 (
-                    "Repair the supplied decision into one valid JSON object. "
-                    "If the input does not contain a recoverable decision, return the safe hold/no-open object. "
-                    f"Use this schema shape: {schema}"
+                    "把下面这段模型返回内容修复成一个合法 JSON 对象。"
+                    "只返回 JSON，不要解释。"
+                    "如果内容里没有可恢复的明确交易结论，返回安全的不开仓或继续持有对象。"
+                    f"必须使用这个结构: {schema}"
                 ),
             ),
             user_prompt=response_content[:6000],
-            max_tokens=320,
+            max_tokens=700,
             strict_json=strict_json,
         )
         parsed = json.loads(raw_response)
@@ -463,16 +484,16 @@ class AiDecisionClient:
 
 def _pa_system_prompt() -> str:
     return (
-        "You are GainLab PA Agent, a JSON-only trading decision API. "
-        "Return exactly one minified JSON object. First character must be { and last character must be }. "
-        "No private reasoning, thoughts, Markdown, prose, code fences, or text outside JSON. "
-        "Use the supplied market features and program_recommendation silently, then write the final explanation only in JSON fields. "
+        "You are GainLab PA Agent trading decision API. Return only one compact JSON object. "
+        "First character must be { and last character must be }. "
+        "Do not output thoughts, reasoning process, markdown, code fences, prefixes, suffixes, or prose outside JSON. "
+        "Analyze silently. Put the final useful explanation inside the JSON fields reason and analysis. "
         "If uncertain, weak, conflicting, or unsafe, choose no-open or hold. "
-        "For open endpoint use keys: should_open, direction, confidence, lot, sl_distance_price, tp_distance_price, reason, analysis. "
-        "For position endpoint use keys: action, ticket, direction, confidence, lot, sl, tp, reason, analysis. "
-        "reason is a concise Chinese summary <= 60 characters. "
-        "analysis is the final Chinese market explanation, 120-300 characters, with concrete structure, score, price/risk details. "
-        "Never invent prices. Use price distances for SL/TP."
+        "Open endpoint keys: should_open, direction, confidence, lot, sl_distance_price, tp_distance_price, reason, analysis. "
+        "Position endpoint keys: action, ticket, direction, confidence, lot, sl, tp, reason, analysis. "
+        "reason must be Chinese, concrete, <=60 Chinese characters. "
+        "analysis must be Chinese, 120-300 Chinese characters, with market structure, setup score, price/risk context, and action rationale. "
+        "Never invent prices. Use price distances for open SL/TP."
     )
 
 
@@ -500,6 +521,30 @@ def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
         "Never copy placeholder text such as 观望原因, 根据行情给出具体原因, reason, analysis, or .... "
         f"Task: {task_prompt}"
     )
+
+def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
+    schema = (
+        '{"should_open":false,"direction":null,"confidence":0,'
+        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,'
+        '"reason":"short Chinese reason","analysis":"detailed Chinese market and risk explanation"}'
+        if endpoint == "open"
+        else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
+        '"lot":0,"sl":null,"tp":null,'
+        '"reason":"short Chinese reason","analysis":"detailed Chinese position and risk explanation"}'
+    )
+    return (
+        "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
+        "Start with { and end with }. No markdown, no code fences, no prefix, no suffix, no prose outside JSON. "
+        "Never write phrases like 'We need', 'Need decide', 'Let's think', or 'JSON only'. "
+        "Analyze internally and write only the final conclusion into reason and analysis. "
+        "If uncertain or unsafe, return the safe object directly. "
+        f"Required JSON shape: {schema}. "
+        "reason: Chinese, concrete, <=60 Chinese characters. "
+        "analysis: Chinese, 120-300 Chinese characters, include market structure, setup_score, price/risk context, and action rationale. "
+        "Never copy placeholder text such as reason, analysis, or .... "
+        f"Task: {task_prompt}"
+    )
+
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
     if endpoint == "open":
@@ -585,6 +630,63 @@ def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") ->
         analysis = default_analysis
     parsed["reason"] = reason[:120]
     parsed["analysis"] = analysis[:800]
+
+
+def _recover_decision_from_text(content: str, *, endpoint: str = "") -> dict[str, Any] | None:
+    summary = _summarize_malformed_ai_text(content)
+    if not summary:
+        return None
+    lowered = summary.lower()
+    if lowered.startswith("<html") or lowered.startswith("<!doctype"):
+        return None
+    if "invalid_request_error" in lowered or "api provider http" in lowered:
+        return None
+
+    if endpoint == "open":
+        recovered = _fallback_decision("open", "AI返回格式异常，按风控不开仓")
+        recovered["analysis"] = (
+            "AI返回不是标准JSON，系统已拒绝执行开仓并保留原始分析。"
+            f"原始分析要点：{summary}"
+        )[:800]
+        return recovered
+
+    if endpoint == "position":
+        recovered = _fallback_decision("position", "AI返回格式异常，按风控继续持有")
+        recovered["analysis"] = (
+            "AI返回不是标准JSON，系统已按保守风控继续持有，不执行平仓、加仓或改价。"
+            f"原始分析要点：{summary}"
+        )[:800]
+        return recovered
+
+    return None
+
+
+def _summarize_malformed_ai_text(content: str, *, limit: int = 520) -> str:
+    text = " ".join(str(content or "").split())
+    if not text:
+        return ""
+    noise_phrases = (
+        "We need answer JSON only, minified.",
+        "We need output JSON only.",
+        "We need respond JSON only.",
+        "We need produce JSON object.",
+        "We need produce final JSON.",
+        "Need output minified JSON",
+        "Need decide open.",
+        "Need decide position.",
+        "Need decide.",
+        "Need examine features.",
+        "Need analyze.",
+        "Let's reason.",
+        "Let’s reason.",
+        "Let's think carefully.",
+        "Need answer JSON only.",
+        "Strict JSON API mode.",
+    )
+    for phrase in noise_phrases:
+        text = text.replace(phrase, " ")
+    return " ".join(text.split())[:limit]
+
 
 def _find_decision_json_object(value: str, *, endpoint: str = "") -> str | None:
     required_key = "should_open" if endpoint == "open" else "action" if endpoint == "position" else ""
