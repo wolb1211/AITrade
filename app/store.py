@@ -2729,24 +2729,32 @@ class SqliteStore:
         for row in rows:
             provider_id = str(row.get("provider_id") or "")
             model_id = str(row.get("model_id") or "")
+            is_custom_provider = provider_id.startswith("custom_")
+            is_custom_model = model_id.startswith("custom_")
             provider_endpoint = endpoint_map.get(provider_id)
             model_endpoint = endpoint_map.get(model_id)
             legacy_model = model_map.get(model_id, {})
 
-            row["provider_name"] = (
+            provider_name = (
                 str((provider_endpoint or {}).get("name") or "")
                 or str((model_endpoint or {}).get("name") or "")
                 or provider_map.get(provider_id, "")
                 or provider_map.get(legacy_model.get("provider_id", ""), "")
                 or provider_id
             )
-            row["model_name"] = (
+            model_name = (
                 str((model_endpoint or {}).get("model") or "")
                 or str((provider_endpoint or {}).get("model") or "")
                 or legacy_model.get("display_name", "")
                 or legacy_model.get("name", "")
                 or model_id
             )
+            if is_custom_provider:
+                provider_name = "自定义AI"
+                model_name = "自定义模型" if is_custom_model else model_name
+
+            row["provider_name"] = provider_name
+            row["model_name"] = model_name
         return rows
 
     def _paged_query(

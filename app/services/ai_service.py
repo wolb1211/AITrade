@@ -190,7 +190,7 @@ class AiDecisionClient:
             return None
 
         provider_id = str(model["provider_id"])
-        model_id = str(model["id"])
+        model_id = self._usage_model_id(model)
         is_custom = bool(model.get("is_custom"))
         prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
         response_content = ""
@@ -348,6 +348,11 @@ class AiDecisionClient:
         if default_endpoint is not None:
             return default_endpoint
         return None
+
+    def _usage_model_id(self, model: dict[str, Any]) -> str:
+        if bool(model.get("is_custom")):
+            return str(model.get("model") or model.get("name") or model.get("id") or "")
+        return str(model.get("id") or model.get("model") or model.get("name") or "")
 
     def _post_chat_completion(
         self,
