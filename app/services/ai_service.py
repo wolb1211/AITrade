@@ -96,6 +96,7 @@ class AiDecisionClient:
                     "sl_distance_price": "positive price distance from entry",
                     "tp_distance_price": "positive price distance from entry",
                     "reason": "short Chinese reason",
+                    "analysis": "detailed final Chinese market explanation",
                 },
             },
         )
@@ -171,6 +172,7 @@ class AiDecisionClient:
                     "sl": "new stop loss price or null",
                     "tp": "new take profit price or null",
                     "reason": "short Chinese reason",
+                    "analysis": "detailed final Chinese position and risk explanation",
                 },
             },
         )
@@ -463,45 +465,48 @@ def _pa_system_prompt() -> str:
     return (
         "You are GainLab PA Agent, a JSON-only trading decision API. "
         "Return exactly one minified JSON object. First character must be { and last character must be }. "
-        "No reasoning, no analysis, no Markdown, no prose, no code fences, no text outside JSON. "
-        "Use the supplied market features and program_recommendation silently. "
+        "No private reasoning, thoughts, Markdown, prose, code fences, or text outside JSON. "
+        "Use the supplied market features and program_recommendation silently, then write the final explanation only in JSON fields. "
         "If uncertain, weak, conflicting, or unsafe, choose no-open or hold. "
-        "For open endpoint use keys: should_open, direction, confidence, lot, sl_distance_price, tp_distance_price, reason. "
-        "For position endpoint use keys: action, ticket, direction, confidence, lot, sl, tp, reason. "
-        "reason <= 40 Chinese characters. Never invent prices. Use price distances for SL/TP."
+        "For open endpoint use keys: should_open, direction, confidence, lot, sl_distance_price, tp_distance_price, reason, analysis. "
+        "For position endpoint use keys: action, ticket, direction, confidence, lot, sl, tp, reason, analysis. "
+        "reason is a concise Chinese summary <= 60 characters. "
+        "analysis is the final Chinese market explanation, 120-300 characters, with concrete structure, score, price/risk details. "
+        "Never invent prices. Use price distances for SL/TP."
     )
 
 
 def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
     schema = (
         '{"should_open":false,"direction":null,"confidence":0,'
-        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,"reason":"根据行情给出具体原因"}'
+        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,'
+        '"reason":"短原因","analysis":"详细中文行情和风控说明"}'
         if endpoint == "open"
         else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
-        '"lot":0,"sl":null,"tp":null,"reason":"根据行情给出具体原因"}'
+        '"lot":0,"sl":null,"tp":null,'
+        '"reason":"短原因","analysis":"详细中文持仓和风控说明"}'
     )
     return (
         "You are a strict JSON API endpoint, not a chat assistant. "
         "Return exactly one minified JSON object only. "
         "The first character of your response must be { and the last character must be }. "
-        "Do not output reasoning, analysis, thoughts, markdown, code fences, explanations, prefixes, or suffixes. "
+        "Do not output private reasoning, thoughts, markdown, code fences, explanations, prefixes, or suffixes outside JSON. "
         "Never say what you need to do. Never mention JSON rules. "
-        "Do not use chain-of-thought. Make the decision silently. "
+        "Do not use chain-of-thought. Make the decision silently and put only the final explanation in analysis. "
         "If uncertain or unsafe, return the safe object directly. "
         f"Required JSON shape: {schema}. "
-        "Reason must be a concrete concise Chinese market/strategy reason, max 40 characters. "
-        "Never copy placeholder text such as 观望原因, 根据行情给出具体原因, reason, or .... "
+        "reason must be a concrete concise Chinese market/strategy reason, max 60 characters. "
+        "analysis must be 120-300 Chinese characters and include concrete market structure, setup score, price/risk context, and action rationale. "
+        "Never copy placeholder text such as 观望原因, 根据行情给出具体原因, reason, analysis, or .... "
         f"Task: {task_prompt}"
     )
 
-
 def _max_tokens_for_endpoint(endpoint: str) -> int:
     if endpoint == "open":
-        return 420
+        return 1000
     if endpoint == "position":
-        return 520
+        return 1000
     return 500
-
 
 def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any]]:
     return [
@@ -543,25 +548,43 @@ def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
 
 def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") -> None:
     reason = str(parsed.get("reason") or "").strip()
+    analysis = str(parsed.get("analysis") or "").strip()
     placeholder_reasons = {
         "",
         "...",
         "reason",
+        "analysis",
+        "短原因",
         "观望原因",
         "根据行情给出具体原因",
         "具体原因",
         "原因",
+        "详细中文行情和风控说明",
+        "详细中文持仓和风控说明",
     }
-    if reason.lower() not in placeholder_reasons:
-        return
-    if endpoint == "open":
-        parsed["reason"] = "开单条件不足，继续观望"
-        return
-    if endpoint == "position":
-        parsed["reason"] = "风控条件未触发，继续持有"
-        return
-    parsed["reason"] = "条件不足，继续观望"
 
+    if endpoint == "open":
+        default_reason = "开仓条件不足，继续观望"
+        default_analysis = "当前开仓条件不足，暂未看到足够清晰的突破、趋势延续或回调确认，继续等待更稳定的结构、动能延续与风险空间。"
+    elif endpoint == "position":
+        default_reason = "风控条件未触发，继续持有"
+        default_analysis = "当前持仓未触发明确反向信号、结构失效或止损调整条件，暂按原有止盈止损和策略节奏继续管理。"
+    else:
+        default_reason = "条件不足，继续观望"
+        default_analysis = default_reason
+
+    if reason.lower() in placeholder_reasons:
+        reason = default_reason
+    if analysis.lower() in placeholder_reasons:
+        analysis = reason
+    if len(reason) > 90:
+        if len(analysis) < len(reason):
+            analysis = reason
+        reason = reason[:90]
+    if len(analysis) < 16:
+        analysis = default_analysis
+    parsed["reason"] = reason[:120]
+    parsed["analysis"] = analysis[:800]
 
 def _find_decision_json_object(value: str, *, endpoint: str = "") -> str | None:
     required_key = "should_open" if endpoint == "open" else "action" if endpoint == "position" else ""
@@ -625,7 +648,6 @@ def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = N
         parts.append(f"解析结果:\n{_preview_text(json.dumps(parsed, ensure_ascii=False), 1600)}")
     return "\n\n".join(parts)[:3200]
 
-
 def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
     if endpoint == "open":
         return {
@@ -636,6 +658,7 @@ def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
             "sl_distance_price": 0,
             "tp_distance_price": 0,
             "reason": reason,
+            "analysis": reason,
         }
     return {
         "action": "hold",
@@ -646,8 +669,8 @@ def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
         "sl": None,
         "tp": None,
         "reason": reason,
+        "analysis": reason,
     }
-
 
 def _preview_text(value: str, limit: int = 500) -> str:
     return value.replace("\r", " ").replace("\n", " ").strip()[:limit]

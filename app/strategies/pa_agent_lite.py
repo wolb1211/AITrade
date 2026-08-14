@@ -186,7 +186,7 @@ class PaAgentLiteStrategy:
             return None
 
         content = result.content
-        reason = str(content.get("reason") or "AI strategy returned hold").strip()[:500]
+        reason = _ai_decision_message(content, "AI strategy returned hold")
         should_open = bool(content.get("should_open", False))
         direction = str(content.get("direction") or "").strip().lower()
         confidence = _clamp(float(content.get("confidence") or 0.45), 0.0, 1.0)
@@ -265,7 +265,7 @@ class PaAgentLiteStrategy:
 
         content = result.content
         action = str(content.get("action") or "hold").strip().lower()
-        reason = str(content.get("reason") or "AI position strategy returned hold").strip()[:500]
+        reason = _ai_decision_message(content, "AI position strategy returned hold")
         confidence = _clamp(float(content.get("confidence") or 0.45), 0.0, 1.0)
         ticket = str(content.get("ticket") or request.positions[0].ticket)
         target = next((item for item in request.positions if item.ticket == ticket), request.positions[0])
@@ -333,6 +333,12 @@ class PaAgentLiteStrategy:
                 usage=result.usage,
             )
         return None
+
+
+def _ai_decision_message(content: dict[str, Any], fallback: str) -> str:
+    analysis = str(content.get("analysis") or "").strip()
+    reason = str(content.get("reason") or "").strip()
+    return (analysis or reason or fallback)[:800]
 
 
 def _hold(
