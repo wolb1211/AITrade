@@ -480,11 +480,22 @@ class AiDecisionClient:
                 "total_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens,
                 "official_tokens": 0 if is_custom else usage.charged_points or usage.input_tokens + usage.output_tokens,
                 "custom_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens if is_custom else 0,
+                "billing_source": "custom" if is_custom else "official",
+                "input_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "input", self.store),
+                "output_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "output", self.store),
                 "success": success,
                 "error_message": error_message,
                 "response_preview": response_preview,
             },
         )
+
+
+def model_price(provider_id: str, model_id: str, price_type: str, store: SqliteStore) -> str:
+    endpoint = store.get_private_ai_endpoint(model_id) or store.get_private_ai_endpoint(provider_id)
+    if endpoint is None:
+        return "0"
+    field = "input_price_per_million" if price_type == "input" else "output_price_per_million"
+    return str(endpoint.get(field) or "0")
 
 
 def _pa_system_prompt() -> str:

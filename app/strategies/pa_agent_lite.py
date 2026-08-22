@@ -93,10 +93,7 @@ class PaAgentLiteStrategy:
         if features is None:
             return _hold(request, self._decision_id(), "PA Agent strategy requires at least 30 candles")
 
-        ai_decision = self._evaluate_open_with_ai(request, deployment, features)
-        if ai_decision is not None:
-            return ai_decision
-
+        # Run cheap deterministic filters before AI so routine no-signal bars do not burn tokens.
         if _is_choppy(features):
             return _hold(
                 request,
@@ -114,7 +111,15 @@ class PaAgentLiteStrategy:
                 confidence=0.35,
             )
 
-        return _build_open_decision(request, deployment, features, direction)
+        local_decision = _build_open_decision(request, deployment, features, direction)
+        if local_decision.action not in {"BUY", "SELL"}:
+            return local_decision
+
+        ai_decision = self._evaluate_open_with_ai(request, deployment, features)
+        if ai_decision is not None:
+            return ai_decision
+
+        return local_decision
 
     def evaluate_position(
         self,
@@ -650,16 +655,40 @@ def _describe_open(features: PaFeatureSnapshot, direction: str) -> str:
     )
 
 
+def _pa_text(value: str) -> str:
+    translations = {
+        "no qualified PA setup": "未发现符合条件的价格行为形态",
+        "bullish": "多头",
+        "bearish": "空头",
+        "neutral": "中性",
+        "none": "无",
+        "unknown": "未知",
+        "middle": "中部",
+        "upper": "上部",
+        "lower": "下部",
+        "trading_range": "震荡区间",
+        "neutral_background": "中性背景",
+        "mixed": "混合",
+        "up": "向上",
+        "down": "向下",
+        "yes": "是",
+        "no": "否",
+    }
+    return translations.get(value, value)
+
+
 def _describe_hold(features: PaFeatureSnapshot) -> str:
     ema_text = f"{features.ema20:.5f}" if features.ema20 is not None else "n/a"
+    patterns = ",".join(_pa_text(item) for item in features.detected_patterns) or "无"
     return (
-        f"No trade: {features.setup_name}, score={features.setup_score}, "
-        f"bias={features.setup_bias}, breakout={features.breakout}/{features.breakout_event}, "
-        f"cycle={features.cycle_position}, patterns={','.join(features.detected_patterns)}, "
-        f"zone={features.zone}, range_position={features.range_position:.2f}, "
-        f"EMA20={ema_text}, "
-        f"trend={features.background_direction}/{features.recent_direction}/{features.trend_relationship}, "
-        f"swing={features.swing_structure}, barbwire={features.barbwire_score:.2f}"
+        f"暂不开仓：当前信号未达到开仓条件，形态={_pa_text(features.setup_name)}，"
+        f"信号评分={features.setup_score}，方向偏向={_pa_text(features.setup_bias)}，"
+        f"突破={_pa_text(features.breakout)}/{_pa_text(features.breakout_event)}，"
+        f"周期位置={_pa_text(features.cycle_position)}，识别形态={patterns}，"
+        f"价格区域={_pa_text(features.zone)}，区间位置={features.range_position:.2f}，"
+        f"EMA20={ema_text}，"
+        f"趋势={_pa_text(features.background_direction)}/{_pa_text(features.recent_direction)}/{_pa_text(features.trend_relationship)}，"
+        f"摆动结构={_pa_text(features.swing_structure)}，盘整度={features.barbwire_score:.2f}"
     )
 
 

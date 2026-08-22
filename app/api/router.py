@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import base64
+from decimal import Decimal, InvalidOperation
+import hmac
 import random
+import time
 from datetime import datetime, timezone
 from hashlib import sha256
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
 from app.models import (
@@ -43,6 +47,7 @@ from app.models import (
     WebDeploymentUpsertResponse,
 )
 from app.services.decision_service import DecisionService
+from app.services.auth_service import AuthError, UserAuthService
 from app.store import SqliteStore
 
 
@@ -58,25 +63,62 @@ class AsciiJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
+def _decode_admin_jwt(token: str, secret: str) -> dict[str, object]:
+    try:
+        encoded_header, encoded_payload, encoded_signature = token.split(".")
+        signed = f"{encoded_header}.{encoded_payload}".encode("ascii")
+        expected = hmac.new(secret.encode("utf-8"), signed, sha256).digest()
+        signature_padding = "=" * (-len(encoded_signature) % 4)
+        signature = base64.urlsafe_b64decode(encoded_signature + signature_padding)
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid signature")
+        payload_padding = "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded_payload + payload_padding))
+        if not isinstance(payload, dict):
+            raise ValueError("invalid payload")
+        expires_at = int(payload.get("exp") or 0)
+        if expires_at and expires_at <= int(time.time()):
+            raise ValueError("expired")
+        return payload
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=401, detail="invalid_admin_token") from exc
+
+
 def create_api_router(
     store: SqliteStore,
     decision_service: DecisionService,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1")
 
+    def public_ok(data: object = None, message: str = "success") -> dict[str, object]:
+        return {"code": 0, "message": message, "data": data}
+
+    @router.get("/guides")
+    def public_guide_list() -> dict[str, object]:
+        return public_ok(store.list_guide_articles())
+
+    @router.get("/guides/{article_id}")
+    def public_guide_detail(article_id: str) -> dict[str, object]:
+        article = store.get_guide_article(article_id)
+        if article is None:
+            raise HTTPException(status_code=404, detail="guide_not_found")
+        return public_ok(article)
+
     @router.post("/ea/activate", response_model=ActivateResponse)
     def activate(request: ActivateRequest) -> ActivateResponse:
-        deployment = store.activate_deployment(
-            request.deployment_key,
-            platform=request.account.platform,
-            login=request.account.login,
-            server=request.account.server,
-        )
+        deployment = store.find_deployment_by_key(request.deployment_key)
         if deployment is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid_deployment_key",
             )
+        decision_service.ensure_deployment_access(deployment)
+        deployment = store.activate_deployment(
+            request.deployment_key,
+            platform=request.account.platform,
+            login=request.account.login,
+            server=request.account.server,
+        ) or deployment
         return ActivateResponse(
             deployment_id=deployment["id"],
             strategy_code=deployment["strategy_code"],
@@ -153,6 +195,24 @@ def create_api_router(
     def upsert_web_deployment(
         request: WebDeploymentUpsertRequest,
     ) -> WebDeploymentUpsertResponse:
+        existing = store.find_deployment_by_key(request.deployment_key)
+        user = store.get_user(request.user_id)
+        if existing is None:
+            if user is None or not bool(user.get("vip_active")):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="vip_required",
+                )
+            if int(user.get("strategy_count") or 0) >= int(user.get("max_strategy_keys") or 0):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="strategy_key_limit_reached",
+                )
+        elif str(existing.get("user_id")) != str(request.user_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="deployment_not_found",
+            )
         deployment = store.upsert_web_deployment(
             request.deployment_key,
             user_id=request.user_id,
@@ -196,6 +256,11 @@ def create_api_router(
                 "position_ai_key": request.position_ai_key,
             },
         )
+        if "mt_login" in request.model_fields_set:
+            deployment = store.set_deployment_login(
+                request.deployment_key,
+                request.mt_login or "",
+            ) or deployment
         return WebDeploymentUpsertResponse(
             deployment_id=deployment["id"],
             deployment_key=request.deployment_key,
@@ -239,6 +304,7 @@ def create_api_router(
                     status=deployment["status"],
                     strategy_code=deployment["strategy_code"],
                     user_id=deployment["user_id"],
+                    mt_login=str(deployment.get("mt_login") or ""),
                     summary=config.get("summary", ""),
                     open_logic=config.get("open_logic", ""),
                     position_logic=config.get("position_logic", ""),
@@ -376,25 +442,42 @@ def create_mt5_router(
                 detail="invalid_deployment_key",
             )
 
-        store.record_deployment_activity(
-            deployment["id"],
-            strategy_code=deployment["strategy_code"],
-            event_type="init",
-        )
-        if account is not None:
-            store.save_deployment_account(
-                deployment,
-                login=account.login,
-                platform=account.platform,
-                provider=account.provider or provider,
-                server=account.server,
+        access_error = decision_service.deployment_access_error(deployment)
+
+        if access_error is None and account is not None:
+            try:
+                deployment = store.bind_deployment_login(
+                    raw_key,
+                    login=account.login,
+                    platform=account.platform,
+                    server=account.server,
+                ) or deployment
+            except RuntimeError as exc:
+                if str(exc) == "deployment_account_mismatch":
+                    access_error = "deployment_account_mismatch"
+                elif str(exc) == "invalid_deployment_account":
+                    access_error = "invalid_deployment_account"
+                else:
+                    raise
+            if access_error is None:
+                store.save_deployment_account(
+                    deployment,
+                    login=account.login,
+                    platform=account.platform,
+                    provider=account.provider or provider,
+                    server=account.server,
+                )
+        if access_error is None:
+            store.record_deployment_activity(
+                deployment["id"],
+                strategy_code=deployment["strategy_code"],
+                event_type="init",
             )
         config = deployment["config"]
         official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
         strategy_name = deployment["strategy_name"]
         strategy_summary = config.get("summary", "")
         if official_strategy is not None:
-            strategy_name = official_strategy["name"]
             strategy_summary = official_strategy["summary"]
         return Mt5StrategyInitResponse(
             status="ok",
@@ -405,7 +488,11 @@ def create_mt5_router(
                 id=deployment["id"],
                 name=strategy_name,
                 summary=strategy_summary,
-                status=deployment["status"],
+                status=(
+                    _mt5_business_error_description(access_error, include_code=False)
+                    if access_error is not None
+                    else deployment["status"]
+                ),
                 open_data_type=config.get("open_data_type", "kline"),
                 open_kline_count=int(config.get("open_kline_count", 100)),
                 position_data_type=config.get("position_data_type", "kline"),
@@ -418,9 +505,16 @@ def create_mt5_router(
     @router.post("/open-decision", response_model=Mt5OpenDecisionResponse)
     def open_decision(request: Mt5OpenDecisionRequest) -> Mt5OpenDecisionResponse:
         request_id = _request_id("open", request)
+        deployment = store.find_deployment_by_key(request.deployment_key)
+        access_error = "invalid_deployment_key" if deployment is None else decision_service.deployment_access_error(deployment)
+        if access_error is None:
+            deployment, access_error = _mt5_validate_deployment_account(
+                store, deployment, request.deployment_key, request.account,
+            )
+        if access_error is not None:
+            return _mt5_open_error_response(request, request_id, access_error)
         test_response = _mt5_open_test_response(request, request_id)
         if test_response is not None:
-            deployment = decision_service.authenticate(request.deployment_key, request.account)
             store.record_deployment_activity(
                 deployment["id"],
                 strategy_code=deployment["strategy_code"],
@@ -449,9 +543,16 @@ def create_mt5_router(
     @router.post("/position-decision", response_model=Mt5PositionDecisionResponse)
     def position_decision(request: Mt5PositionDecisionRequest) -> Mt5PositionDecisionResponse:
         request_id = _request_id("position", request)
+        deployment = store.find_deployment_by_key(request.deployment_key)
+        access_error = "invalid_deployment_key" if deployment is None else decision_service.deployment_access_error(deployment)
+        if access_error is None:
+            deployment, access_error = _mt5_validate_deployment_account(
+                store, deployment, request.deployment_key, request.account,
+            )
+        if access_error is not None:
+            return _mt5_position_error_response(request, request_id, access_error)
         test_response = _mt5_position_test_response(request, request_id)
         if test_response is not None:
-            deployment = decision_service.authenticate(request.deployment_key, request.account)
             store.record_deployment_activity(
                 deployment["id"],
                 strategy_code=deployment["strategy_code"],
@@ -528,8 +629,30 @@ def create_mt5_executions_router(
     return router
 
 
-def create_admin_ai_router(store: SqliteStore) -> APIRouter:
-    router = APIRouter(prefix="/api/admin/ai", default_response_class=AsciiJSONResponse)
+def create_admin_ai_router(
+    store: SqliteStore,
+    *,
+    admin_jwt_secret: str = "",
+    require_admin_auth: bool = False,
+) -> APIRouter:
+    def require_admin(authorization: str = Header(default="")) -> None:
+        if not require_admin_auth:
+            return
+        if not admin_jwt_secret:
+            raise HTTPException(status_code=503, detail="admin_auth_not_configured")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(status_code=401, detail="admin_token_required")
+        payload = _decode_admin_jwt(token.strip(), admin_jwt_secret)
+        roles = payload.get("roles") or []
+        if not isinstance(roles, list) or "admin" not in roles:
+            raise HTTPException(status_code=403, detail="admin_role_required")
+
+    router = APIRouter(
+        prefix="/api/admin/ai",
+        default_response_class=AsciiJSONResponse,
+        dependencies=[Depends(require_admin)],
+    )
 
     def ok(data: object = None, message: str = "success") -> dict[str, object]:
         return {
@@ -541,6 +664,156 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
     @router.post("/stats/overview")
     def stats_overview() -> dict[str, object]:
         return ok(store.admin_ai_strategy_overview())
+
+    @router.post("/user/list")
+    def user_list(payload: dict[str, object] | None = None) -> dict[str, object]:
+        payload = payload or {}
+        raw_vip_level = payload.get("vip_level")
+        vip_level = None if raw_vip_level in (None, "") else int(raw_vip_level)
+        raw_agent_level = payload.get("agent_level")
+        agent_level = None if raw_agent_level in (None, "") else int(raw_agent_level)
+        return ok(store.list_users(
+            page=int(payload.get("page") or 1),
+            size=int(payload.get("size") or 20),
+            keyword=str(payload.get("keyword") or "").strip(),
+            status=str(payload.get("status") or "").strip(),
+            vip_level=vip_level,
+            agent_level=agent_level,
+        ))
+
+    @router.post("/user/referrals")
+    def user_referrals(payload: dict[str, object]) -> dict[str, object]:
+        user_id = str(payload.get("user_id") or "").strip()
+        if not user_id.isdigit():
+            raise HTTPException(status_code=400, detail="invalid_user_id")
+        try:
+            return ok(store.get_agent_dashboard(
+                int(user_id),
+                page=int(payload.get("page") or 1),
+                size=int(payload.get("size") or 20),
+            ))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/user/save")
+    def user_save(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            return ok(store.save_user(payload), "saved")
+        except RuntimeError as exc:
+            if str(exc) == "user_email_exists":
+                raise HTTPException(status_code=409, detail="user_email_exists") from exc
+            if str(exc) == "invalid_user_status":
+                raise HTTPException(status_code=400, detail="invalid_user_status") from exc
+            if str(exc) in {"invalid_user_id", "user_email_required"}:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise
+
+    @router.post("/user/strategies")
+    def user_strategies(payload: dict[str, object]) -> dict[str, object]:
+        user_id = str(payload.get("user_id") or "").strip()
+        if not user_id.isdigit():
+            raise HTTPException(status_code=400, detail="invalid_user_id")
+        rows = []
+        for deployment in store.list_web_deployments(user_id):
+            config = deployment.get("config", {})
+            rows.append({
+                "id": deployment["id"],
+                "name": deployment["strategy_name"],
+                "strategy_code": deployment["strategy_code"],
+                "deployment_key": str(config.get("deployment_key") or ""),
+                "mt_login": str(deployment.get("mt_login") or ""),
+                "status": deployment["status"],
+                "open_ai_mode": str(config.get("open_ai_mode") or "official"),
+                "position_ai_mode": str(config.get("position_ai_mode") or "official"),
+                "updated_at": deployment["updated_at"],
+            })
+        return ok({"list": rows})
+
+    @router.post("/user/strategy/status")
+    def user_strategy_status(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            deployment = store.update_user_deployment_status(
+                user_id=int(str(payload.get("user_id") or "0")),
+                deployment_id=str(payload.get("deployment_id") or ""),
+                status=str(payload.get("status") or ""),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ok({"id": deployment["id"], "status": deployment["status"]}, "saved")
+
+    @router.post("/user/strategy/delete")
+    def user_strategy_delete(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            store.delete_user_deployment(
+                user_id=int(str(payload.get("user_id") or "0")),
+                deployment_id=str(payload.get("deployment_id") or ""),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return ok(message="deleted")
+
+    @router.post("/wallet/settings")
+    def wallet_settings() -> dict[str, object]:
+        return ok(store.get_ai_billing_settings())
+
+    @router.post("/wallet/settings/save")
+    def wallet_settings_save(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            credit_limit = Decimal(str(payload.get("credit_limit") or 0))
+            warning_threshold = Decimal(str(payload.get("low_balance_threshold") or 0))
+        except (InvalidOperation, ValueError):
+            raise HTTPException(status_code=400, detail="wallet_setting_invalid") from None
+        if credit_limit < 0 or warning_threshold < 0:
+            raise HTTPException(status_code=400, detail="wallet_setting_invalid")
+        return ok(
+            store.save_ai_billing_settings(
+                credit_limit=credit_limit,
+                low_balance_threshold=warning_threshold,
+            ),
+            "saved",
+        )
+
+    @router.post("/wallet/adjust")
+    def wallet_adjust(payload: dict[str, object]) -> dict[str, object]:
+        raw_user_id = str(payload.get("user_id") or "").strip()
+        if not raw_user_id.isdigit():
+            raise HTTPException(status_code=400, detail="invalid_user_id")
+        operation = str(payload.get("operation") or "").strip()
+        if operation not in {"recharge", "deduction"}:
+            raise HTTPException(status_code=400, detail="wallet_operation_invalid")
+        try:
+            amount = Decimal(str(payload.get("amount") or 0))
+        except (InvalidOperation, ValueError):
+            raise HTTPException(status_code=400, detail="wallet_amount_invalid") from None
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="wallet_amount_invalid")
+        signed_amount = amount if operation == "recharge" else -amount
+        try:
+            data = store.adjust_ai_balance(
+                user_id=int(raw_user_id),
+                amount=signed_amount,
+                entry_type=f"admin_{operation}",
+                remark=str(payload.get("remark") or "").strip(),
+                operator_id=str(payload.get("operator_id") or "admin").strip() or "admin",
+            )
+        except RuntimeError as exc:
+            if str(exc) == "user_not_found":
+                raise HTTPException(status_code=404, detail="user_not_found") from exc
+            raise
+        return ok(data, "saved")
+
+    @router.post("/wallet/ledger")
+    def wallet_ledger(payload: dict[str, object] | None = None) -> dict[str, object]:
+        payload = payload or {}
+        raw_user_id = str(payload.get("user_id") or "").strip()
+        user_id = int(raw_user_id) if raw_user_id.isdigit() else None
+        return ok(store.list_ai_balance_ledger(
+            page=int(payload.get("page") or 1),
+            size=int(payload.get("size") or 20),
+            keyword=str(payload.get("keyword") or "").strip(),
+            user_id=user_id,
+            entry_type=str(payload.get("entry_type") or "").strip(),
+        ))
 
     @router.post("/official-strategy/list")
     def official_strategy_list(payload: dict[str, object] | None = None) -> dict[str, object]:
@@ -605,6 +878,48 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
             raise HTTPException(status_code=400, detail="strategy_code_required")
         return ok(store.save_official_ai_strategy(payload), "saved")
 
+    @router.post("/ea-download/list")
+    def ea_download_list() -> dict[str, object]:
+        return ok(store.list_ea_downloads(include_disabled=True))
+
+    @router.post("/ea-download/save")
+    def ea_download_save(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            return ok(store.save_ea_download(payload), "saved")
+        except RuntimeError as exc:
+            if str(exc) in {"ea_download_name_required", "ea_download_url_required"}:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise
+
+    @router.post("/ea-download/delete")
+    def ea_download_delete(payload: dict[str, object]) -> dict[str, object]:
+        download_id = str(payload.get("id") or "").strip()
+        if not download_id:
+            raise HTTPException(status_code=400, detail="ea_download_id_required")
+        store.delete_ea_download(download_id)
+        return ok(message="deleted")
+
+    @router.post("/guide/list")
+    def guide_list() -> dict[str, object]:
+        return ok(store.list_guide_articles(include_disabled=True, include_content=True))
+
+    @router.post("/guide/save")
+    def guide_save(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            return ok(store.save_guide_article(payload), "saved")
+        except RuntimeError as exc:
+            if str(exc) == "guide_title_required":
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise
+
+    @router.post("/guide/delete")
+    def guide_delete(payload: dict[str, object]) -> dict[str, object]:
+        article_id = str(payload.get("id") or "").strip()
+        if not article_id:
+            raise HTTPException(status_code=400, detail="guide_id_required")
+        store.delete_guide_article(article_id)
+        return ok(message="deleted")
+
     @router.post("/endpoint/list")
     def endpoint_list(payload: dict[str, object] | None = None) -> dict[str, object]:
         payload = payload or {}
@@ -627,6 +942,16 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
             raise HTTPException(status_code=400, detail="endpoint_base_url_required")
         if not str(payload.get("model") or "").strip():
             raise HTTPException(status_code=400, detail="endpoint_model_required")
+        for field in ("input_price_per_million", "output_price_per_million"):
+            if field not in payload:
+                continue
+            try:
+                price = Decimal(str(payload.get(field) or 0))
+            except (InvalidOperation, ValueError):
+                raise HTTPException(status_code=400, detail="endpoint_price_invalid") from None
+            if price < 0:
+                raise HTTPException(status_code=400, detail="endpoint_price_invalid")
+            payload[field] = format(price, "f")
         return ok(store.save_ai_endpoint(payload), "saved")
 
     @router.post("/endpoint/delete")
@@ -634,7 +959,12 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
         endpoint_id = str(payload.get("id") or "").strip()
         if not endpoint_id:
             raise HTTPException(status_code=400, detail="endpoint_id_required")
-        store.delete_ai_endpoint(endpoint_id)
+        try:
+            store.delete_ai_endpoint(endpoint_id)
+        except RuntimeError as exc:
+            if str(exc) == "ai_endpoint_in_use":
+                raise HTTPException(status_code=409, detail="ai_endpoint_in_use") from exc
+            raise
         return ok(message="deleted")
 
     @router.post("/template/list")
@@ -682,13 +1012,289 @@ def create_admin_ai_router(store: SqliteStore) -> APIRouter:
     @router.post("/usage/list")
     def usage_list(payload: dict[str, object] | None = None) -> dict[str, object]:
         payload = payload or {}
+        raw_success = payload.get("success")
+        success = None if raw_success in (None, "") else str(raw_success).lower() in {"1", "true", "yes"}
         data = store.list_ai_usage_logs(
             page=int(payload.get("page") or 1),
             size=int(payload.get("size") or 20),
             keyword=str(payload.get("keyword") or "").strip(),
             user_id=str(payload.get("user_id") or "").strip(),
+            model_id=str(payload.get("model_id") or "").strip(),
+            deployment_id=str(payload.get("deployment_id") or "").strip(),
+            deployment_key=str(payload.get("deployment_key") or "").strip(),
+            endpoint=str(payload.get("endpoint") or "").strip(),
+            billing_source=str(payload.get("billing_source") or "").strip(),
+            success=success,
+            start_at=str(payload.get("start_at") or "").strip(),
+            end_at=str(payload.get("end_at") or "").strip(),
         )
         return ok(data)
+
+    return router
+
+
+def create_auth_router(auth_service: UserAuthService) -> APIRouter:
+    router = APIRouter(prefix="/api/v1/auth", default_response_class=AsciiJSONResponse)
+
+    def ok(data: object = None, message: str = "success") -> dict[str, object]:
+        return {"code": 0, "data": data if data is not None else {}, "message": message}
+
+    def execute(action: object) -> dict[str, object]:
+        try:
+            return ok(action())  # type: ignore[operator]
+        except AuthError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+
+    def bearer_token(authorization: str) -> str:
+        scheme, _, token = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(status_code=401, detail="invalid_session")
+        return token.strip()
+
+    @router.post("/register")
+    def register(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.register(
+            email=str(payload.get("email") or ""),
+            password=str(payload.get("password") or ""),
+            invite_code=str(payload.get("invite_code") or ""),
+        ))
+
+    @router.post("/register/verify")
+    def verify_register(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.verify_registration(
+            email=str(payload.get("email") or ""),
+            code=str(payload.get("code") or ""),
+        ))
+
+    @router.post("/login/password")
+    def password_login(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.password_login(
+            email=str(payload.get("email") or ""),
+            password=str(payload.get("password") or ""),
+        ))
+
+    @router.post("/login/code/send")
+    def send_login_code(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.send_login_code(
+            email=str(payload.get("email") or ""),
+        ))
+
+    @router.post("/login/code")
+    def code_login(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.code_login(
+            email=str(payload.get("email") or ""),
+            code=str(payload.get("code") or ""),
+        ))
+
+    @router.post("/password/forgot")
+    def forgot_password(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.forgot_password(
+            email=str(payload.get("email") or ""),
+        ))
+
+    @router.post("/password/reset")
+    def reset_password(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.reset_password(
+            email=str(payload.get("email") or ""),
+            code=str(payload.get("code") or ""),
+            password=str(payload.get("password") or ""),
+        ))
+
+    @router.post("/code/resend")
+    def resend_code(payload: dict[str, object]) -> dict[str, object]:
+        return execute(lambda: auth_service.resend_code(
+            email=str(payload.get("email") or ""),
+            purpose=str(payload.get("purpose") or ""),
+        ))
+
+    @router.get("/me")
+    def current_user(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.me(token))
+
+    @router.get("/portal")
+    def user_portal(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.portal(token))
+
+    @router.get("/official-strategies")
+    def user_official_strategies(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.official_strategies(token))
+
+    @router.get("/ai-model-options")
+    def user_ai_model_options(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.ai_model_options(token))
+
+    @router.get("/ea-downloads")
+    def user_ea_downloads(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.ea_downloads(token))
+
+    @router.get("/agent")
+    def agent_dashboard(
+        page: int = Query(default=1, ge=1),
+        size: int = Query(default=20, ge=1, le=100),
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.agent_dashboard(token, page=page, size=size))
+
+    @router.post("/strategies")
+    def create_user_strategy(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.create_strategy(token, payload=payload))
+
+    @router.get("/usage")
+    def user_usage(
+        page: int = Query(default=1, ge=1),
+        size: int = Query(default=10, ge=1, le=100),
+        model_id: str = Query(default="", max_length=128),
+        deployment_id: str = Query(default="", max_length=128),
+        start_at: str = Query(default="", max_length=64),
+        end_at: str = Query(default="", max_length=64),
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.usage(
+            token,
+            page=page,
+            size=size,
+            model_id=model_id,
+            deployment_id=deployment_id,
+            start_at=start_at,
+            end_at=end_at,
+        ))
+
+    @router.get("/orders")
+    def user_orders(
+        page: int = Query(default=1, ge=1),
+        size: int = Query(default=10, ge=1, le=100),
+        deployment_id: str = Query(default="", max_length=128),
+        symbol: str = Query(default="", max_length=64),
+        start_at: str = Query(default="", max_length=64),
+        end_at: str = Query(default="", max_length=64),
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.orders(
+            token,
+            page=page,
+            size=size,
+            deployment_id=deployment_id,
+            symbol=symbol,
+            start_at=start_at,
+            end_at=end_at,
+        ))
+
+    @router.patch("/strategies/{deployment_id}/status")
+    def update_user_strategy_status(
+        deployment_id: str,
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.update_strategy_status(
+            token,
+            deployment_id=deployment_id,
+            status=str(payload.get("status") or ""),
+        ))
+
+    @router.patch("/strategies/{deployment_id}/ai")
+    def update_user_strategy_ai(
+        deployment_id: str,
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.update_strategy_ai(token, deployment_id=deployment_id, payload=payload))
+
+    @router.patch("/strategies/{deployment_id}")
+    def update_user_strategy_settings(
+        deployment_id: str,
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.update_strategy_settings(token, deployment_id=deployment_id, payload=payload))
+
+    @router.delete("/strategies/{deployment_id}")
+    def delete_user_strategy(
+        deployment_id: str,
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.delete_strategy(token, deployment_id=deployment_id))
+
+    @router.post("/profile")
+    def update_profile(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.update_profile(
+            token,
+            nickname=str(payload.get("nickname") or ""),
+        ))
+
+    @router.post("/password/change")
+    def change_password(payload: dict[str, object], authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.change_password(
+            token,
+            current_password=str(payload.get("current_password") or ""),
+            new_password=str(payload.get("new_password") or ""),
+        ))
+
+    @router.post("/email/change/current/send")
+    def send_current_email_code(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.send_current_email_code(token))
+
+    @router.post("/email/change/send")
+    def send_change_email_code(payload: dict[str, object], authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.send_change_email_code(
+            token,
+            email=str(payload.get("email") or ""),
+        ))
+
+    @router.post("/email/change/verify")
+    def verify_change_email(payload: dict[str, object], authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.verify_change_email(
+            token,
+            email=str(payload.get("email") or ""),
+            current_email_code=str(payload.get("current_email_code") or ""),
+            new_email_code=str(payload.get("new_email_code") or ""),
+        ))
+
+    @router.get("/sessions")
+    def list_sessions(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.list_sessions(token))
+
+    @router.post("/sessions/revoke")
+    def revoke_session(payload: dict[str, object], authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.revoke_session_by_id(
+            token,
+            session_id=str(payload.get("session_id") or ""),
+        ))
+
+    @router.post("/logout-all")
+    def logout_all(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.logout_all(token))
+
+    @router.post("/logout")
+    def logout(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.logout(token))
 
     return router
 
@@ -802,6 +1408,64 @@ def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDeci
         request_id=decision.request_id,
         orders_count=len(orders),
         orders=orders,
+    )
+
+
+def _mt5_validate_deployment_account(
+    store: SqliteStore,
+    deployment: dict,
+    deployment_key: str,
+    account: AccountIdentity,
+) -> tuple[dict, str | None]:
+    try:
+        bound_deployment = store.bind_deployment_login(
+            deployment_key,
+            login=account.login,
+            platform=account.platform,
+            server=account.server,
+        )
+        return bound_deployment or deployment, None
+    except RuntimeError as exc:
+        error_code = str(exc)
+        if error_code in {"deployment_account_mismatch", "invalid_deployment_account"}:
+            return deployment, error_code
+        raise
+
+
+def _mt5_business_error_description(
+    error_code: str,
+    *,
+    include_code: bool = True,
+) -> str:
+    messages = {
+        "invalid_deployment_key": "策略 Key 无效，请检查 EA 配置",
+        "deployment_not_active": "策略未启用，请在用户中心检查策略状态",
+        "deployment_owner_unavailable": "策略所属用户不存在，请联系管理员",
+        "account_not_active": "用户账号不可用，请联系管理员",
+        "vip_required": "VIP 未开通，策略分析已停止",
+        "vip_expired": "VIP 已到期，策略分析已停止",
+        "deployment_account_mismatch": "当前 MT 账号与策略绑定账号不一致，请在用户中心修改绑定账号",
+        "invalid_deployment_account": "MT 账号无效，请检查账号后重试",
+        "insufficient_balance": "AI 余额不足，策略分析已停止，请充值后继续使用",
+    }
+    message = messages.get(error_code, "策略暂时不可用")
+    return f"{message}（{error_code}）" if include_code else message
+
+
+def _mt5_open_error_response(
+    request: Mt5OpenDecisionRequest,
+    request_id: str,
+    error_code: str,
+) -> Mt5OpenDecisionResponse:
+    return Mt5OpenDecisionResponse(
+        status="ok",
+        should_open=False,
+        description=_mt5_business_error_description(error_code),
+        spread=request.market.spread,
+        decision_id=f"dec_rejected_{sha256((request_id + error_code).encode('utf-8')).hexdigest()[:24]}",
+        request_id=request_id,
+        orders_count=0,
+        orders=[],
     )
 
 
@@ -984,6 +1648,23 @@ def _mt5_position_response(
         request_id=decision.request_id,
         actions_count=len(actions),
         actions=actions,
+    )
+
+
+def _mt5_position_error_response(
+    request: Mt5PositionDecisionRequest,
+    request_id: str,
+    error_code: str,
+) -> Mt5PositionDecisionResponse:
+    return Mt5PositionDecisionResponse(
+        status="ok",
+        has_action=False,
+        description=_mt5_business_error_description(error_code),
+        spread=request.market.spread,
+        decision_id=f"dec_rejected_{sha256((request_id + error_code).encode('utf-8')).hexdigest()[:24]}",
+        request_id=request_id,
+        actions_count=0,
+        actions=[],
     )
 
 

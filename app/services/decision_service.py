@@ -34,12 +34,42 @@ class DecisionService:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid_deployment_key",
             )
-        if deployment["status"] != "active":
+        self.ensure_deployment_access(deployment)
+        return deployment
+
+    def ensure_deployment_access(self, deployment: dict[str, Any]) -> None:
+        access_error = self.deployment_access_error(deployment)
+        if access_error is not None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="deployment_not_active",
+                detail=access_error,
             )
-        return deployment
+
+    def deployment_access_error(self, deployment: dict[str, Any]) -> str | None:
+        if deployment["status"] != "active":
+            return "deployment_not_active"
+        raw_user_id = str(deployment.get("user_id") or "").strip()
+        # Local demonstration deployments use non-numeric owners. Real user deployments
+        # always use the numeric users.id primary key and must pass account/VIP checks.
+        if not raw_user_id.isdigit():
+            return None
+        user = self.store.get_user(int(raw_user_id))
+        if user is None:
+            return "deployment_owner_unavailable"
+        if str(user.get("status") or "") != "active":
+            return "account_not_active"
+        if int(user.get("vip_level") or 0) <= 0:
+            return "vip_required"
+        if not bool(user.get("vip_active")):
+            return "vip_expired"
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        uses_official_ai = any(
+            str(config.get(f"{prefix}_ai_mode") or "official").strip().lower() != "custom"
+            for prefix in ("open", "position")
+        )
+        if uses_official_ai and bool(user.get("credit_exhausted")):
+            return "insufficient_balance"
+        return None
 
     def evaluate_open(self, request: OpenEvaluateRequest) -> TradeDecision:
         deployment = self.authenticate(request.deployment_key, request.account)

@@ -181,7 +181,7 @@ class Mt5StrategyInfo(StrictModel):
 
 class Mt5StrategyInitRequest(StrictModel):
     deployment_key: str = Field(min_length=8, max_length=256)
-    account: AccountIdentity | None = None
+    account: AccountIdentity
     provider: str = Field(default="", max_length=128)
     ea_version: float | None = Field(default=None, ge=0)
 
@@ -364,6 +364,7 @@ class WebDeploymentUpsertRequest(StrictModel):
     status: Literal["active", "paused"] = "paused"
     strategy_code: str = "PA_MOCK_V1"
     user_id: str = "web_demo"
+    mt_login: str | None = Field(default=None, max_length=64)
     open_data_type: Mt5DataType = "kline"
     open_kline_count: int = Field(default=100, ge=1, le=1000)
     position_data_type: Mt5DataType = "kline"
@@ -406,6 +407,7 @@ class WebDeploymentItem(StrictModel):
     status: Literal["active", "paused"]
     strategy_code: str
     user_id: str
+    mt_login: str = ""
     summary: str = ""
     open_logic: str = ""
     position_logic: str = ""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import json
 import logging
 from typing import AsyncIterator
@@ -12,13 +13,16 @@ from fastapi.responses import JSONResponse
 
 from app.api.router import (
     create_admin_ai_router,
+    create_auth_router,
     create_api_router,
     create_mt5_executions_router,
     create_mt5_router,
 )
 from app.config import Settings
 from app.services.ai_service import AiDecisionClient
+from app.services.auth_service import UserAuthService
 from app.services.decision_service import DecisionService
+from app.services.email_service import EmailService
 from app.store import MySQLStore, SqliteStore
 from app.strategies.pa_agent_lite import PaAgentLiteStrategy
 from app.strategies.pa_mock import PaMockStrategy
@@ -53,13 +57,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         PaAgentLiteStrategy(ai_client),
     ]
     service = DecisionService(store, {strategy.code: strategy for strategy in strategies})
+    auth_service = UserAuthService(store, resolved, EmailService(resolved))
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         store.initialize()
+        store.cleanup_expired_ai_usage_details()
         if resolved.environment != "production":
             store.ensure_demo_deployment(resolved.demo_deployment_key)
-        yield
+
+        async def cleanup_usage_details_daily() -> None:
+            while True:
+                await asyncio.sleep(24 * 60 * 60)
+                await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
+
+        cleanup_task = asyncio.create_task(cleanup_usage_details_daily())
+        try:
+            yield
+        finally:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
 
     application = FastAPI(
         title="GainLab AI Trading API",
@@ -76,8 +94,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "http://localhost:3000",
             "http://127.0.0.1:5174",
             "http://localhost:5174",
+            "http://127.0.0.1:5180",
+            "http://localhost:5180",
             "https://gainlab.ai",
             "https://www.gainlab.ai",
+            "https://aitrader.gainlab.ai",
         ],
         allow_origin_regex=r"https://.*\.gainlab\.ai",
         allow_credentials=True,
@@ -117,7 +138,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(create_api_router(store, service))
     application.include_router(create_mt5_router(store, service))
     application.include_router(create_mt5_executions_router(store, service))
-    application.include_router(create_admin_ai_router(store))
+    application.include_router(create_admin_ai_router(
+        store,
+        admin_jwt_secret=resolved.admin_jwt_secret,
+        require_admin_auth=resolved.environment == "production" or bool(resolved.admin_jwt_secret),
+    ))
+    application.include_router(create_auth_router(auth_service))
     application.state.settings = resolved
     application.state.store = store
     return application

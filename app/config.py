@@ -23,6 +23,21 @@ def _load_dotenv() -> None:
         if key and key not in os.environ:
             os.environ[key] = value
 
+    mail_env_file = os.getenv("GAINLAB_MAIL_ENV_FILE", "").strip()
+    if not mail_env_file:
+        return
+    external_path = Path(mail_env_file)
+    if not external_path.exists():
+        return
+    for raw_line in external_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("MAIL_") and key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -38,6 +53,16 @@ class Settings:
     mysql_password: str = ""
     ai_timeout: float = 30.0
     demo_deployment_key: str = "gl_demo_pa_key"
+    auth_secret: str = ""
+    admin_jwt_secret: str = ""
+    session_days: int = 30
+    verification_minutes: int = 10
+    mail_host: str = ""
+    mail_port: int = 465
+    mail_user: str = ""
+    mail_password: str = ""
+    mail_from: str = ""
+    mail_secure: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,6 +83,16 @@ class Settings:
             mysql_user=os.getenv("GAINLAB_MYSQL_USER", ""),
             mysql_password=os.getenv("GAINLAB_MYSQL_PASSWORD", ""),
             ai_timeout=float(os.getenv("GAINLAB_AI_TIMEOUT", "30")),
+            auth_secret=os.getenv("GAINLAB_AUTH_SECRET", ""),
+            admin_jwt_secret=os.getenv("GAINLAB_ADMIN_JWT_SECRET", ""),
+            session_days=int(os.getenv("GAINLAB_SESSION_DAYS", "30")),
+            verification_minutes=int(os.getenv("GAINLAB_VERIFICATION_MINUTES", "10")),
+            mail_host=os.getenv("GAINLAB_MAIL_HOST", os.getenv("MAIL_HOST", "")),
+            mail_port=int(os.getenv("GAINLAB_MAIL_PORT", os.getenv("MAIL_PORT", "465"))),
+            mail_user=os.getenv("GAINLAB_MAIL_USER", os.getenv("MAIL_USER", "")),
+            mail_password=os.getenv("GAINLAB_MAIL_PASSWORD", os.getenv("MAIL_PASS", "")),
+            mail_from=os.getenv("GAINLAB_MAIL_FROM", os.getenv("MAIL_FROM", os.getenv("MAIL_USER", ""))),
+            mail_secure=os.getenv("GAINLAB_MAIL_SECURE", "true").strip().lower() not in {"0", "false", "no"},
             demo_deployment_key=os.getenv(
                 "GAINLAB_DEMO_DEPLOYMENT_KEY",
                 "gl_demo_pa_key",

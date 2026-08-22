@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,21 @@ class MySqlConnection:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalized_utc_iso(value: str) -> str:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def decimal_string(value: Any, default: str = "0") -> str:
+    try:
+        amount = Decimal(str(value if value not in (None, "") else default))
+    except (InvalidOperation, ValueError):
+        amount = Decimal(default)
+    return format(amount, "f")
 
 
 def _period_bounds(period: str) -> tuple[str, str, int, int, str]:
@@ -205,8 +221,83 @@ class SqliteStore:
 
     def initialize(self) -> None:
         with self._connect() as connection:
+            self._migrate_sqlite_user_id(connection)
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT UNIQUE,
+                    password_hash TEXT,
+                    nickname TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending_activation',
+                    vip_level INTEGER NOT NULL DEFAULT 0,
+                    vip_expires_at TEXT NOT NULL DEFAULT '',
+                    max_strategy_keys INTEGER NOT NULL DEFAULT 10,
+                    agent_level INTEGER NOT NULL DEFAULT 0,
+                    invite_code TEXT UNIQUE,
+                    referrer_user_id INTEGER,
+                    referred_at TEXT NOT NULL DEFAULT '',
+                    ai_balance NUMERIC NOT NULL DEFAULT 0,
+                    email_verified_at TEXT NOT NULL DEFAULT '',
+                    last_login_at TEXT NOT NULL DEFAULT '',
+                    remark TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL DEFAULT '',
+                    remark TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_balance_ledger (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    entry_type TEXT NOT NULL,
+                    amount NUMERIC NOT NULL,
+                    balance_before NUMERIC NOT NULL,
+                    balance_after NUMERIC NOT NULL,
+                    operator_id TEXT NOT NULL DEFAULT '',
+                    reference_id TEXT UNIQUE,
+                    remark TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ai_balance_ledger_user_time
+                    ON ai_balance_ledger(user_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_balance_ledger_type_time
+                    ON ai_balance_ledger(entry_type, created_at);
+
+                CREATE TABLE IF NOT EXISTS email_verification_codes (
+                    id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT NOT NULL DEFAULT '',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_verification_email_purpose
+                    ON email_verification_codes(email, purpose, created_at);
+
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id
+                    ON user_sessions(user_id, created_at);
+
                 CREATE TABLE IF NOT EXISTS deployments (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
@@ -272,6 +363,10 @@ class SqliteStore:
                     commission REAL NOT NULL DEFAULT 0,
                     swap REAL NOT NULL DEFAULT 0,
                     net_profit REAL NOT NULL DEFAULT 0,
+                    open_price REAL NOT NULL DEFAULT 0,
+                    close_price REAL NOT NULL DEFAULT 0,
+                    open_time INTEGER NOT NULL DEFAULT 0,
+                    close_time INTEGER NOT NULL DEFAULT 0,
                     deal_time INTEGER NOT NULL DEFAULT 0,
                     comment TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
@@ -279,6 +374,11 @@ class SqliteStore:
                     UNIQUE(account_login, account_server, deal_id),
                     FOREIGN KEY(deployment_id) REFERENCES deployments(id)
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_mt5_history_deployment_close
+                    ON mt5_history_deals(deployment_id, close_time);
+                CREATE INDEX IF NOT EXISTS idx_mt5_history_deployment_symbol_close
+                    ON mt5_history_deals(deployment_id, symbol, close_time);
 
                 CREATE TABLE IF NOT EXISTS ai_providers (
                     id TEXT PRIMARY KEY,
@@ -336,6 +436,8 @@ class SqliteStore:
                     input_token_rate REAL NOT NULL DEFAULT 1,
                     output_token_rate REAL NOT NULL DEFAULT 1,
                     billing_multiplier REAL NOT NULL DEFAULT 1,
+                    input_price_per_million NUMERIC NOT NULL DEFAULT 0,
+                    output_price_per_million NUMERIC NOT NULL DEFAULT 0,
                     is_default INTEGER NOT NULL DEFAULT 0,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     selectable_by_user INTEGER NOT NULL DEFAULT 0,
@@ -373,11 +475,45 @@ class SqliteStore:
                     total_tokens INTEGER NOT NULL DEFAULT 0,
                     official_tokens INTEGER NOT NULL DEFAULT 0,
                     custom_tokens INTEGER NOT NULL DEFAULT 0,
+                    billing_source TEXT NOT NULL DEFAULT '',
+                    input_price_snapshot NUMERIC NOT NULL DEFAULT 0,
+                    output_price_snapshot NUMERIC NOT NULL DEFAULT 0,
+                    charged_amount NUMERIC NOT NULL DEFAULT 0,
+                    balance_after NUMERIC,
                     success INTEGER NOT NULL DEFAULT 1,
                     error_message TEXT NOT NULL DEFAULT '',
                     response_preview TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_user_time
+                    ON ai_usage_logs(user_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_user_model_time
+                    ON ai_usage_logs(user_id, model_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_user_deployment_time
+                    ON ai_usage_logs(user_id, deployment_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS ai_usage_monthly_summaries (
+                    user_id TEXT NOT NULL,
+                    month_key TEXT NOT NULL,
+                    model_id TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    deployment_id TEXT NOT NULL DEFAULT '',
+                    strategy_code TEXT NOT NULL DEFAULT '',
+                    billing_source TEXT NOT NULL DEFAULT '',
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    success_calls INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    official_tokens INTEGER NOT NULL DEFAULT 0,
+                    custom_tokens INTEGER NOT NULL DEFAULT 0,
+                    charged_amount NUMERIC NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, month_key, model_id, deployment_id, billing_source)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_monthly_user_month
+                    ON ai_usage_monthly_summaries(user_id, month_key);
 
                 CREATE TABLE IF NOT EXISTS official_ai_strategies (
                     id TEXT PRIMARY KEY,
@@ -400,6 +536,30 @@ class SqliteStore:
                     open_ai_endpoint_id TEXT NOT NULL DEFAULT '',
                     position_ai_endpoint_id TEXT NOT NULL DEFAULT '',
                     default_config_json TEXT NOT NULL DEFAULT '{}',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort INTEGER NOT NULL DEFAULT 9999,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ea_downloads (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    oss_url TEXT NOT NULL,
+                    file_name TEXT NOT NULL DEFAULT '',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    sort INTEGER NOT NULL DEFAULT 9999,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS guide_articles (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL DEFAULT '',
+                    content_json TEXT NOT NULL DEFAULT '[]',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     sort INTEGER NOT NULL DEFAULT 9999,
                     created_at TEXT NOT NULL,
@@ -438,6 +598,151 @@ class SqliteStore:
             self._ensure_ai_endpoint_tables(connection)
             self._ensure_official_strategy_columns(connection)
             self._ensure_official_strategy_seed(connection)
+            self._ensure_user_columns(connection)
+        self._backfill_ai_usage_monthly_summaries()
+        self._ensure_existing_users()
+
+    def _migrate_sqlite_user_id(self, connection: sqlite3.Connection) -> None:
+        table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+        ).fetchone()
+        if not table:
+            return
+        columns = connection.execute("PRAGMA table_info(users)").fetchall()
+        id_column = next((row for row in columns if row["name"] == "id"), None)
+        if id_column and str(id_column["type"] or "").upper() == "INTEGER":
+            return
+        connection.executescript(
+            """
+            ALTER TABLE users RENAME TO users_legacy;
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE,
+                password_hash TEXT,
+                nickname TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending_activation',
+                vip_level INTEGER NOT NULL DEFAULT 0,
+                vip_expires_at TEXT NOT NULL DEFAULT '',
+                max_strategy_keys INTEGER NOT NULL DEFAULT 10,
+                agent_level INTEGER NOT NULL DEFAULT 0,
+                invite_code TEXT UNIQUE,
+                referrer_user_id INTEGER,
+                referred_at TEXT NOT NULL DEFAULT '',
+                ai_balance NUMERIC NOT NULL DEFAULT 0,
+                email_verified_at TEXT NOT NULL DEFAULT '',
+                last_login_at TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO users (
+                id, email, password_hash, nickname, status, vip_level,
+                vip_expires_at, max_strategy_keys, agent_level, invite_code,
+                referrer_user_id, referred_at, email_verified_at,
+                last_login_at, remark, created_at, updated_at
+            )
+            SELECT CAST(id AS INTEGER), email, password_hash, nickname, status, vip_level,
+                   COALESCE(vip_expires_at, ''), COALESCE(max_strategy_keys, 10),
+                   0, NULL, NULL, '', email_verified_at, last_login_at, remark, created_at, updated_at
+            FROM users_legacy
+            WHERE id <> '' AND id NOT GLOB '*[^0-9]*';
+            DROP TABLE users_legacy;
+            """
+        )
+
+    def _ensure_user_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        migrations = {
+            "vip_expires_at": "ALTER TABLE users ADD COLUMN vip_expires_at TEXT NOT NULL DEFAULT ''",
+            "max_strategy_keys": "ALTER TABLE users ADD COLUMN max_strategy_keys INTEGER NOT NULL DEFAULT 10",
+            "ai_balance": "ALTER TABLE users ADD COLUMN ai_balance NUMERIC NOT NULL DEFAULT 0",
+            "agent_level": "ALTER TABLE users ADD COLUMN agent_level INTEGER NOT NULL DEFAULT 0",
+            "invite_code": "ALTER TABLE users ADD COLUMN invite_code TEXT",
+            "referrer_user_id": "ALTER TABLE users ADD COLUMN referrer_user_id INTEGER",
+            "referred_at": "ALTER TABLE users ADD COLUMN referred_at TEXT NOT NULL DEFAULT ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS uk_users_invite_code ON users(invite_code)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_users_referrer ON users(referrer_user_id, created_at)")
+        now = utc_now_iso()
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("ai_credit_limit", "10.000000", "官方 AI 默认信用额度（元）", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("ai_low_balance_threshold", "10.000000", "客户端低余额提醒阈值（元）", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("ai_usage_detail_retention_days", "60", "AI 调用明细保存天数", now),
+        )
+
+    def _backfill_ai_usage_monthly_summaries(self) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            marker = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("ai_usage_monthly_summary_backfilled",),
+            ).fetchone()
+            if marker is not None:
+                return
+            connection.execute(
+                """
+                INSERT INTO ai_usage_monthly_summaries (
+                    user_id, month_key, model_id, provider_id, deployment_id,
+                    strategy_code, billing_source, calls, success_calls,
+                    input_tokens, output_tokens, official_tokens, custom_tokens,
+                    charged_amount, updated_at
+                )
+                SELECT user_id, SUBSTR(created_at, 1, 7), model_id, MAX(provider_id),
+                       deployment_id, MAX(strategy_code), billing_source,
+                       COUNT(*), COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                       COALESCE(SUM(official_tokens), 0), COALESCE(SUM(custom_tokens), 0),
+                       COALESCE(SUM(charged_amount), 0), ?
+                FROM ai_usage_logs
+                GROUP BY user_id, SUBSTR(created_at, 1, 7), model_id,
+                         deployment_id, billing_source
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                ("ai_usage_monthly_summary_backfilled", "1", "AI 月度汇总历史数据已初始化", now),
+            )
+
+    def _ensure_existing_users(self) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT user_id FROM deployments WHERE user_id <> ''"
+            ).fetchall()
+            for row in rows:
+                raw_user_id = str(row["user_id"] or "").strip()
+                if not raw_user_id.isdigit():
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO users (
+                        id, email, password_hash, nickname, status, vip_level,
+                        vip_expires_at, max_strategy_keys, email_verified_at,
+                        last_login_at, remark, created_at, updated_at
+                    ) VALUES (?, NULL, NULL, '', 'pending_activation', 0, '', 10, '', '', ?, ?, ?)
+                    """,
+                    (int(raw_user_id), "由现有策略数据自动补充", now, now),
+                )
 
     def _ensure_mt5_history_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -482,6 +787,11 @@ class SqliteStore:
             "symbol": "ALTER TABLE ai_usage_logs ADD COLUMN symbol TEXT NOT NULL DEFAULT ''",
             "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
             "response_preview": "ALTER TABLE ai_usage_logs ADD COLUMN response_preview TEXT NOT NULL DEFAULT ''",
+            "billing_source": "ALTER TABLE ai_usage_logs ADD COLUMN billing_source TEXT NOT NULL DEFAULT ''",
+            "input_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN input_price_snapshot NUMERIC NOT NULL DEFAULT 0",
+            "output_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN output_price_snapshot NUMERIC NOT NULL DEFAULT 0",
+            "charged_amount": "ALTER TABLE ai_usage_logs ADD COLUMN charged_amount NUMERIC NOT NULL DEFAULT 0",
+            "balance_after": "ALTER TABLE ai_usage_logs ADD COLUMN balance_after NUMERIC",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -537,6 +847,8 @@ class SqliteStore:
                 input_token_rate REAL NOT NULL DEFAULT 1,
                 output_token_rate REAL NOT NULL DEFAULT 1,
                 billing_multiplier REAL NOT NULL DEFAULT 1,
+                input_price_per_million NUMERIC NOT NULL DEFAULT 0,
+                output_price_per_million NUMERIC NOT NULL DEFAULT 0,
                 is_default INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 selectable_by_user INTEGER NOT NULL DEFAULT 0,
@@ -564,6 +876,8 @@ class SqliteStore:
             "input_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN input_token_rate REAL NOT NULL DEFAULT 1",
             "output_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN output_token_rate REAL NOT NULL DEFAULT 1",
             "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier REAL NOT NULL DEFAULT 1",
+            "input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN input_price_per_million NUMERIC NOT NULL DEFAULT 0",
+            "output_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN output_price_per_million NUMERIC NOT NULL DEFAULT 0",
             "is_default": "ALTER TABLE ai_endpoints ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
             "enabled": "ALTER TABLE ai_endpoints ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
             "selectable_by_user": "ALTER TABLE ai_endpoints ADD COLUMN selectable_by_user INTEGER NOT NULL DEFAULT 0",
@@ -814,7 +1128,7 @@ class SqliteStore:
             rows = connection.execute(
                 """
                 SELECT * FROM deployments
-                WHERE user_id = ?
+                WHERE user_id = ? AND status <> 'deleted'
                 ORDER BY updated_at DESC
                 """,
                 (user_id,),
@@ -825,6 +1139,153 @@ class SqliteStore:
             for deployment in deployments
             if deployment["config"].get("deployment_key")
         ]
+
+    def update_user_deployment_status(self, *, user_id: int, deployment_id: str, status: str) -> dict[str, Any]:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"active", "paused"}:
+            raise RuntimeError("invalid_deployment_status")
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM deployments WHERE id = ? AND user_id = ? AND status <> 'deleted'",
+                (deployment_id, str(user_id)),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("deployment_not_found")
+            connection.execute(
+                "UPDATE deployments SET status = ?, updated_at = ? WHERE id = ?",
+                (normalized_status, now, deployment_id),
+            )
+            updated = connection.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,)).fetchone()
+        return self._deployment_row(updated)
+
+    def delete_user_deployment(self, *, user_id: int, deployment_id: str) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM deployments WHERE id = ? AND user_id = ? AND status <> 'deleted'",
+                (deployment_id, str(user_id)),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("deployment_not_found")
+            connection.execute(
+                "UPDATE deployments SET status = 'deleted', updated_at = ? WHERE id = ?",
+                (now, deployment_id),
+            )
+
+    def update_user_deployment_ai_config(
+        self,
+        *,
+        user_id: int,
+        deployment_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM deployments WHERE id = ? AND user_id = ? AND status <> 'deleted'",
+                (deployment_id, str(user_id)),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("deployment_not_found")
+            deployment = self._deployment_row(row)
+            config = dict(deployment.get("config") or {})
+            for prefix in ("open", "position"):
+                mode = str(payload.get(f"{prefix}_ai_mode") or config.get(f"{prefix}_ai_mode") or "official").strip().lower()
+                if mode not in {"official", "custom"}:
+                    raise RuntimeError("invalid_ai_mode")
+                config[f"{prefix}_ai_mode"] = mode
+                if mode == "official":
+                    endpoint_id = str(payload.get(f"{prefix}_ai_endpoint_id") or "").strip()
+                    endpoint = connection.execute(
+                        """
+                        SELECT id, model FROM ai_endpoints
+                        WHERE id = ? AND owner_type = 'gl' AND enabled = 1
+                          AND selectable_by_user = 1 AND api_key <> ''
+                        """,
+                        (endpoint_id,),
+                    ).fetchone()
+                    if endpoint is None:
+                        raise RuntimeError("invalid_ai_endpoint")
+                    config[f"{prefix}_ai_endpoint_id"] = str(endpoint["id"] or "")
+                    config[f"{prefix}_ai_model"] = str(endpoint["model"] or "")
+                    config[f"{prefix}_ai_base_url"] = ""
+                    config[f"{prefix}_ai_key"] = ""
+                else:
+                    base_url = str(payload.get(f"{prefix}_ai_base_url") or "").strip()
+                    model = str(payload.get(f"{prefix}_ai_model") or "").strip()
+                    new_key = str(payload.get(f"{prefix}_ai_key") or "").strip()
+                    existing_key = str(config.get(f"{prefix}_ai_key") or "").strip()
+                    if not base_url or not model or not (new_key or existing_key):
+                        raise RuntimeError("custom_ai_config_required")
+                    config[f"{prefix}_ai_endpoint_id"] = ""
+                    config[f"{prefix}_ai_base_url"] = base_url.rstrip("/")
+                    config[f"{prefix}_ai_model"] = model
+                    if new_key:
+                        config[f"{prefix}_ai_key"] = new_key
+            config["ai_user_configured"] = True
+            connection.execute(
+                "UPDATE deployments SET config_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(config, ensure_ascii=False), now, deployment_id),
+            )
+            updated = connection.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,)).fetchone()
+        return self._deployment_row(updated)
+
+    def update_user_deployment_settings(
+        self,
+        *,
+        user_id: int,
+        deployment_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        deployment = self.update_user_deployment_ai_config(
+            user_id=user_id,
+            deployment_id=deployment_id,
+            payload=payload,
+        )
+        config = dict(deployment.get("config") or {})
+        size_mode = str(payload.get("position_size_mode") or config.get("position_size_mode") or "fixed")
+        risk_mode = str(payload.get("risk_base_mode") or config.get("risk_base_mode") or "fixed_loss")
+        status = str(payload.get("status") or deployment.get("status") or "active")
+        if size_mode not in {"fixed", "risk"} or risk_mode not in {"fixed_loss", "balance_percent"}:
+            raise RuntimeError("invalid_strategy_settings")
+        if status not in {"active", "paused"}:
+            raise RuntimeError("invalid_deployment_status")
+        try:
+            fixed_volume = float(payload.get("fixed_volume", config.get("fixed_volume", 0.01)))
+            risk_amount = float(payload.get("risk_amount", config.get("risk_amount", 100)))
+            risk_percent = float(payload.get("risk_percent", config.get("risk_percent", 1)))
+            max_positions = int(payload.get("max_positions", config.get("max_positions", 1)))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("invalid_strategy_settings") from exc
+        if fixed_volume < 0 or risk_amount < 0 or risk_percent <= 0 or max_positions < 1:
+            raise RuntimeError("invalid_strategy_settings")
+        config.update({
+            "position_size_mode": size_mode,
+            "fixed_volume": fixed_volume,
+            "lot": fixed_volume,
+            "risk_base_mode": risk_mode,
+            "risk_amount": risk_amount,
+            "risk_percent": risk_percent,
+            "max_positions": max_positions,
+            "allow_add": bool(payload.get("allow_add", config.get("allow_add", False))),
+        })
+        strategy_name = str(payload.get("name") or deployment.get("strategy_name") or "").strip()
+        mt_login = str(payload.get("mt_login") if "mt_login" in payload else deployment.get("mt_login") or "").strip()
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE deployments
+                SET strategy_name = ?, status = ?, mt_login = ?, config_json = ?, updated_at = ?
+                WHERE id = ? AND user_id = ? AND status <> 'deleted'
+                """,
+                (strategy_name, status, mt_login or None, json.dumps(config, ensure_ascii=False), now, deployment_id, str(user_id)),
+            )
+            updated = connection.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,)).fetchone()
+        if updated is None:
+            raise RuntimeError("deployment_not_found")
+        return self._deployment_row(updated)
 
     def deployment_runtime_stats(self, deployment_id: str) -> dict[str, Any]:
         stats = {
@@ -1200,6 +1661,10 @@ class SqliteStore:
         }
 
     def admin_ai_strategy_overview(self) -> dict[str, Any]:
+        billing_settings = self.get_ai_billing_settings()
+        credit_limit = Decimal(str(billing_settings["credit_limit"]))
+        warning_threshold = Decimal(str(billing_settings["low_balance_threshold"]))
+        month_start = datetime.now(timezone.utc).strftime("%Y-%m-01T00:00:00+00:00")
         with self._connect() as connection:
             deployments = [
                 self._deployment_row(row)
@@ -1222,9 +1687,6 @@ class SqliteStore:
                 """
                 SELECT
                     deployment_id,
-                    account_login,
-                    account_server,
-                    symbol,
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -1234,15 +1696,33 @@ class SqliteStore:
                 GROUP BY deployment_id
                 """
             ).fetchall()
-            quota_row = connection.execute(
+            wallet_user_row = connection.execute(
                 """
                 SELECT
-                    COUNT(*) AS quota_user_count,
-                    COALESCE(SUM(monthly_quota), 0) AS monthly_quota,
-                    COALESCE(SUM(extra_quota), 0) AS extra_quota,
-                    COALESCE(SUM(used_tokens), 0) AS quota_used_tokens
-                FROM ai_user_quotas
+                    COUNT(*) AS user_count,
+                    COALESCE(SUM(ai_balance), 0) AS total_balance,
+                    COALESCE(SUM(CASE WHEN ai_balance < ? THEN 1 ELSE 0 END), 0) AS low_balance_users,
+                    COALESCE(SUM(CASE WHEN ai_balance <= ? THEN 1 ELSE 0 END), 0) AS exhausted_users
+                FROM users
+                """,
+                (float(warning_threshold), float(-credit_limit)),
+            ).fetchone()
+            wallet_ledger_row = connection.execute(
                 """
+                SELECT
+                    COALESCE(SUM(CASE WHEN entry_type = 'admin_recharge' THEN amount ELSE 0 END), 0) AS total_recharge,
+                    COALESCE(SUM(CASE WHEN entry_type = 'admin_deduction' THEN -amount ELSE 0 END), 0) AS total_deduction,
+                    COALESCE(SUM(CASE WHEN entry_type = 'ai_charge' THEN -amount ELSE 0 END), 0) AS total_ai_charged
+                FROM ai_balance_ledger
+                """
+            ).fetchone()
+            monthly_charge_row = connection.execute(
+                """
+                SELECT COALESCE(SUM(charged_amount), 0) AS charged_amount
+                FROM ai_usage_logs
+                WHERE created_at >= ?
+                """,
+                (month_start,),
             ).fetchone()
             history_rows = connection.execute(
                 """
@@ -1328,8 +1808,8 @@ class SqliteStore:
         )
         return {
             "summary": {
-                "user_count": len({item["user_id"] for item in by_deployment.values()}),
-                "quota_user_count": int(quota_row["quota_user_count"] or 0) if quota_row else 0,
+                "user_count": int(wallet_user_row["user_count"] or 0) if wallet_user_row else 0,
+                "strategy_user_count": len({item["user_id"] for item in by_deployment.values()}),
                 "strategy_count": len(by_deployment),
                 "running_strategy_count": len([item for item in by_deployment.values() if item["status"] == "active"]),
                 "analysis_count": total_analysis,
@@ -1340,9 +1820,13 @@ class SqliteStore:
                 "total_tokens": total_tokens,
                 "official_tokens": total_official_tokens,
                 "custom_tokens": total_custom_tokens,
-                "monthly_quota": int(quota_row["monthly_quota"] or 0) if quota_row else 0,
-                "extra_quota": int(quota_row["extra_quota"] or 0) if quota_row else 0,
-                "quota_used_tokens": int(quota_row["quota_used_tokens"] or 0) if quota_row else 0,
+                "total_balance": decimal_string(wallet_user_row["total_balance"] if wallet_user_row else 0),
+                "total_recharge": decimal_string(wallet_ledger_row["total_recharge"] if wallet_ledger_row else 0),
+                "total_deduction": decimal_string(wallet_ledger_row["total_deduction"] if wallet_ledger_row else 0),
+                "total_ai_charged": decimal_string(wallet_ledger_row["total_ai_charged"] if wallet_ledger_row else 0),
+                "monthly_ai_charged": decimal_string(monthly_charge_row["charged_amount"] if monthly_charge_row else 0),
+                "low_balance_user_count": int(wallet_user_row["low_balance_users"] or 0) if wallet_user_row else 0,
+                "credit_exhausted_user_count": int(wallet_user_row["exhausted_users"] or 0) if wallet_user_row else 0,
                 "pnl": round(total_pnl, 2),
             },
             "strategies": strategy_list[:50],
@@ -1448,15 +1932,6 @@ class SqliteStore:
                     now,
                 ),
             )
-            if strategy_code and strategy_name:
-                connection.execute(
-                    """
-                    UPDATE deployments
-                    SET strategy_name = ?, updated_at = ?
-                    WHERE strategy_code = ?
-                    """,
-                    (strategy_name, now, strategy_code),
-                )
         saved = self.get_official_ai_strategy(strategy_id)
         if saved is None:
             raise RuntimeError("official_strategy_save_failed")
@@ -1503,6 +1978,7 @@ class SqliteStore:
                     "position_ai_endpoint_id": str(row["position_ai_endpoint_id"] or ""),
                     "position_ai_endpoint_name": str(row["position_endpoint_name"] or ""),
                     "position_ai_endpoint_model": str(row["position_endpoint_model"] or ""),
+                    "default_config": self._official_strategy_row(row).get("default_config", {}),
                 }
                 for row in rows
             ],
@@ -1628,7 +2104,8 @@ class SqliteStore:
             by_deployment[deployment["id"]] = {
                 "id": deployment["id"],
                 "user_id": deployment["user_id"],
-                "name": strategy_name or deployment["strategy_name"],
+                "name": deployment["strategy_name"] or strategy_name,
+                "deployment_key": str(deployment.get("config", {}).get("deployment_key") or ""),
                 "status": deployment["status"],
                 "account_login": "",
                 "account_provider": "",
@@ -1989,6 +2466,68 @@ class SqliteStore:
                     (row["id"],),
                 ).fetchone()
         return self._deployment_row(row)
+
+    def bind_deployment_login(
+        self,
+        raw_key: str,
+        *,
+        login: str,
+        platform: str = "MT5",
+        server: str = "",
+    ) -> dict[str, Any] | None:
+        """Bind a deployment to its first MT login and reject later mismatches."""
+        normalized_login = str(login or "").strip()
+        if not normalized_login or normalized_login == "unknown":
+            raise RuntimeError("invalid_deployment_account")
+
+        key_hash = hash_deployment_key(raw_key)
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE deployments
+                SET mt_platform = ?, mt_login = ?, mt_server = ?, updated_at = ?
+                WHERE key_hash = ?
+                  AND (mt_login IS NULL OR TRIM(mt_login) = '')
+                """,
+                (
+                    str(platform or "MT5").strip(),
+                    normalized_login,
+                    str(server or "").strip(),
+                    now,
+                    key_hash,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM deployments WHERE key_hash = ?",
+                (key_hash,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        deployment = self._deployment_row(row)
+        if str(deployment.get("mt_login") or "").strip() != normalized_login:
+            raise RuntimeError("deployment_account_mismatch")
+        return deployment
+
+    def set_deployment_login(self, raw_key: str, login: str) -> dict[str, Any] | None:
+        """Set or clear the MT login from the strategy editor."""
+        normalized_login = str(login or "").strip()
+        key_hash = hash_deployment_key(raw_key)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE deployments
+                SET mt_login = ?, mt_platform = NULL, mt_server = NULL, updated_at = ?
+                WHERE key_hash = ?
+                """,
+                (normalized_login or None, utc_now_iso(), key_hash),
+            )
+            row = connection.execute(
+                "SELECT * FROM deployments WHERE key_hash = ?",
+                (key_hash,),
+            ).fetchone()
+        return self._deployment_row(row) if row else None
 
     def account_matches(
         self,
@@ -2377,15 +2916,28 @@ class SqliteStore:
         api_key = str(payload.get("api_key") or "")
         if not api_key and existing:
             api_key = str(existing.get("api_key") or "")
+        input_price = decimal_string(
+            payload.get("input_price_per_million")
+            if "input_price_per_million" in payload
+            else (existing or {}).get("input_price_per_million"),
+        )
+        output_price = decimal_string(
+            payload.get("output_price_per_million")
+            if "output_price_per_million" in payload
+            else (existing or {}).get("output_price_per_million"),
+        )
         with self._connect() as connection:
+            if payload.get("is_default", False) and str(payload.get("owner_type") or "gl") == "gl":
+                connection.execute("UPDATE ai_endpoints SET is_default = 0 WHERE owner_type = 'gl'")
             connection.execute(
                 """
                 INSERT INTO ai_endpoints (
                     id, owner_type, user_id, template_code, name, base_url, model,
                     api_key, strict_json, context_window, input_token_rate, output_token_rate,
-                    billing_multiplier, is_default, enabled, selectable_by_user,
+                    billing_multiplier, input_price_per_million, output_price_per_million,
+                    is_default, enabled, selectable_by_user,
                     sort, remark, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     owner_type = excluded.owner_type,
                     user_id = excluded.user_id,
@@ -2399,6 +2951,8 @@ class SqliteStore:
                     input_token_rate = excluded.input_token_rate,
                     output_token_rate = excluded.output_token_rate,
                     billing_multiplier = excluded.billing_multiplier,
+                    input_price_per_million = excluded.input_price_per_million,
+                    output_price_per_million = excluded.output_price_per_million,
                     is_default = excluded.is_default,
                     enabled = excluded.enabled,
                     selectable_by_user = excluded.selectable_by_user,
@@ -2420,6 +2974,8 @@ class SqliteStore:
                     float(payload.get("input_token_rate") or 1),
                     float(payload.get("output_token_rate") or 1),
                     float(payload.get("billing_multiplier") or 1),
+                    input_price,
+                    output_price,
                     1 if payload.get("is_default", False) else 0,
                     1 if payload.get("enabled", True) else 0,
                     1 if payload.get("selectable_by_user", False) else 0,
@@ -2460,7 +3016,170 @@ class SqliteStore:
 
     def delete_ai_endpoint(self, endpoint_id: str) -> None:
         with self._connect() as connection:
+            official_reference = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM official_ai_strategies
+                WHERE open_ai_endpoint_id = ? OR position_ai_endpoint_id = ?
+                """,
+                (endpoint_id, endpoint_id),
+            ).fetchone()[0]
+            deployment_reference = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM deployments
+                WHERE config_json LIKE ?
+                """,
+                (f'%"{endpoint_id}"%',),
+            ).fetchone()[0]
+            if int(official_reference or 0) > 0 or int(deployment_reference or 0) > 0:
+                raise RuntimeError("ai_endpoint_in_use")
             connection.execute("DELETE FROM ai_endpoints WHERE id = ?", (endpoint_id,))
+
+    def list_ea_downloads(self, *, include_disabled: bool = False) -> dict[str, Any]:
+        where = "" if include_disabled else "WHERE enabled = 1"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM ea_downloads {where} ORDER BY sort ASC, updated_at DESC"
+            ).fetchall()
+        return {"list": [self._ea_download_row(row) for row in rows]}
+
+    def save_ea_download(self, payload: dict[str, Any]) -> dict[str, Any]:
+        download_id = str(payload.get("id") or f"ead_{uuid4().hex}").strip()
+        name = str(payload.get("name") or "").strip()
+        oss_url = str(payload.get("oss_url") or "").strip()
+        if not name:
+            raise RuntimeError("ea_download_name_required")
+        if not oss_url:
+            raise RuntimeError("ea_download_url_required")
+        now = utc_now_iso()
+        sort_value = int(payload["sort"]) if payload.get("sort") is not None else 9999
+        existing = None
+        with self._connect() as connection:
+            existing = connection.execute("SELECT * FROM ea_downloads WHERE id = ?", (download_id,)).fetchone()
+            connection.execute(
+                """
+                INSERT INTO ea_downloads (
+                    id, name, description, oss_url, file_name, file_size,
+                    enabled, sort, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    oss_url = excluded.oss_url,
+                    file_name = excluded.file_name,
+                    file_size = excluded.file_size,
+                    enabled = excluded.enabled,
+                    sort = excluded.sort,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    download_id,
+                    name,
+                    str(payload.get("description") or ""),
+                    oss_url,
+                    str(payload.get("file_name") or ""),
+                    max(0, int(payload.get("file_size") or 0)),
+                    1 if payload.get("enabled", True) else 0,
+                    sort_value,
+                    str(existing["created_at"]) if existing else now,
+                    now,
+                ),
+            )
+            row = connection.execute("SELECT * FROM ea_downloads WHERE id = ?", (download_id,)).fetchone()
+        return self._ea_download_row(row)
+
+    def delete_ea_download(self, download_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM ea_downloads WHERE id = ?", (download_id,))
+
+    def list_guide_articles(
+        self,
+        *,
+        include_disabled: bool = False,
+        include_content: bool = False,
+    ) -> dict[str, Any]:
+        where = "" if include_disabled else "WHERE enabled = 1"
+        columns = "*" if include_content else "id, title, summary, enabled, sort, created_at, updated_at"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM guide_articles {where} ORDER BY sort ASC, updated_at DESC"
+            ).fetchall()
+        return {"list": [self._guide_article_row(row) for row in rows]}
+
+    def get_guide_article(self, article_id: str, *, include_disabled: bool = False) -> dict[str, Any] | None:
+        enabled_clause = "" if include_disabled else "AND enabled = 1"
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT * FROM guide_articles WHERE id = ? {enabled_clause}",
+                (article_id,),
+            ).fetchone()
+        return self._guide_article_row(row) if row else None
+
+    def save_guide_article(self, payload: dict[str, Any]) -> dict[str, Any]:
+        article_id = str(payload.get("id") or f"guide_{uuid4().hex}").strip()
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            raise RuntimeError("guide_title_required")
+        raw_content = payload.get("content")
+        if not isinstance(raw_content, list):
+            raw_content = []
+        content: list[dict[str, str]] = []
+        for raw_block in raw_content[:200]:
+            if not isinstance(raw_block, dict):
+                continue
+            block_type = str(raw_block.get("type") or "paragraph").strip()
+            if block_type not in {"heading", "paragraph", "image"}:
+                continue
+            block = {"type": block_type}
+            if block_type == "image":
+                url = str(raw_block.get("url") or "").strip()
+                if not url:
+                    continue
+                block["url"] = url
+                block["caption"] = str(raw_block.get("caption") or "").strip()
+            else:
+                text = str(raw_block.get("text") or "").strip()
+                if not text:
+                    continue
+                block["text"] = text
+            content.append(block)
+        now = utc_now_iso()
+        sort_value = int(payload["sort"]) if payload.get("sort") is not None else 9999
+        with self._connect() as connection:
+            existing = connection.execute("SELECT created_at FROM guide_articles WHERE id = ?", (article_id,)).fetchone()
+            connection.execute(
+                """
+                INSERT INTO guide_articles (
+                    id, title, summary, content_json, enabled, sort, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    summary = excluded.summary,
+                    content_json = excluded.content_json,
+                    enabled = excluded.enabled,
+                    sort = excluded.sort,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    article_id,
+                    title,
+                    str(payload.get("summary") or "").strip(),
+                    json.dumps(content, ensure_ascii=False),
+                    1 if payload.get("enabled", True) else 0,
+                    sort_value,
+                    str(existing["created_at"]) if existing else now,
+                    now,
+                ),
+            )
+        article = self.get_guide_article(article_id, include_disabled=True)
+        if article is None:
+            raise RuntimeError("guide_save_failed")
+        return article
+
+    def delete_guide_article(self, article_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM guide_articles WHERE id = ?", (article_id,))
 
     def list_ai_templates(
         self,
@@ -2555,6 +3274,8 @@ class SqliteStore:
                     "model": str(row["model"] or ""),
                     "display_name": str(row["model"] or row["name"] or ""),
                     "base_url": str(row["base_url"] or ""),
+                    "input_price_per_million": decimal_string(row["input_price_per_million"] or 0),
+                    "output_price_per_million": decimal_string(row["output_price_per_million"] or 0),
                     "is_default": bool(row["is_default"]),
                     "official_available": True,
                 }
@@ -2613,6 +3334,1061 @@ class SqliteStore:
             ).fetchone()
         return self._quota_row(row)
 
+    def get_ai_billing_settings(self) -> dict[str, str]:
+        values = {
+            "credit_limit": "10.000000",
+            "low_balance_threshold": "10.000000",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT setting_key, setting_value
+                FROM system_settings
+                WHERE setting_key IN ('ai_credit_limit', 'ai_low_balance_threshold')
+                """
+            ).fetchall()
+        for row in rows:
+            if row["setting_key"] == "ai_credit_limit":
+                values["credit_limit"] = decimal_string(row["setting_value"], "10")
+            elif row["setting_key"] == "ai_low_balance_threshold":
+                values["low_balance_threshold"] = decimal_string(row["setting_value"], "10")
+        return values
+
+    def get_ai_usage_detail_retention_days(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("ai_usage_detail_retention_days",),
+            ).fetchone()
+        try:
+            return max(1, min(3650, int(str(row["setting_value"])))) if row else 60
+        except (TypeError, ValueError):
+            return 60
+
+    def cleanup_expired_ai_usage_details(self, *, batch_size: int = 5000, max_batches: int = 100) -> int:
+        retention_days = self.get_ai_usage_detail_retention_days()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        deleted = 0
+        for _ in range(max_batches):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT id FROM ai_usage_logs WHERE created_at < ? ORDER BY created_at LIMIT ?",
+                    (cutoff, max(1, min(10000, int(batch_size)))),
+                ).fetchall()
+                ids = [str(row["id"]) for row in rows]
+                if not ids:
+                    break
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"DELETE FROM ai_balance_ledger WHERE entry_type = 'ai_charge' AND reference_id IN ({placeholders})",
+                    ids,
+                )
+                connection.execute(
+                    f"DELETE FROM ai_usage_logs WHERE id IN ({placeholders})",
+                    ids,
+                )
+                deleted += len(ids)
+            if len(ids) < batch_size:
+                break
+        return deleted
+
+    def save_ai_billing_settings(
+        self,
+        *,
+        credit_limit: Decimal,
+        low_balance_threshold: Decimal,
+    ) -> dict[str, str]:
+        now = utc_now_iso()
+        rows = (
+            ("ai_credit_limit", format(credit_limit, "f"), "官方 AI 默认信用额度（元）"),
+            ("ai_low_balance_threshold", format(low_balance_threshold, "f"), "客户端低余额提醒阈值（元）"),
+        )
+        with self._connect() as connection:
+            for key, value, remark in rows:
+                connection.execute(
+                    """
+                    INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(setting_key) DO UPDATE SET
+                        setting_value = excluded.setting_value,
+                        remark = excluded.remark,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, value, remark, now),
+                )
+        return self.get_ai_billing_settings()
+
+    def adjust_ai_balance(
+        self,
+        *,
+        user_id: int,
+        amount: Decimal,
+        entry_type: str,
+        remark: str = "",
+        operator_id: str = "admin",
+        reference_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        ledger_id = f"aibl_{uuid4().hex}"
+        with self._connect() as connection:
+            lock_suffix = " FOR UPDATE" if isinstance(connection, MySqlConnection) else ""
+            row = connection.execute(
+                f"SELECT id, ai_balance FROM users WHERE id = ?{lock_suffix}",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("user_not_found")
+            balance_before = Decimal(str(row["ai_balance"] or 0))
+            balance_after = balance_before + amount
+            connection.execute(
+                "UPDATE users SET ai_balance = ?, updated_at = ? WHERE id = ?",
+                (format(balance_after, "f"), now, user_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO ai_balance_ledger (
+                    id, user_id, entry_type, amount, balance_before, balance_after,
+                    operator_id, reference_id, remark, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ledger_id,
+                    user_id,
+                    entry_type,
+                    format(amount, "f"),
+                    format(balance_before, "f"),
+                    format(balance_after, "f"),
+                    operator_id,
+                    reference_id,
+                    remark,
+                    now,
+                ),
+            )
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+        return {"ledger_id": ledger_id, "user": user}
+
+    def list_ai_balance_ledger(
+        self,
+        *,
+        page: int,
+        size: int,
+        keyword: str = "",
+        user_id: int | None = None,
+        entry_type: str = "",
+        exclude_entry_type: str = "",
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user_id is not None:
+            clauses.append("l.user_id = ?")
+            params.append(user_id)
+        if entry_type:
+            clauses.append("l.entry_type = ?")
+            params.append(entry_type)
+        if exclude_entry_type:
+            clauses.append("l.entry_type <> ?")
+            params.append(exclude_entry_type)
+        if keyword:
+            like = f"%{keyword}%"
+            keyword_clauses = ["u.email LIKE ?", "u.nickname LIKE ?", "l.remark LIKE ?"]
+            params.extend([like, like, like])
+            if keyword.isdigit():
+                keyword_clauses.append("l.user_id = ?")
+                params.append(int(keyword))
+            clauses.append(f"({' OR '.join(keyword_clauses)})")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._paged_query_sql(
+            count_sql=f"SELECT COUNT(*) FROM ai_balance_ledger l JOIN users u ON u.id = l.user_id {where}",
+            list_sql=f"""
+                SELECT l.*, u.email, u.nickname
+                FROM ai_balance_ledger l
+                JOIN users u ON u.id = l.user_id
+                {where}
+                ORDER BY l.created_at DESC, l.id DESC
+                LIMIT ? OFFSET ?
+            """,
+            params=params,
+            page=page,
+            size=size,
+            mapper=self._balance_ledger_row,
+        )
+
+    def get_user_portal_data(self, user_id: int) -> dict[str, Any]:
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+
+        deployments = []
+        summary = {
+            "strategy_count": 0,
+            "active_strategy_count": 0,
+            "analysis_count": 0,
+            "signal_count": 0,
+            "order_count": 0,
+            "official_tokens_used": 0,
+            "custom_tokens_used": 0,
+            "pnl": 0.0,
+        }
+        for deployment in self.list_web_deployments(str(user_id)):
+            config = deployment["config"]
+            stats = self.deployment_runtime_stats(deployment["id"])
+            official_strategy = self.get_official_ai_strategy(deployment["strategy_code"])
+            open_ai_mode = str(config.get("open_ai_mode") or "official")
+            position_ai_mode = str(config.get("position_ai_mode") or "official")
+            open_ai_endpoint_id = str(config.get("open_ai_endpoint_id") or "")
+            position_ai_endpoint_id = str(config.get("position_ai_endpoint_id") or "")
+            if official_strategy:
+                if open_ai_mode == "official" and not open_ai_endpoint_id:
+                    open_ai_endpoint_id = str(official_strategy.get("open_ai_endpoint_id") or "")
+                if position_ai_mode == "official" and not position_ai_endpoint_id:
+                    position_ai_endpoint_id = str(official_strategy.get("position_ai_endpoint_id") or "")
+            open_ai_endpoint = self.get_ai_endpoint(open_ai_endpoint_id)
+            position_ai_endpoint = self.get_ai_endpoint(position_ai_endpoint_id)
+            item = {
+                "id": deployment["id"],
+                "deployment_key": str(config.get("deployment_key") or ""),
+                "name": str(deployment["strategy_name"] or (official_strategy.get("name") if official_strategy else "") or ""),
+                "status": deployment["status"],
+                "strategy_code": deployment["strategy_code"],
+                "mt_login": str(deployment.get("mt_login") or ""),
+                "summary": str(official_strategy.get("summary") or config.get("summary") or "") if official_strategy else str(config.get("summary") or ""),
+                "open_ai_mode": open_ai_mode,
+                "open_ai_model": str(config.get("open_ai_model") or ""),
+                "open_ai_endpoint_id": open_ai_endpoint_id,
+                "open_ai_endpoint_name": str(open_ai_endpoint.get("name") or "") if open_ai_endpoint else "",
+                "open_ai_base_url": str(config.get("open_ai_base_url") or ""),
+                "open_ai_key_configured": bool(str(config.get("open_ai_key") or "").strip()),
+                "ai_user_configured": bool(config.get("ai_user_configured", False)),
+                "position_ai_mode": position_ai_mode,
+                "position_ai_model": str(config.get("position_ai_model") or ""),
+                "position_ai_endpoint_id": position_ai_endpoint_id,
+                "position_ai_endpoint_name": str(position_ai_endpoint.get("name") or "") if position_ai_endpoint else "",
+                "position_ai_base_url": str(config.get("position_ai_base_url") or ""),
+                "position_ai_key_configured": bool(str(config.get("position_ai_key") or "").strip()),
+                "open_data_type": str(config.get("open_data_type") or "kline"),
+                "open_kline_count": int(config.get("open_kline_count") or 100),
+                "position_data_type": str(config.get("position_data_type") or "kline"),
+                "position_kline_count": int(config.get("position_kline_count") or 100),
+                "call_mode": str(config.get("call_mode") or "bar"),
+                "call_val": float(config.get("call_val") or 1),
+                "position_size_mode": str(config.get("position_size_mode") or "fixed"),
+                "fixed_volume": float(config.get("fixed_volume") or config.get("lot") or 0.01),
+                "risk_base_mode": str(config.get("risk_base_mode") or "fixed_loss"),
+                "risk_amount": float(config.get("risk_amount") or 0),
+                "risk_percent": float(config.get("risk_percent") or 0),
+                "allow_add": bool(config.get("allow_add", False)),
+                "max_positions": int(config.get("max_positions") or 1),
+                "updated_at": deployment["updated_at"],
+                **stats,
+            }
+            deployments.append(item)
+            summary["strategy_count"] += 1
+            summary["active_strategy_count"] += 1 if deployment["status"] == "active" else 0
+            for field in ("analysis_count", "signal_count", "order_count", "official_tokens_used", "custom_tokens_used"):
+                summary[field] += int(stats[field] or 0)
+            summary["pnl"] = round(float(summary["pnl"]) + float(stats["pnl"] or 0), 2)
+
+        month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        with self._connect() as connection:
+            order_summary = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN h.net_profit > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN h.net_profit < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                    COALESCE(SUM(h.net_profit), 0) AS pnl,
+                    COUNT(DISTINCT h.symbol) AS symbol_count
+                FROM mt5_history_deals h
+                JOIN deployments d ON d.id = h.deployment_id
+                WHERE d.user_id = ? AND LOWER(h.entry) IN ('out', 'out_by', 'inout')
+                """,
+                (str(user_id),),
+            ).fetchone()
+            order_rows = connection.execute(
+                """
+                SELECT h.*, d.strategy_name, d.id AS deployment_id
+                FROM mt5_history_deals h
+                JOIN deployments d ON d.id = h.deployment_id
+                WHERE d.user_id = ? AND LOWER(h.entry) IN ('out', 'out_by', 'inout')
+                ORDER BY COALESCE(NULLIF(h.close_time, 0), h.deal_time) DESC, h.updated_at DESC
+                LIMIT 200
+                """,
+                (str(user_id),),
+            ).fetchall()
+            usage_summary = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS calls,
+                    COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) AS success_calls,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(official_tokens), 0) AS official_tokens,
+                    COALESCE(SUM(custom_tokens), 0) AS custom_tokens,
+                    COALESCE(SUM(charged_amount), 0) AS charged_amount
+                FROM ai_usage_logs
+                WHERE user_id = ? AND created_at >= ?
+                """,
+                (str(user_id), month_start),
+            ).fetchone()
+            usage_rows = connection.execute(
+                """
+                SELECT * FROM ai_usage_logs
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 200
+                """,
+                (str(user_id),),
+            ).fetchall()
+            wallet_totals = connection.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS total_credit,
+                    COALESCE(SUM(CASE WHEN amount < 0 AND entry_type <> 'ai_charge' THEN -amount ELSE 0 END), 0) AS manual_debit,
+                    (SELECT COALESCE(SUM(charged_amount), 0)
+                     FROM ai_usage_monthly_summaries
+                     WHERE user_id = ?) AS ai_total_debit
+                FROM ai_balance_ledger
+                WHERE user_id = ?
+                """,
+                (str(user_id), user_id),
+            ).fetchone()
+
+        orders = []
+        for row in order_rows:
+            orders.append({
+                "order_id": str(row["order_id"] or row["deal_id"] or ""),
+                "deployment_id": str(row["deployment_id"] or ""),
+                "strategy_name": str(row["strategy_name"] or ""),
+                "symbol": str(row["symbol"] or ""),
+                "mt_type": str(row["mt_type"] or ""),
+                "volume": float(row["volume"] or 0),
+                "open_price": float(row["open_price"] or 0),
+                "close_price": float(row["close_price"] or row["price"] or 0),
+                "net_profit": float(row["net_profit"] or 0),
+                "open_time": int(row["open_time"] or 0),
+                "close_time": int(row["close_time"] or row["deal_time"] or 0),
+                "comment": str(row["comment"] or ""),
+            })
+
+        usage = self._with_ai_usage_display_names([self._usage_row(row) for row in usage_rows])
+        for item in usage:
+            for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount", "balance_after"):
+                item[field] = None if item.get(field) is None else decimal_string(item.get(field))
+
+        ledger = self.list_ai_balance_ledger(
+            page=1,
+            size=100,
+            user_id=user_id,
+            exclude_entry_type="ai_charge",
+        )
+        total_orders = int(order_summary["total"] or 0) if order_summary else 0
+        wins = int(order_summary["wins"] or 0) if order_summary else 0
+        losses = int(order_summary["losses"] or 0) if order_summary else 0
+        return {
+            "user": user,
+            "summary": summary,
+            "strategies": deployments,
+            "orders": {
+                "total": total_orders,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total_orders) * 100, 2) if total_orders else 0,
+                "pnl": round(float(order_summary["pnl"] or 0), 2) if order_summary else 0,
+                "symbol_count": int(order_summary["symbol_count"] or 0) if order_summary else 0,
+                "list": orders,
+            },
+            "usage": {
+                "calls": int(usage_summary["calls"] or 0) if usage_summary else 0,
+                "success_calls": int(usage_summary["success_calls"] or 0) if usage_summary else 0,
+                "input_tokens": int(usage_summary["input_tokens"] or 0) if usage_summary else 0,
+                "output_tokens": int(usage_summary["output_tokens"] or 0) if usage_summary else 0,
+                "official_tokens": int(usage_summary["official_tokens"] or 0) if usage_summary else 0,
+                "custom_tokens": int(usage_summary["custom_tokens"] or 0) if usage_summary else 0,
+                "charged_amount": decimal_string(usage_summary["charged_amount"] if usage_summary else 0),
+                "list": usage,
+            },
+            "wallet": {
+                "balance": user["ai_balance"],
+                "credit_limit": user["credit_limit"],
+                "available_balance": user["available_balance"],
+                "low_balance_threshold": user["low_balance_threshold"],
+                "balance_warning": user["balance_warning"],
+                "credit_exhausted": user["credit_exhausted"],
+                "total_credit": decimal_string(wallet_totals["total_credit"] if wallet_totals else 0),
+                "total_debit": decimal_string(
+                    Decimal(str(wallet_totals["manual_debit"] or 0))
+                    + Decimal(str(wallet_totals["ai_total_debit"] or 0))
+                    if wallet_totals else 0
+                ),
+                "ledger": ledger["list"],
+            },
+        }
+
+    def list_user_orders(
+        self,
+        *,
+        user_id: int,
+        page: int,
+        size: int,
+        deployment_id: str = "",
+        deployment_key: str = "",
+        symbol: str = "",
+        start_at: str = "",
+        end_at: str = "",
+    ) -> dict[str, Any]:
+        normalized_page = max(1, int(page))
+        normalized_size = max(1, min(100, int(size)))
+        offset = (normalized_page - 1) * normalized_size
+        time_expr = "COALESCE(NULLIF(h.close_time, 0), h.deal_time)"
+        clauses = ["d.user_id = ?", "LOWER(h.entry) IN ('out', 'out_by', 'inout')"]
+        params: list[Any] = [str(user_id)]
+        if deployment_id:
+            clauses.append("h.deployment_id = ?")
+            params.append(deployment_id)
+        if symbol:
+            clauses.append("UPPER(h.symbol) = UPPER(?)")
+            params.append(symbol)
+        if start_at:
+            clauses.append(f"{time_expr} >= ?")
+            params.append(int(datetime.fromisoformat(normalized_utc_iso(start_at)).timestamp()))
+        if end_at:
+            clauses.append(f"{time_expr} <= ?")
+            params.append(int(datetime.fromisoformat(normalized_utc_iso(end_at)).timestamp()))
+        where = f"WHERE {' AND '.join(clauses)}"
+
+        deployments = self.list_web_deployments(str(user_id))
+        deployment_map = {
+            str(item["id"]): {
+                "id": str(item["id"]),
+                "key": str(item.get("config", {}).get("deployment_key") or ""),
+                "name": str(item.get("strategy_name") or ""),
+            }
+            for item in deployments
+        }
+
+        with self._connect() as connection:
+            summary = connection.execute(
+                f"""
+                SELECT COUNT(*) total,
+                       COALESCE(SUM(CASE WHEN h.net_profit > 0 THEN 1 ELSE 0 END), 0) wins,
+                       COALESCE(SUM(CASE WHEN h.net_profit < 0 THEN 1 ELSE 0 END), 0) losses,
+                       COALESCE(SUM(h.net_profit), 0) pnl,
+                       COUNT(DISTINCT h.symbol) symbol_count
+                FROM mt5_history_deals h
+                JOIN deployments d ON d.id = h.deployment_id
+                {where}
+                """,
+                params,
+            ).fetchone()
+            rows = connection.execute(
+                f"""
+                SELECT h.*, d.strategy_name
+                FROM mt5_history_deals h
+                JOIN deployments d ON d.id = h.deployment_id
+                {where}
+                ORDER BY {time_expr} DESC, h.updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, normalized_size, offset],
+            ).fetchall()
+            symbol_rows = connection.execute(
+                """
+                SELECT DISTINCT h.symbol
+                FROM mt5_history_deals h
+                JOIN deployments d ON d.id = h.deployment_id
+                WHERE d.user_id = ?
+                  AND LOWER(h.entry) IN ('out', 'out_by', 'inout')
+                  AND h.symbol <> ''
+                ORDER BY h.symbol
+                """,
+                (str(user_id),),
+            ).fetchall()
+            curve_rows = connection.execute(
+                f"""
+                SELECT {time_expr} close_timestamp,
+                       COALESCE(h.net_profit, 0) change_amount
+                FROM mt5_history_deals h
+                JOIN deployments d ON d.id = h.deployment_id
+                {where}
+                ORDER BY {time_expr}, h.updated_at, h.id
+                """,
+                params,
+            ).fetchall()
+
+        orders = []
+        for row in rows:
+            deployment = deployment_map.get(str(row["deployment_id"] or ""), {})
+            orders.append({
+                "order_id": str(row["order_id"] or row["deal_id"] or ""),
+                "deployment_id": str(row["deployment_id"] or ""),
+                "deployment_key": str(deployment.get("key") or ""),
+                "strategy_name": str(deployment.get("name") or row["strategy_name"] or ""),
+                "account_login": str(row["account_login"] or ""),
+                "symbol": str(row["symbol"] or ""),
+                "mt_type": str(row["mt_type"] or ""),
+                "volume": float(row["volume"] or 0),
+                "open_price": float(row["open_price"] or 0),
+                "close_price": float(row["close_price"] or row["price"] or 0),
+                "net_profit": float(row["net_profit"] or 0),
+                "open_time": int(row["open_time"] or 0),
+                "close_time": int(row["close_time"] or row["deal_time"] or 0),
+                "comment": str(row["comment"] or ""),
+            })
+
+        curve = []
+        cumulative = 0.0
+        for row in curve_rows:
+            change = float(row["change_amount"] or 0)
+            cumulative = round(cumulative + change, 2)
+            curve.append({
+                "time": datetime.fromtimestamp(int(row["close_timestamp"]), timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "change": round(change, 2),
+                "pnl": cumulative,
+            })
+
+        total = int(summary["total"] or 0) if summary else 0
+        wins = int(summary["wins"] or 0) if summary else 0
+        losses = int(summary["losses"] or 0) if summary else 0
+        return {
+            "total": total,
+            "page": normalized_page,
+            "size": normalized_size,
+            "pages": max(1, (total + normalized_size - 1) // normalized_size),
+            "list": orders,
+            "summary": {
+                "total": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total) * 100, 2) if total else 0,
+                "pnl": round(float(summary["pnl"] or 0), 2) if summary else 0,
+                "symbol_count": int(summary["symbol_count"] or 0) if summary else 0,
+            },
+            "curve": curve,
+            "filters": {
+                "deployments": list(deployment_map.values()),
+                "symbols": [str(row["symbol"] or "") for row in symbol_rows],
+            },
+        }
+
+    def list_users(
+        self,
+        *,
+        page: int,
+        size: int,
+        keyword: str = "",
+        status: str = "",
+        vip_level: int | None = None,
+        agent_level: int | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if keyword:
+            like = f"%{keyword}%"
+            keyword_clauses = ["u.email LIKE ?", "u.nickname LIKE ?"]
+            params.extend([like, like])
+            if keyword.isdigit():
+                keyword_clauses.append("u.id = ?")
+                params.append(int(keyword))
+            clauses.append(f"({' OR '.join(keyword_clauses)})")
+        if status:
+            clauses.append("u.status = ?")
+            params.append(status)
+        if vip_level is not None:
+            clauses.append("u.vip_level = ?")
+            params.append(max(0, int(vip_level)))
+        if agent_level is not None:
+            clauses.append("u.agent_level = ?")
+            params.append(max(0, int(agent_level)))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._paged_query_sql(
+            count_sql=f"SELECT COUNT(*) FROM users u {where}",
+            list_sql=f"""
+                SELECT u.*,
+                       (SELECT COUNT(*) FROM deployments d WHERE d.user_id = u.id AND d.status <> 'deleted') AS strategy_count,
+                       (SELECT COUNT(*) FROM users child WHERE child.referrer_user_id = u.id) AS referral_count,
+                       (SELECT setting_value FROM system_settings WHERE setting_key = 'ai_credit_limit') AS credit_limit,
+                       (SELECT setting_value FROM system_settings WHERE setting_key = 'ai_low_balance_threshold') AS low_balance_threshold
+                FROM users u
+                {where}
+                ORDER BY u.created_at DESC, u.id DESC
+                LIMIT ? OFFSET ?
+            """,
+            params=params,
+            page=page,
+            size=size,
+            mapper=self._user_row,
+        )
+
+    def get_user(self, user_id: int | str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT u.*,
+                       (SELECT COUNT(*) FROM deployments d WHERE d.user_id = u.id AND d.status <> 'deleted') AS strategy_count,
+                       (SELECT COUNT(*) FROM users child WHERE child.referrer_user_id = u.id) AS referral_count,
+                       (SELECT setting_value FROM system_settings WHERE setting_key = 'ai_credit_limit') AS credit_limit,
+                       (SELECT setting_value FROM system_settings WHERE setting_key = 'ai_low_balance_threshold') AS low_balance_threshold
+                FROM users u
+                WHERE u.id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+        return self._user_row(row) if row else None
+
+    def save_user(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now_iso()
+        raw_user_id = str(payload.get("id") or "").strip()
+        if raw_user_id and not raw_user_id.isdigit():
+            raise RuntimeError("invalid_user_id")
+        user_id = int(raw_user_id) if raw_user_id else None
+        email = str(payload.get("email") or "").strip().lower() or None
+        if user_id is None and not email:
+            raise RuntimeError("user_email_required")
+        nickname = str(payload.get("nickname") or "").strip()
+        status = str(payload.get("status") or "pending_activation").strip()
+        if status not in {"pending_activation", "active", "disabled"}:
+            raise RuntimeError("invalid_user_status")
+        vip_level = max(0, int(payload.get("vip_level") or 0))
+        vip_expires_at = str(payload.get("vip_expires_at") or "").strip()
+        max_strategy_keys = max(0, int(payload.get("max_strategy_keys", 10) or 0))
+        requested_agent_level = payload.get("agent_level")
+        agent_level = max(0, int(requested_agent_level or 0))
+
+        try:
+            with self._connect() as connection:
+                existing = None
+                if user_id is not None:
+                    existing = connection.execute(
+                        "SELECT id, email_verified_at, agent_level, invite_code FROM users WHERE id = ?",
+                        (user_id,),
+                    ).fetchone()
+                if existing and "agent_level" not in payload:
+                    agent_level = int(existing["agent_level"] or 0)
+                invite_code = str(existing["invite_code"] or "") if existing else ""
+                if agent_level > 0 and not invite_code:
+                    invite_code = self._generate_invite_code(connection)
+                requested_verified = bool(payload.get("email_verified"))
+                verified_at = now if requested_verified else ""
+                if existing:
+                    if "email_verified" not in payload:
+                        verified_at = str(existing["email_verified_at"] or "")
+                    connection.execute(
+                        """
+                        UPDATE users
+                        SET email = ?, nickname = ?, status = ?, vip_level = ?,
+                            vip_expires_at = ?, max_strategy_keys = ?,
+                            agent_level = ?, invite_code = NULLIF(?, ''),
+                            email_verified_at = ?, remark = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            email,
+                            nickname,
+                            status,
+                            vip_level,
+                            vip_expires_at,
+                            max_strategy_keys,
+                            agent_level,
+                            invite_code,
+                            verified_at,
+                            str(payload.get("remark") or ""),
+                            now,
+                            user_id,
+                        ),
+                    )
+                else:
+                    columns = "email, password_hash, nickname, status, vip_level, vip_expires_at, max_strategy_keys, agent_level, invite_code, email_verified_at, last_login_at, remark, created_at, updated_at"
+                    values: list[Any] = [
+                        email, None, nickname, status, vip_level, vip_expires_at,
+                        max_strategy_keys, agent_level, invite_code or None, verified_at, "", str(payload.get("remark") or ""), now, now,
+                    ]
+                    if user_id is not None:
+                        columns = f"id, {columns}"
+                        values.insert(0, user_id)
+                    placeholders = ", ".join("?" for _ in values)
+                    connection.execute(
+                        f"INSERT INTO users ({columns}) VALUES ({placeholders})",
+                        values,
+                    )
+                    if user_id is None:
+                        row = connection.execute(
+                            "SELECT id FROM users WHERE email = ?",
+                            (email,),
+                        ).fetchone()
+                        user_id = int(row["id"])
+        except DatabaseIntegrityError as exc:
+            raise RuntimeError("user_email_exists") from exc
+
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_save_failed")
+        return user
+
+    @staticmethod
+    def _generate_invite_code(connection: Any) -> str:
+        for _ in range(20):
+            code = f"GL{uuid4().hex[:10].upper()}"
+            exists = connection.execute("SELECT id FROM users WHERE invite_code = ?", (code,)).fetchone()
+            if not exists:
+                return code
+        raise RuntimeError("invite_code_generation_failed")
+
+    @staticmethod
+    def _masked_email(email: str) -> str:
+        local, separator, domain = str(email or "").partition("@")
+        if not separator:
+            return "-"
+        visible = local[:2] if len(local) > 1 else local[:1]
+        return f"{visible}***@{domain}"
+
+    def get_agent_dashboard(self, user_id: int, *, page: int = 1, size: int = 20) -> dict[str, Any]:
+        agent = self.get_user(user_id)
+        if agent is None:
+            raise RuntimeError("user_not_found")
+        if int(agent.get("agent_level") or 0) <= 0:
+            raise RuntimeError("agent_required")
+        normalized_page = max(1, int(page or 1))
+        normalized_size = max(1, min(100, int(size or 20)))
+        offset = (normalized_page - 1) * normalized_size
+        now = utc_now_iso()
+        with self._connect() as connection:
+            summary = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0) AS active_users,
+                       COALESCE(SUM(CASE WHEN vip_level > 0 AND vip_expires_at <> '' AND vip_expires_at > ? THEN 1 ELSE 0 END), 0) AS active_vip_users
+                FROM users
+                WHERE referrer_user_id = ?
+                """,
+                (now, user_id),
+            ).fetchone()
+            rows = connection.execute(
+                """
+                SELECT id, email, nickname, status, vip_level, vip_expires_at, referred_at, created_at
+                FROM users
+                WHERE referrer_user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, normalized_size, offset),
+            ).fetchall()
+        items = []
+        for row in rows:
+            expires_at = str(row["vip_expires_at"] or "")
+            vip_active = int(row["vip_level"] or 0) > 0 and bool(expires_at) and expires_at > now
+            items.append({
+                "id": int(row["id"]),
+                "email": self._masked_email(str(row["email"] or "")),
+                "nickname": str(row["nickname"] or ""),
+                "status": str(row["status"] or ""),
+                "vip_level": int(row["vip_level"] or 0),
+                "vip_active": vip_active,
+                "vip_expires_at": expires_at,
+                "referred_at": str(row["referred_at"] or row["created_at"] or ""),
+                "created_at": str(row["created_at"] or ""),
+            })
+        total = int(summary["total"] or 0) if summary else 0
+        return {
+            "agent_level": int(agent.get("agent_level") or 0),
+            "invite_code": str(agent.get("invite_code") or ""),
+            "summary": {
+                "total_users": total,
+                "active_users": int(summary["active_users"] or 0) if summary else 0,
+                "active_vip_users": int(summary["active_vip_users"] or 0) if summary else 0,
+            },
+            "page": normalized_page,
+            "size": normalized_size,
+            "pages": max(1, (total + normalized_size - 1) // normalized_size),
+            "total": total,
+            "list": items,
+        }
+
+    def get_auth_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM users WHERE email = ?",
+                (email.strip().lower(),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_auth_user_by_id(self, user_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update_user_nickname(self, user_id: int, nickname: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE users SET nickname = ?, updated_at = ? WHERE id = ?",
+                (nickname.strip(), utc_now_iso(), user_id),
+            )
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+        return user
+
+    def update_user_password(self, user_id: int, password_hash: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                (password_hash, utc_now_iso(), user_id),
+            )
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+        return user
+
+    def update_user_email(self, user_id: int, email: str) -> dict[str, Any]:
+        now = utc_now_iso()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE users SET email = ?, email_verified_at = ?, updated_at = ? WHERE id = ?",
+                    (email.strip().lower(), now, now, user_id),
+                )
+        except DatabaseIntegrityError as exc:
+            raise RuntimeError("user_email_exists") from exc
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+        return user
+
+    def prepare_registration(self, *, email: str, password_hash: str, invite_code: str = "") -> dict[str, Any]:
+        now = utc_now_iso()
+        normalized = email.strip().lower()
+        normalized_invite = str(invite_code or "").strip().upper()
+        with self._connect() as connection:
+            referrer_id: int | None = None
+            if normalized_invite:
+                referrer = connection.execute(
+                    "SELECT id FROM users WHERE invite_code = ? AND agent_level > 0 AND status = 'active'",
+                    (normalized_invite,),
+                ).fetchone()
+                if not referrer:
+                    raise RuntimeError("invalid_invite_code")
+                referrer_id = int(referrer["id"])
+            row = connection.execute("SELECT * FROM users WHERE email = ?", (normalized,)).fetchone()
+            if row and str(row["status"] or "") == "disabled":
+                raise RuntimeError("user_disabled")
+            if row and row["email_verified_at"]:
+                raise RuntimeError("email_already_registered")
+            if row:
+                existing_referrer_id = row["referrer_user_id"] if "referrer_user_id" in row.keys() else None
+                bound_referrer_id = existing_referrer_id or referrer_id
+                referred_at = str(row["referred_at"] or "") if "referred_at" in row.keys() else ""
+                if bound_referrer_id and not referred_at:
+                    referred_at = now
+                connection.execute(
+                    "UPDATE users SET password_hash = ?, status = 'pending_activation', referrer_user_id = ?, referred_at = ?, updated_at = ? WHERE id = ?",
+                    (password_hash, bound_referrer_id, referred_at, now, row["id"]),
+                )
+                user_id = int(row["id"])
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO users (
+                        email, password_hash, nickname, status, vip_level,
+                        vip_expires_at, max_strategy_keys, referrer_user_id, referred_at, email_verified_at,
+                        last_login_at, remark, created_at, updated_at
+                    ) VALUES (?, ?, '', 'pending_activation', 0, '', 10, ?, ?, '', '', '', ?, ?)
+                    """,
+                    (normalized, password_hash, referrer_id, now if referrer_id else "", now, now),
+                )
+                created = connection.execute("SELECT id FROM users WHERE email = ?", (normalized,)).fetchone()
+                user_id = int(created["id"])
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_save_failed")
+        return user
+
+    def save_verification_code(
+        self,
+        *,
+        email: str,
+        purpose: str,
+        code_hash: str,
+        expires_at: str,
+    ) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE email_verification_codes SET consumed_at = ? WHERE email = ? AND purpose = ? AND consumed_at = ''",
+                (now, email, purpose),
+            )
+            connection.execute(
+                """
+                INSERT INTO email_verification_codes (
+                    id, email, purpose, code_hash, expires_at, consumed_at, attempt_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, '', 0, ?)
+                """,
+                (f"evc_{uuid4().hex}", email, purpose, code_hash, expires_at, now),
+            )
+
+    def latest_verification_created_at(self, *, email: str, purpose: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT created_at FROM email_verification_codes WHERE email = ? AND purpose = ? ORDER BY created_at DESC LIMIT 1",
+                (email, purpose),
+            ).fetchone()
+        return str(row["created_at"] or "") if row else ""
+
+    def consume_verification_code(self, *, email: str, purpose: str, code_hash: str) -> str:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM email_verification_codes
+                WHERE email = ? AND purpose = ? AND consumed_at = ''
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (email, purpose),
+            ).fetchone()
+            if not row:
+                return "invalid"
+            if str(row["expires_at"] or "") <= now:
+                connection.execute(
+                    "UPDATE email_verification_codes SET consumed_at = ? WHERE id = ?",
+                    (now, row["id"]),
+                )
+                return "expired"
+            attempts = int(row["attempt_count"] or 0)
+            if attempts >= 5:
+                return "too_many_attempts"
+            if str(row["code_hash"] or "") != code_hash:
+                connection.execute(
+                    "UPDATE email_verification_codes SET attempt_count = attempt_count + 1 WHERE id = ?",
+                    (row["id"],),
+                )
+                return "invalid"
+            connection.execute(
+                "UPDATE email_verification_codes SET consumed_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+        return "ok"
+
+    def activate_user(self, *, email: str, password_hash: str | None = None) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute("SELECT id, status FROM users WHERE email = ?", (email,)).fetchone()
+            if not row:
+                raise RuntimeError("user_not_found")
+            if str(row["status"] or "") == "disabled":
+                raise RuntimeError("user_disabled")
+            if password_hash:
+                connection.execute(
+                    """
+                    UPDATE users SET password_hash = ?, email_verified_at = ?, status = 'active', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (password_hash, now, now, row["id"]),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE users SET email_verified_at = ?, status = 'active', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, row["id"]),
+                )
+            user_id = int(row["id"])
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+        return user
+
+    def create_user_session(self, *, user_id: int, token_hash: str, expires_at: str) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_sessions (id, user_id, token_hash, expires_at, revoked_at, created_at)
+                VALUES (?, ?, ?, ?, '', ?)
+                """,
+                (f"ses_{uuid4().hex}", user_id, token_hash, expires_at, now),
+            )
+            connection.execute(
+                "UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, user_id),
+            )
+
+    def get_session_user(self, token_hash: str) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT u.*,
+                       (SELECT COUNT(*) FROM deployments d WHERE d.user_id = u.id AND d.status <> 'deleted') AS strategy_count
+                FROM user_sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.token_hash = ? AND s.revoked_at = '' AND s.expires_at > ?
+                """,
+                (token_hash, now),
+            ).fetchone()
+        return self._user_row(row) if row else None
+
+    def revoke_session(self, token_hash: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE user_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at = ''",
+                (utc_now_iso(), token_hash),
+            )
+
+    def list_user_sessions(self, user_id: int, current_token_hash: str) -> list[dict[str, Any]]:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, expires_at, created_at,
+                       CASE WHEN token_hash = ? THEN 1 ELSE 0 END AS is_current
+                FROM user_sessions
+                WHERE user_id = ? AND revoked_at = '' AND expires_at > ?
+                ORDER BY created_at DESC
+                """,
+                (current_token_hash, user_id, now),
+            ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "created_at": str(row["created_at"]),
+                "expires_at": str(row["expires_at"]),
+                "is_current": bool(row["is_current"]),
+            }
+            for row in rows
+        ]
+
+    def revoke_user_session(self, user_id: int, session_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM user_sessions WHERE id = ? AND user_id = ? AND revoked_at = ''",
+                (session_id, user_id),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE user_sessions SET revoked_at = ? WHERE id = ?",
+                (utc_now_iso(), session_id),
+            )
+        return True
+
+    def revoke_other_user_sessions(self, user_id: int, current_token_hash: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE user_sessions SET revoked_at = ?
+                WHERE user_id = ? AND token_hash != ? AND revoked_at = ''
+                """,
+                (utc_now_iso(), user_id, current_token_hash),
+            )
+
+    def revoke_all_user_sessions(self, user_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE user_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at = ''",
+                (utc_now_iso(), user_id),
+            )
+
     def list_ai_usage_logs(
         self,
         *,
@@ -2620,28 +4396,271 @@ class SqliteStore:
         size: int,
         keyword: str = "",
         user_id: str = "",
+        model_id: str = "",
+        deployment_id: str = "",
+        deployment_key: str = "",
+        endpoint: str = "",
+        billing_source: str = "",
+        success: bool | None = None,
+        start_at: str = "",
+        end_at: str = "",
     ) -> dict[str, Any]:
-        clauses = []
+        clauses: list[str] = []
         params: list[Any] = []
         if keyword:
-            clauses.append("(deployment_id LIKE ? OR strategy_code LIKE ? OR endpoint LIKE ? OR error_message LIKE ? OR response_preview LIKE ?)")
+            clauses.append("(l.deployment_id LIKE ? OR l.strategy_code LIKE ? OR l.endpoint LIKE ? OR l.error_message LIKE ? OR l.response_preview LIKE ? OR u.email LIKE ? OR d.strategy_name LIKE ?)")
             like = f"%{keyword}%"
-            params.extend([like, like, like, like, like])
+            params.extend([like, like, like, like, like, like, like])
         if user_id:
-            clauses.append("user_id = ?")
+            clauses.append("l.user_id = ?")
             params.append(user_id)
+        if model_id:
+            clauses.append("l.model_id = ?")
+            params.append(model_id)
+        if deployment_id:
+            clauses.append("l.deployment_id = ?")
+            params.append(deployment_id)
+        if deployment_key:
+            clauses.append("d.config_json LIKE ?")
+            params.append(f'%"deployment_key": "{deployment_key}"%')
+        if endpoint:
+            clauses.append("l.endpoint = ?")
+            params.append(endpoint)
+        if billing_source:
+            clauses.append("l.billing_source = ?")
+            params.append(billing_source)
+        if success is not None:
+            clauses.append("l.success = ?")
+            params.append(1 if success else 0)
+        if start_at:
+            clauses.append("l.created_at >= ?")
+            params.append(normalized_utc_iso(start_at))
+        if end_at:
+            clauses.append("l.created_at <= ?")
+            params.append(normalized_utc_iso(end_at))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        data = self._paged_query(
-            table="ai_usage_logs",
-            where=where,
+        data = self._paged_query_sql(
+            count_sql=f"""
+                SELECT COUNT(*)
+                FROM ai_usage_logs l
+                LEFT JOIN deployments d ON d.id = l.deployment_id
+                LEFT JOIN users u ON u.id = l.user_id
+                {where}
+            """,
+            list_sql=f"""
+                SELECT l.*, d.strategy_name, d.config_json, u.email user_email, u.nickname user_nickname
+                FROM ai_usage_logs l
+                LEFT JOIN deployments d ON d.id = l.deployment_id
+                LEFT JOIN users u ON u.id = l.user_id
+                {where}
+                ORDER BY l.created_at DESC
+                LIMIT ? OFFSET ?
+            """,
             params=params,
             page=page,
             size=size,
-            order_by="created_at DESC",
             mapper=self._usage_row,
         )
         data["list"] = self._with_ai_usage_display_names(data["list"])
+        for item in data["list"]:
+            try:
+                config = json.loads(str(item.pop("config_json", "") or "{}"))
+            except json.JSONDecodeError:
+                config = {}
+            item["deployment_key"] = str(config.get("deployment_key") or "")
+        with self._connect() as connection:
+            summary = connection.execute(
+                f"""
+                SELECT COUNT(*) calls,
+                       COALESCE(SUM(CASE WHEN l.success = 1 THEN 1 ELSE 0 END), 0) success_calls,
+                       COALESCE(SUM(l.input_tokens), 0) input_tokens,
+                       COALESCE(SUM(l.output_tokens), 0) output_tokens,
+                       COALESCE(SUM(l.charged_amount), 0) charged_amount
+                FROM ai_usage_logs l
+                LEFT JOIN deployments d ON d.id = l.deployment_id
+                LEFT JOIN users u ON u.id = l.user_id
+                {where}
+                """,
+                params,
+            ).fetchone()
+        data["summary"] = {
+            "calls": int(summary["calls"] or 0),
+            "success_calls": int(summary["success_calls"] or 0),
+            "input_tokens": int(summary["input_tokens"] or 0),
+            "output_tokens": int(summary["output_tokens"] or 0),
+            "charged_amount": decimal_string(summary["charged_amount"] or 0),
+        }
         return data
+
+    def list_user_ai_usage(
+        self,
+        *,
+        user_id: int,
+        page: int,
+        size: int,
+        model_id: str = "",
+        deployment_id: str = "",
+        start_at: str = "",
+        end_at: str = "",
+    ) -> dict[str, Any]:
+        retention_days = self.get_ai_usage_detail_retention_days()
+        retention_start = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        requested_start = normalized_utc_iso(start_at) if start_at else ""
+        detail_start = max(retention_start, requested_start) if requested_start else retention_start
+        clauses = ["user_id = ?", "created_at >= ?"]
+        params: list[Any] = [str(user_id), detail_start]
+        if model_id:
+            clauses.append("model_id = ?")
+            params.append(model_id)
+        if deployment_id:
+            clauses.append("deployment_id = ?")
+            params.append(deployment_id)
+        if end_at:
+            clauses.append("created_at <= ?")
+            params.append(normalized_utc_iso(end_at))
+        where = f"WHERE {' AND '.join(clauses)}"
+        data = self._paged_query_sql(
+            count_sql=f"SELECT COUNT(*) FROM ai_usage_logs {where}",
+            list_sql=f"SELECT * FROM ai_usage_logs {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            params=params,
+            page=page,
+            size=size,
+            mapper=self._usage_row,
+        )
+        data["list"] = self._with_ai_usage_display_names(data["list"])
+
+        with self._connect() as connection:
+            summary = connection.execute(
+                f"""
+                SELECT COUNT(*) calls,
+                       COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) success_calls,
+                       COALESCE(SUM(input_tokens), 0) input_tokens,
+                       COALESCE(SUM(output_tokens), 0) output_tokens,
+                       COALESCE(SUM(official_tokens), 0) official_tokens,
+                       COALESCE(SUM(custom_tokens), 0) custom_tokens,
+                       COALESCE(SUM(charged_amount), 0) charged_amount
+                FROM ai_usage_logs {where}
+                """,
+                params,
+            ).fetchone()
+            model_rows = connection.execute(
+                """
+                SELECT model_id, MAX(provider_id) provider_id
+                FROM ai_usage_monthly_summaries
+                WHERE user_id = ? AND model_id <> ''
+                GROUP BY model_id
+                ORDER BY model_id
+                """,
+                (str(user_id),),
+            ).fetchall()
+            lifetime_summary = connection.execute(
+                """
+                SELECT COALESCE(SUM(calls), 0) calls,
+                       COALESCE(SUM(success_calls), 0) success_calls,
+                       COALESCE(SUM(input_tokens), 0) input_tokens,
+                       COALESCE(SUM(output_tokens), 0) output_tokens,
+                       COALESCE(SUM(official_tokens), 0) official_tokens,
+                       COALESCE(SUM(custom_tokens), 0) custom_tokens,
+                       COALESCE(SUM(charged_amount), 0) charged_amount
+                FROM ai_usage_monthly_summaries
+                WHERE user_id = ?
+                """,
+                (str(user_id),),
+            ).fetchone()
+            monthly_rows = connection.execute(
+                """
+                SELECT month_key,
+                       COALESCE(SUM(calls), 0) calls,
+                       COALESCE(SUM(success_calls), 0) success_calls,
+                       COALESCE(SUM(input_tokens), 0) input_tokens,
+                       COALESCE(SUM(output_tokens), 0) output_tokens,
+                       COALESCE(SUM(official_tokens), 0) official_tokens,
+                       COALESCE(SUM(custom_tokens), 0) custom_tokens,
+                       COALESCE(SUM(charged_amount), 0) charged_amount
+                FROM ai_usage_monthly_summaries
+                WHERE user_id = ?
+                GROUP BY month_key
+                ORDER BY month_key DESC
+                """,
+                (str(user_id),),
+            ).fetchall()
+            user_row = connection.execute(
+                "SELECT ai_balance FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+
+        deployments = self.list_web_deployments(str(user_id))
+        deployment_map = {
+            str(item["id"]): {
+                "id": str(item["id"]),
+                "key": str(item.get("config", {}).get("deployment_key") or ""),
+                "name": str(item.get("strategy_name") or ""),
+            }
+            for item in deployments
+        }
+        for item in data["list"]:
+            deployment = deployment_map.get(str(item.get("deployment_id") or ""), {})
+            item["deployment_key"] = deployment.get("key", "")
+            item["strategy_name"] = deployment.get("name", "")
+
+        model_items = self._with_ai_usage_display_names([
+            {"model_id": str(row["model_id"] or ""), "provider_id": str(row["provider_id"] or "")}
+            for row in model_rows
+        ])
+        normalized_page = max(1, int(page))
+        normalized_size = max(1, min(100, int(size)))
+        total = int(data["total"] or 0)
+        lifetime = lifetime_summary or {}
+        return {
+            **data,
+            "page": normalized_page,
+            "size": normalized_size,
+            "pages": max(1, (total + normalized_size - 1) // normalized_size),
+            "retention_days": retention_days,
+            "detail_start_at": retention_start,
+            "current_balance": decimal_string(user_row["ai_balance"] if user_row else 0),
+            "lifetime_summary": {
+                "calls": int(lifetime["calls"] or 0) if lifetime else 0,
+                "success_calls": int(lifetime["success_calls"] or 0) if lifetime else 0,
+                "input_tokens": int(lifetime["input_tokens"] or 0) if lifetime else 0,
+                "output_tokens": int(lifetime["output_tokens"] or 0) if lifetime else 0,
+                "official_tokens": int(lifetime["official_tokens"] or 0) if lifetime else 0,
+                "custom_tokens": int(lifetime["custom_tokens"] or 0) if lifetime else 0,
+                "charged_amount": decimal_string(lifetime["charged_amount"] if lifetime else 0),
+            },
+            "monthly_bills": [
+                {
+                    "month": str(row["month_key"] or ""),
+                    "calls": int(row["calls"] or 0),
+                    "success_calls": int(row["success_calls"] or 0),
+                    "input_tokens": int(row["input_tokens"] or 0),
+                    "output_tokens": int(row["output_tokens"] or 0),
+                    "official_tokens": int(row["official_tokens"] or 0),
+                    "custom_tokens": int(row["custom_tokens"] or 0),
+                    "charged_amount": decimal_string(row["charged_amount"]),
+                }
+                for row in monthly_rows
+            ],
+            "summary": {
+                "calls": int(summary["calls"] or 0),
+                "success_calls": int(summary["success_calls"] or 0),
+                "input_tokens": int(summary["input_tokens"] or 0),
+                "output_tokens": int(summary["output_tokens"] or 0),
+                "official_tokens": int(summary["official_tokens"] or 0),
+                "custom_tokens": int(summary["custom_tokens"] or 0),
+                "charged_amount": decimal_string(summary["charged_amount"]),
+            },
+            "filters": {
+                "models": [
+                    {
+                        "id": str(item.get("model_id") or ""),
+                        "name": str(item.get("model_name") or item.get("provider_name") or item.get("model_id") or ""),
+                    }
+                    for item in model_items
+                ],
+                "deployments": list(deployment_map.values()),
+            },
+        }
 
     def save_ai_usage_log(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now_iso()
@@ -2649,15 +4668,70 @@ class SqliteStore:
         input_tokens = int(payload.get("input_tokens") or 0)
         output_tokens = int(payload.get("output_tokens") or 0)
         total_tokens = int(payload.get("total_tokens") or (input_tokens + output_tokens))
+        billing_source = str(payload.get("billing_source") or "").strip().lower()
+        input_price = Decimal(decimal_string(payload.get("input_price_snapshot")))
+        output_price = Decimal(decimal_string(payload.get("output_price_snapshot")))
+        charged_amount = Decimal("0")
+        balance_after: Decimal | None = None
+        if billing_source == "official":
+            charged_amount = (
+                (Decimal(input_tokens) * input_price + Decimal(output_tokens) * output_price)
+                / Decimal("1000000")
+            ).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+        official_tokens = (
+            int(payload["official_tokens"])
+            if payload.get("official_tokens") is not None
+            else (total_tokens if billing_source != "custom" else 0)
+        )
+        custom_tokens = (
+            int(payload["custom_tokens"])
+            if payload.get("custom_tokens") is not None
+            else (total_tokens if billing_source == "custom" else 0)
+        )
         with self._connect() as connection:
+            raw_user_id = str(payload.get("user_id") or "").strip()
+            if billing_source == "official" and raw_user_id.isdigit():
+                lock_suffix = " FOR UPDATE" if isinstance(connection, MySqlConnection) else ""
+                user_row = connection.execute(
+                    f"SELECT id, ai_balance FROM users WHERE id = ?{lock_suffix}",
+                    (int(raw_user_id),),
+                ).fetchone()
+                if user_row is None:
+                    raise RuntimeError("user_not_found")
+                balance_after = Decimal(str(user_row["ai_balance"] or 0)) - charged_amount
+                if charged_amount > 0:
+                    connection.execute(
+                        "UPDATE users SET ai_balance = ?, updated_at = ? WHERE id = ?",
+                        (format(balance_after, "f"), now, int(raw_user_id)),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO ai_balance_ledger (
+                            id, user_id, entry_type, amount, balance_before, balance_after,
+                            operator_id, reference_id, remark, created_at
+                        ) VALUES (?, ?, 'ai_charge', ?, ?, ?, 'system', ?, ?, ?)
+                        """,
+                        (
+                            f"aibl_{uuid4().hex}",
+                            int(raw_user_id),
+                            format(-charged_amount, "f"),
+                            format(balance_after + charged_amount, "f"),
+                            format(balance_after, "f"),
+                            log_id,
+                            f"官方 AI 调用 · {str(payload.get('endpoint') or '')} · {str(payload.get('model_id') or '')}",
+                            now,
+                        ),
+                    )
             connection.execute(
                 """
                 INSERT INTO ai_usage_logs (
                     id, user_id, deployment_id, strategy_code, endpoint,
                     provider_id, model_id, account_login, account_server, symbol, timeframe,
                     input_tokens, output_tokens, total_tokens,
-                    official_tokens, custom_tokens, success, error_message, response_preview, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    official_tokens, custom_tokens, billing_source,
+                    input_price_snapshot, output_price_snapshot, charged_amount, balance_after,
+                    success, error_message, response_preview, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     log_id,
@@ -2674,11 +4748,53 @@ class SqliteStore:
                     input_tokens,
                     output_tokens,
                     total_tokens,
-                    int(payload.get("official_tokens") or total_tokens),
-                    int(payload.get("custom_tokens") or 0),
+                    official_tokens,
+                    custom_tokens,
+                    billing_source,
+                    format(input_price, "f"),
+                    format(output_price, "f"),
+                    format(charged_amount, "f"),
+                    None if balance_after is None else format(balance_after, "f"),
                     1 if payload.get("success", True) else 0,
                     str(payload.get("error_message") or ""),
                     str(payload.get("response_preview") or ""),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO ai_usage_monthly_summaries (
+                    user_id, month_key, model_id, provider_id, deployment_id,
+                    strategy_code, billing_source, calls, success_calls,
+                    input_tokens, output_tokens, official_tokens, custom_tokens,
+                    charged_amount, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, month_key, model_id, deployment_id, billing_source) DO UPDATE SET
+                    provider_id = excluded.provider_id,
+                    strategy_code = excluded.strategy_code,
+                    calls = ai_usage_monthly_summaries.calls + excluded.calls,
+                    success_calls = ai_usage_monthly_summaries.success_calls + excluded.success_calls,
+                    input_tokens = ai_usage_monthly_summaries.input_tokens + excluded.input_tokens,
+                    output_tokens = ai_usage_monthly_summaries.output_tokens + excluded.output_tokens,
+                    official_tokens = ai_usage_monthly_summaries.official_tokens + excluded.official_tokens,
+                    custom_tokens = ai_usage_monthly_summaries.custom_tokens + excluded.custom_tokens,
+                    charged_amount = ai_usage_monthly_summaries.charged_amount + excluded.charged_amount,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    raw_user_id,
+                    now[:7],
+                    str(payload.get("model_id") or ""),
+                    str(payload.get("provider_id") or ""),
+                    str(payload.get("deployment_id") or ""),
+                    str(payload.get("strategy_code") or ""),
+                    billing_source,
+                    1 if payload.get("success", True) else 0,
+                    input_tokens,
+                    output_tokens,
+                    official_tokens,
+                    custom_tokens,
+                    format(charged_amount, "f"),
                     now,
                 ),
             )
@@ -2899,6 +5015,8 @@ class SqliteStore:
         data["is_default"] = bool(data["is_default"])
         data["selectable_by_user"] = bool(data["selectable_by_user"])
         data["strict_json"] = bool(data.get("strict_json", 1))
+        data["input_price_per_million"] = decimal_string(data.get("input_price_per_million"))
+        data["output_price_per_million"] = decimal_string(data.get("output_price_per_million"))
         data["provider_id"] = str(data.get("id") or "")
         data["model_id"] = str(data.get("id") or "")
         data["provider_name"] = str(data.get("name") or "")
@@ -2933,9 +5051,56 @@ class SqliteStore:
         return data
 
     @staticmethod
+    def _balance_ledger_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        for field in ("amount", "balance_before", "balance_after"):
+            data[field] = decimal_string(data.get(field))
+        return data
+
+    @staticmethod
+    def _user_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        data["vip_level"] = int(data.get("vip_level") or 0)
+        data["agent_level"] = int(data.get("agent_level") or 0)
+        data["referrer_user_id"] = int(data.get("referrer_user_id") or 0) or None
+        data["referral_count"] = int(data.get("referral_count") or 0)
+        data["invite_code"] = str(data.get("invite_code") or "")
+        data["max_strategy_keys"] = int(data.get("max_strategy_keys") or 0)
+        data["strategy_count"] = int(data.get("strategy_count") or 0)
+        balance = Decimal(decimal_string(data.get("ai_balance")))
+        credit_limit = Decimal(decimal_string(data.get("credit_limit"), "10"))
+        low_balance_threshold = Decimal(decimal_string(data.get("low_balance_threshold"), "10"))
+        data["ai_balance"] = format(balance, "f")
+        data["credit_limit"] = format(credit_limit, "f")
+        data["available_balance"] = format(balance + credit_limit, "f")
+        data["low_balance_threshold"] = format(low_balance_threshold, "f")
+        data["balance_warning"] = balance < low_balance_threshold
+        data["credit_exhausted"] = balance <= -credit_limit
+        expires_at = str(data.get("vip_expires_at") or "")
+        vip_level = data["vip_level"]
+        vip_expired = vip_level > 0 and not expires_at
+        if expires_at:
+            try:
+                expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=LOCAL_TIMEZONE)
+                vip_expired = expires.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+            except ValueError:
+                vip_expired = False
+        data["vip_expired"] = vip_expired
+        data["vip_active"] = vip_level > 0 and bool(expires_at) and not vip_expired
+        data["email_verified"] = bool(data.get("email_verified_at"))
+        data["password_configured"] = bool(data.get("password_hash"))
+        data.pop("password_hash", None)
+        return data
+
+    @staticmethod
     def _usage_row(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
         data["success"] = bool(data["success"])
+        for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount"):
+            data[field] = decimal_string(data.get(field))
+        data["balance_after"] = None if data.get("balance_after") is None else decimal_string(data.get("balance_after"))
         return data
 
     @staticmethod
@@ -2946,6 +5111,27 @@ class SqliteStore:
             data["default_config"] = json.loads(data.pop("default_config_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             data["default_config"] = {}
+        return data
+
+    @staticmethod
+    def _ea_download_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        data["enabled"] = bool(data.get("enabled"))
+        data["file_size"] = int(data.get("file_size") or 0)
+        data["sort"] = int(data.get("sort") or 0)
+        return data
+
+    @staticmethod
+    def _guide_article_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        data["enabled"] = bool(data.get("enabled"))
+        data["sort"] = int(data.get("sort") or 0)
+        if "content_json" in data:
+            try:
+                content = json.loads(str(data.pop("content_json") or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                content = []
+            data["content"] = content if isinstance(content, list) else []
         return data
 
     @staticmethod
@@ -2988,7 +5174,18 @@ class MySQLStore(SqliteStore):
         )
 
     def initialize(self) -> None:
+        self._ensure_mysql_user_table()
+        self._ensure_mysql_auth_tables()
+        self._ensure_mysql_wallet_tables()
+        self._ensure_mysql_ea_download_table()
+        self._ensure_mysql_guide_article_table()
         required_tables = {
+            "users",
+            "email_verification_codes",
+            "user_sessions",
+            "system_settings",
+            "ai_balance_ledger",
+            "ai_usage_monthly_summaries",
             "deployments",
             "decisions",
             "heartbeats",
@@ -2999,6 +5196,8 @@ class MySQLStore(SqliteStore):
             "ai_user_quotas",
             "ai_usage_logs",
             "official_ai_strategies",
+            "ea_downloads",
+            "guide_articles",
             "deployment_activity_logs",
             "deployment_accounts",
         }
@@ -3015,9 +5214,236 @@ class MySQLStore(SqliteStore):
         if missing:
             raise RuntimeError(f"mysql_schema_missing_tables:{','.join(missing)}")
         self._ensure_mysql_decision_columns()
+        self._ensure_mysql_history_indexes()
         self._ensure_mysql_ai_usage_columns()
         self._ensure_mysql_official_strategy_columns()
         self._ensure_mysql_ai_template_endpoint_seed()
+        self._ensure_existing_users()
+        self._backfill_ai_usage_monthly_summaries()
+
+    def _ensure_mysql_ea_download_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ea_downloads (
+                    id VARCHAR(64) NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    description TEXT NOT NULL,
+                    oss_url VARCHAR(1000) NOT NULL,
+                    file_name VARCHAR(255) NOT NULL DEFAULT '',
+                    file_size BIGINT NOT NULL DEFAULT 0,
+                    enabled TINYINT(1) NOT NULL DEFAULT 1,
+                    sort INT NOT NULL DEFAULT 9999,
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    KEY idx_ea_downloads_enabled_sort (enabled, sort)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+    def _ensure_mysql_guide_article_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guide_articles (
+                    id VARCHAR(64) NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    summary VARCHAR(1000) NOT NULL DEFAULT '',
+                    content_json LONGTEXT NOT NULL,
+                    enabled TINYINT(1) NOT NULL DEFAULT 1,
+                    sort INT NOT NULL DEFAULT 9999,
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    KEY idx_guide_articles_enabled_sort (enabled, sort)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+    def _ensure_mysql_user_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    email VARCHAR(255) NULL,
+                    password_hash VARCHAR(255) NULL,
+                    nickname VARCHAR(100) NOT NULL DEFAULT '',
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending_activation',
+                    vip_level INT NOT NULL DEFAULT 0,
+                    vip_expires_at VARCHAR(40) NOT NULL DEFAULT '',
+                    max_strategy_keys INT NOT NULL DEFAULT 10,
+                    agent_level INT NOT NULL DEFAULT 0,
+                    invite_code VARCHAR(32) NULL,
+                    referrer_user_id BIGINT NULL,
+                    referred_at VARCHAR(40) NOT NULL DEFAULT '',
+                    ai_balance DECIMAL(18,6) NOT NULL DEFAULT 0.000000,
+                    email_verified_at VARCHAR(40) NOT NULL DEFAULT '',
+                    last_login_at VARCHAR(40) NOT NULL DEFAULT '',
+                    remark TEXT NULL,
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_users_email (email),
+                    UNIQUE KEY uk_users_invite_code (invite_code),
+                    KEY idx_users_status_vip (status, vip_level),
+                    KEY idx_users_referrer (referrer_user_id, created_at),
+                    KEY idx_users_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            rows = connection.execute(
+                """
+                SELECT COLUMN_NAME, DATA_TYPE, EXTRA
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'users'
+                """
+            ).fetchall()
+            columns = {str(row["COLUMN_NAME"]) for row in rows}
+            id_row = next((row for row in rows if str(row["COLUMN_NAME"]) == "id"), None)
+            id_type = str(id_row.get("DATA_TYPE") or "") if id_row else ""
+            id_extra = str(id_row.get("EXTRA") or "") if id_row else ""
+            if id_type.lower() != "bigint" or "auto_increment" not in id_extra.lower():
+                connection.execute("DELETE FROM users WHERE id NOT REGEXP '^[0-9]+$'")
+                connection.execute("ALTER TABLE users MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT")
+            migrations = {
+                "vip_expires_at": "ALTER TABLE users ADD COLUMN vip_expires_at VARCHAR(40) NOT NULL DEFAULT '' AFTER vip_level",
+                "max_strategy_keys": "ALTER TABLE users ADD COLUMN max_strategy_keys INT NOT NULL DEFAULT 10 AFTER vip_expires_at",
+                "ai_balance": "ALTER TABLE users ADD COLUMN ai_balance DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER max_strategy_keys",
+                "agent_level": "ALTER TABLE users ADD COLUMN agent_level INT NOT NULL DEFAULT 0 AFTER max_strategy_keys",
+                "invite_code": "ALTER TABLE users ADD COLUMN invite_code VARCHAR(32) NULL AFTER agent_level",
+                "referrer_user_id": "ALTER TABLE users ADD COLUMN referrer_user_id BIGINT NULL AFTER invite_code",
+                "referred_at": "ALTER TABLE users ADD COLUMN referred_at VARCHAR(40) NOT NULL DEFAULT '' AFTER referrer_user_id",
+            }
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
+            index_rows = connection.execute("SHOW INDEX FROM users").fetchall()
+            indexes = {str(row["Key_name"]) for row in index_rows}
+            if "uk_users_invite_code" not in indexes:
+                connection.execute("ALTER TABLE users ADD UNIQUE KEY uk_users_invite_code (invite_code)")
+            if "idx_users_referrer" not in indexes:
+                connection.execute("ALTER TABLE users ADD KEY idx_users_referrer (referrer_user_id, created_at)")
+
+    def _ensure_mysql_wallet_tables(self) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    setting_key VARCHAR(64) NOT NULL,
+                    setting_value VARCHAR(255) NOT NULL DEFAULT '',
+                    remark VARCHAR(255) NOT NULL DEFAULT '',
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (setting_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_balance_ledger (
+                    id VARCHAR(64) NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    entry_type VARCHAR(32) NOT NULL,
+                    amount DECIMAL(18,6) NOT NULL,
+                    balance_before DECIMAL(18,6) NOT NULL,
+                    balance_after DECIMAL(18,6) NOT NULL,
+                    operator_id VARCHAR(64) NOT NULL DEFAULT '',
+                    reference_id VARCHAR(128) NULL,
+                    remark VARCHAR(1000) NOT NULL DEFAULT '',
+                    created_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_ai_balance_ledger_reference (reference_id),
+                    KEY idx_ai_balance_ledger_user_time (user_id, created_at),
+                    KEY idx_ai_balance_ledger_type_time (entry_type, created_at),
+                    CONSTRAINT fk_ai_balance_ledger_user FOREIGN KEY (user_id) REFERENCES users (id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_usage_monthly_summaries (
+                    user_id VARCHAR(64) NOT NULL,
+                    month_key CHAR(7) NOT NULL,
+                    model_id VARCHAR(128) NOT NULL DEFAULT '',
+                    provider_id VARCHAR(128) NOT NULL DEFAULT '',
+                    deployment_id VARCHAR(128) NOT NULL DEFAULT '',
+                    strategy_code VARCHAR(128) NOT NULL DEFAULT '',
+                    billing_source VARCHAR(16) NOT NULL DEFAULT '',
+                    calls BIGINT NOT NULL DEFAULT 0,
+                    success_calls BIGINT NOT NULL DEFAULT 0,
+                    input_tokens BIGINT NOT NULL DEFAULT 0,
+                    output_tokens BIGINT NOT NULL DEFAULT 0,
+                    official_tokens BIGINT NOT NULL DEFAULT 0,
+                    custom_tokens BIGINT NOT NULL DEFAULT 0,
+                    charged_amount DECIMAL(24,6) NOT NULL DEFAULT 0.000000,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (user_id, month_key, model_id, deployment_id, billing_source),
+                    KEY idx_ai_usage_monthly_user_month (user_id, month_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("ai_credit_limit", "10.000000", "官方 AI 默认信用额度（元）", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("ai_low_balance_threshold", "10.000000", "客户端低余额提醒阈值（元）", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("ai_usage_detail_retention_days", "60", "AI 调用明细保存天数", now),
+            )
+
+    def _ensure_mysql_auth_tables(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS email_verification_codes (
+                    id VARCHAR(64) NOT NULL,
+                    email VARCHAR(255) NOT NULL,
+                    purpose VARCHAR(32) NOT NULL,
+                    code_hash VARCHAR(128) NOT NULL,
+                    expires_at VARCHAR(40) NOT NULL,
+                    consumed_at VARCHAR(40) NOT NULL DEFAULT '',
+                    attempt_count INT NOT NULL DEFAULT 0,
+                    created_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    KEY idx_verification_email_purpose (email, purpose, created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id VARCHAR(64) NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    token_hash VARCHAR(128) NOT NULL,
+                    expires_at VARCHAR(40) NOT NULL,
+                    revoked_at VARCHAR(40) NOT NULL DEFAULT '',
+                    created_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_user_sessions_token_hash (token_hash),
+                    KEY idx_user_sessions_user_id (user_id, created_at),
+                    CONSTRAINT fk_user_sessions_user FOREIGN KEY (user_id) REFERENCES users(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
 
     def _ensure_mysql_decision_columns(self) -> None:
         migrations = {
@@ -3039,7 +5465,6 @@ class MySQLStore(SqliteStore):
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
-
     def _ensure_mysql_official_strategy_columns(self) -> None:
         migrations = {
             "open_ai_endpoint_id": "ALTER TABLE official_ai_strategies ADD COLUMN open_ai_endpoint_id VARCHAR(64) NOT NULL DEFAULT '' AFTER position_model_id",
@@ -3059,6 +5484,24 @@ class MySQLStore(SqliteStore):
                 if column not in columns:
                     connection.execute(statement)
 
+    def _ensure_mysql_history_indexes(self) -> None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT INDEX_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'mt5_history_deals'
+                """
+            ).fetchall()
+            indexes = {str(row["INDEX_NAME"]) for row in rows}
+            history_indexes = {
+                "idx_mt5_history_deployment_close": "CREATE INDEX idx_mt5_history_deployment_close ON mt5_history_deals(deployment_id, close_time)",
+                "idx_mt5_history_deployment_symbol_close": "CREATE INDEX idx_mt5_history_deployment_symbol_close ON mt5_history_deals(deployment_id, symbol, close_time)",
+            }
+            for index_name, statement in history_indexes.items():
+                if index_name not in indexes:
+                    connection.execute(statement)
+
     def _ensure_mysql_ai_usage_columns(self) -> None:
         migrations = {
             "account_login": "ALTER TABLE ai_usage_logs ADD COLUMN account_login VARCHAR(64) NOT NULL DEFAULT '' AFTER model_id",
@@ -3066,6 +5509,11 @@ class MySQLStore(SqliteStore):
             "symbol": "ALTER TABLE ai_usage_logs ADD COLUMN symbol VARCHAR(32) NOT NULL DEFAULT '' AFTER account_server",
             "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe VARCHAR(16) NOT NULL DEFAULT '' AFTER symbol",
             "response_preview": "ALTER TABLE ai_usage_logs ADD COLUMN response_preview TEXT NULL AFTER error_message",
+            "billing_source": "ALTER TABLE ai_usage_logs ADD COLUMN billing_source VARCHAR(16) NOT NULL DEFAULT '' AFTER custom_tokens",
+            "input_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN input_price_snapshot DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER billing_source",
+            "output_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN output_price_snapshot DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER input_price_snapshot",
+            "charged_amount": "ALTER TABLE ai_usage_logs ADD COLUMN charged_amount DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER output_price_snapshot",
+            "balance_after": "ALTER TABLE ai_usage_logs ADD COLUMN balance_after DECIMAL(18,6) NULL AFTER charged_amount",
         }
         with self._connect() as connection:
             rows = connection.execute(
@@ -3079,6 +5527,22 @@ class MySQLStore(SqliteStore):
             columns = {str(row["COLUMN_NAME"]) for row in rows}
             for column, statement in migrations.items():
                 if column not in columns:
+                    connection.execute(statement)
+            index_rows = connection.execute(
+                """
+                SELECT DISTINCT INDEX_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ai_usage_logs'
+                """
+            ).fetchall()
+            indexes = {str(row["INDEX_NAME"]) for row in index_rows}
+            usage_indexes = {
+                "idx_ai_usage_user_time": "CREATE INDEX idx_ai_usage_user_time ON ai_usage_logs(user_id, created_at)",
+                "idx_ai_usage_user_model_time": "CREATE INDEX idx_ai_usage_user_model_time ON ai_usage_logs(user_id, model_id, created_at)",
+                "idx_ai_usage_user_deployment_time": "CREATE INDEX idx_ai_usage_user_deployment_time ON ai_usage_logs(user_id, deployment_id, created_at)",
+            }
+            for index_name, statement in usage_indexes.items():
+                if index_name not in indexes:
                     connection.execute(statement)
 
     def _ensure_mysql_ai_template_endpoint_seed(self) -> None:
@@ -3096,6 +5560,8 @@ class MySQLStore(SqliteStore):
             "input_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN input_token_rate DOUBLE NOT NULL DEFAULT 1",
             "output_token_rate": "ALTER TABLE ai_endpoints ADD COLUMN output_token_rate DOUBLE NOT NULL DEFAULT 1",
             "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier DOUBLE NOT NULL DEFAULT 1",
+            "input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN input_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER billing_multiplier",
+            "output_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN output_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER input_price_per_million",
             "is_default": "ALTER TABLE ai_endpoints ADD COLUMN is_default TINYINT NOT NULL DEFAULT 0",
             "enabled": "ALTER TABLE ai_endpoints ADD COLUMN enabled TINYINT NOT NULL DEFAULT 1",
             "selectable_by_user": "ALTER TABLE ai_endpoints ADD COLUMN selectable_by_user TINYINT NOT NULL DEFAULT 0",
