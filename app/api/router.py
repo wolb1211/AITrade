@@ -773,6 +773,22 @@ def create_admin_ai_router(
             "saved",
         )
 
+    @router.post("/cache/settings")
+    def cache_settings() -> dict[str, object]:
+        return ok(store.get_ai_cache_settings())
+
+    @router.post("/cache/settings/save")
+    def cache_settings_save(payload: dict[str, object]) -> dict[str, object]:
+        raw_enabled = payload.get("enabled", True)
+        enabled = raw_enabled if isinstance(raw_enabled, bool) else str(raw_enabled).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            ttl_seconds = int(payload.get("ttl_seconds") or 120)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="cache_ttl_invalid") from None
+        if ttl_seconds < 10 or ttl_seconds > 3600:
+            raise HTTPException(status_code=400, detail="cache_ttl_invalid")
+        return ok(store.save_ai_cache_settings(enabled=enabled, ttl_seconds=ttl_seconds), "saved")
+
     @router.post("/wallet/adjust")
     def wallet_adjust(payload: dict[str, object]) -> dict[str, object]:
         raw_user_id = str(payload.get("user_id") or "").strip()
@@ -1024,6 +1040,7 @@ def create_admin_ai_router(
             deployment_key=str(payload.get("deployment_key") or "").strip(),
             endpoint=str(payload.get("endpoint") or "").strip(),
             billing_source=str(payload.get("billing_source") or "").strip(),
+            response_source=str(payload.get("response_source") or "").strip(),
             success=success,
             start_at=str(payload.get("start_at") or "").strip(),
             end_at=str(payload.get("end_at") or "").strip(),

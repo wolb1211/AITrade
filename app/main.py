@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 import json
 import logging
 from typing import AsyncIterator
@@ -63,12 +64,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         store.initialize()
         store.cleanup_expired_ai_usage_details()
+        store.cleanup_expired_ai_response_cache()
         if resolved.environment != "production":
             store.ensure_demo_deployment(resolved.demo_deployment_key)
 
         async def cleanup_usage_details_daily() -> None:
             while True:
-                await asyncio.sleep(24 * 60 * 60)
+                await asyncio.sleep(60 * 60)
+                await asyncio.to_thread(store.cleanup_expired_ai_response_cache)
+                if datetime.now(timezone.utc).hour != 3:
+                    continue
                 await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
 
         cleanup_task = asyncio.create_task(cleanup_usage_details_daily())

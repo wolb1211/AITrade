@@ -481,6 +481,9 @@ class SqliteStore:
                     charged_amount NUMERIC NOT NULL DEFAULT 0,
                     balance_after NUMERIC,
                     success INTEGER NOT NULL DEFAULT 1,
+                    provider_called INTEGER NOT NULL DEFAULT 1,
+                    response_source TEXT NOT NULL DEFAULT 'provider',
+                    cache_id TEXT,
                     error_message TEXT NOT NULL DEFAULT '',
                     response_preview TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
@@ -503,8 +506,12 @@ class SqliteStore:
                     billing_source TEXT NOT NULL DEFAULT '',
                     calls INTEGER NOT NULL DEFAULT 0,
                     success_calls INTEGER NOT NULL DEFAULT 0,
+                    provider_calls INTEGER NOT NULL DEFAULT 0,
+                    cache_hits INTEGER NOT NULL DEFAULT 0,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                    provider_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    provider_output_tokens INTEGER NOT NULL DEFAULT 0,
                     official_tokens INTEGER NOT NULL DEFAULT 0,
                     custom_tokens INTEGER NOT NULL DEFAULT 0,
                     charged_amount NUMERIC NOT NULL DEFAULT 0,
@@ -514,6 +521,27 @@ class SqliteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_ai_usage_monthly_user_month
                     ON ai_usage_monthly_summaries(user_id, month_key);
+
+                CREATE TABLE IF NOT EXISTS ai_response_cache (
+                    id TEXT PRIMARY KEY,
+                    cache_key TEXT NOT NULL UNIQUE,
+                    endpoint TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    model_id TEXT NOT NULL DEFAULT '',
+                    response_json TEXT NOT NULL,
+                    response_preview TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT NOT NULL,
+                    last_hit_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ai_response_cache_expires
+                    ON ai_response_cache(expires_at);
 
                 CREATE TABLE IF NOT EXISTS official_ai_strategies (
                     id TEXT PRIMARY KEY,
@@ -594,12 +622,14 @@ class SqliteStore:
             self._ensure_mt5_history_columns(connection)
             self._ensure_decision_columns(connection)
             self._ensure_ai_usage_columns(connection)
+            self._ensure_ai_usage_monthly_columns(connection)
             self._ensure_ai_model_columns(connection)
             self._ensure_ai_endpoint_tables(connection)
             self._ensure_official_strategy_columns(connection)
             self._ensure_official_strategy_seed(connection)
             self._ensure_user_columns(connection)
         self._backfill_ai_usage_monthly_summaries()
+        self._backfill_ai_cache_stats()
         self._ensure_existing_users()
 
     def _migrate_sqlite_user_id(self, connection: sqlite3.Connection) -> None:
@@ -681,6 +711,14 @@ class SqliteStore:
         connection.execute(
             "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
             ("ai_usage_detail_retention_days", "60", "AI 调用明细保存天数", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("ai_cache_enabled", "1", "AI 相同请求缓存开关", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("ai_cache_ttl_seconds", "120", "AI 相同请求缓存秒数", now),
         )
 
     def _backfill_ai_usage_monthly_summaries(self) -> None:
@@ -792,10 +830,57 @@ class SqliteStore:
             "output_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN output_price_snapshot NUMERIC NOT NULL DEFAULT 0",
             "charged_amount": "ALTER TABLE ai_usage_logs ADD COLUMN charged_amount NUMERIC NOT NULL DEFAULT 0",
             "balance_after": "ALTER TABLE ai_usage_logs ADD COLUMN balance_after NUMERIC",
+            "provider_called": "ALTER TABLE ai_usage_logs ADD COLUMN provider_called INTEGER NOT NULL DEFAULT 1",
+            "response_source": "ALTER TABLE ai_usage_logs ADD COLUMN response_source TEXT NOT NULL DEFAULT 'provider'",
+            "cache_id": "ALTER TABLE ai_usage_logs ADD COLUMN cache_id TEXT",
         }
         for column, statement in migrations.items():
             if column not in columns:
                 connection.execute(statement)
+
+    def _ensure_ai_usage_monthly_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(ai_usage_monthly_summaries)").fetchall()
+        }
+        migrations = {
+            "provider_calls": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_calls INTEGER NOT NULL DEFAULT 0",
+            "cache_hits": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN cache_hits INTEGER NOT NULL DEFAULT 0",
+            "provider_input_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "provider_output_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_output_tokens INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+
+    def _backfill_ai_cache_stats(self) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            marker = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("ai_cache_stats_backfilled",),
+            ).fetchone()
+            if marker is not None:
+                return
+            connection.execute(
+                """
+                UPDATE ai_usage_monthly_summaries
+                SET provider_calls = calls,
+                    cache_hits = 0,
+                    provider_input_tokens = input_tokens,
+                    provider_output_tokens = output_tokens
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                ("ai_cache_stats_backfilled", "1", "AI 缓存统计历史数据已初始化", now),
+            )
 
     def _ensure_ai_model_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -3365,6 +3450,147 @@ class SqliteStore:
         except (TypeError, ValueError):
             return 60
 
+    def get_ai_cache_settings(self) -> dict[str, Any]:
+        values: dict[str, Any] = {"enabled": True, "ttl_seconds": 120}
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT setting_key, setting_value
+                FROM system_settings
+                WHERE setting_key IN ('ai_cache_enabled', 'ai_cache_ttl_seconds')
+                """
+            ).fetchall()
+        for row in rows:
+            if row["setting_key"] == "ai_cache_enabled":
+                values["enabled"] = str(row["setting_value"] or "1").strip().lower() not in {"0", "false", "no", "off"}
+            elif row["setting_key"] == "ai_cache_ttl_seconds":
+                try:
+                    values["ttl_seconds"] = max(10, min(3600, int(str(row["setting_value"]))))
+                except (TypeError, ValueError):
+                    values["ttl_seconds"] = 120
+        return values
+
+    def save_ai_cache_settings(self, *, enabled: bool, ttl_seconds: int) -> dict[str, Any]:
+        now = utc_now_iso()
+        normalized_ttl = max(10, min(3600, int(ttl_seconds)))
+        with self._connect() as connection:
+            for key, value, remark in (
+                ("ai_cache_enabled", "1" if enabled else "0", "AI 相同请求缓存开关"),
+                ("ai_cache_ttl_seconds", str(normalized_ttl), "AI 相同请求缓存秒数"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(setting_key) DO UPDATE SET
+                        setting_value = excluded.setting_value,
+                        remark = excluded.remark,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, value, remark, now),
+                )
+        return {"enabled": bool(enabled), "ttl_seconds": normalized_ttl}
+
+    def get_ai_response_cache(self, cache_key: str) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM ai_response_cache
+                WHERE cache_key = ? AND expires_at > ?
+                """,
+                (cache_key, now),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE ai_response_cache
+                SET hit_count = hit_count + 1, last_hit_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, row["id"]),
+            )
+        data = dict(row)
+        try:
+            content = json.loads(str(data.pop("response_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(content, dict):
+            return None
+        data["content"] = content
+        data["hit_count"] = int(data.get("hit_count") or 0) + 1
+        return data
+
+    def save_ai_response_cache(self, payload: dict[str, Any], *, ttl_seconds: int) -> dict[str, Any]:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(seconds=max(10, min(3600, int(ttl_seconds))))).isoformat()
+        cache_id = str(payload.get("id") or f"aicache_{uuid4().hex}")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ai_response_cache (
+                    id, cache_key, endpoint, provider_id, model_id,
+                    response_json, response_preview, input_tokens, output_tokens,
+                    total_tokens, hit_count, expires_at, last_hit_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    endpoint = excluded.endpoint,
+                    provider_id = excluded.provider_id,
+                    model_id = excluded.model_id,
+                    response_json = excluded.response_json,
+                    response_preview = excluded.response_preview,
+                    input_tokens = excluded.input_tokens,
+                    output_tokens = excluded.output_tokens,
+                    total_tokens = excluded.total_tokens,
+                    hit_count = 0,
+                    expires_at = excluded.expires_at,
+                    last_hit_at = '',
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cache_id,
+                    str(payload.get("cache_key") or ""),
+                    str(payload.get("endpoint") or ""),
+                    str(payload.get("provider_id") or ""),
+                    str(payload.get("model_id") or ""),
+                    json.dumps(payload.get("content") or {}, ensure_ascii=False, separators=(",", ":")),
+                    str(payload.get("response_preview") or ""),
+                    int(payload.get("input_tokens") or 0),
+                    int(payload.get("output_tokens") or 0),
+                    int(payload.get("total_tokens") or 0),
+                    expires_at,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM ai_response_cache WHERE cache_key = ?",
+                (str(payload.get("cache_key") or ""),),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def cleanup_expired_ai_response_cache(self, *, batch_size: int = 5000, max_batches: int = 20) -> int:
+        cutoff = utc_now_iso()
+        deleted = 0
+        normalized_batch = max(1, min(10000, int(batch_size)))
+        for _ in range(max_batches):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT id FROM ai_response_cache WHERE expires_at <= ? ORDER BY expires_at LIMIT ?",
+                    (cutoff, normalized_batch),
+                ).fetchall()
+                ids = [str(row["id"]) for row in rows]
+                if not ids:
+                    break
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(f"DELETE FROM ai_response_cache WHERE id IN ({placeholders})", ids)
+                deleted += len(ids)
+            if len(ids) < normalized_batch:
+                break
+        return deleted
+
     def cleanup_expired_ai_usage_details(self, *, batch_size: int = 5000, max_batches: int = 100) -> int:
         retention_days = self.get_ai_usage_detail_retention_days()
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
@@ -3674,6 +3900,8 @@ class SqliteStore:
 
         usage = self._with_ai_usage_display_names([self._usage_row(row) for row in usage_rows])
         for item in usage:
+            for internal_field in ("provider_called", "response_source", "cache_id"):
+                item.pop(internal_field, None)
             for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount", "balance_after"):
                 item[field] = None if item.get(field) is None else decimal_string(item.get(field))
 
@@ -4401,6 +4629,7 @@ class SqliteStore:
         deployment_key: str = "",
         endpoint: str = "",
         billing_source: str = "",
+        response_source: str = "",
         success: bool | None = None,
         start_at: str = "",
         end_at: str = "",
@@ -4429,6 +4658,9 @@ class SqliteStore:
         if billing_source:
             clauses.append("l.billing_source = ?")
             params.append(billing_source)
+        if response_source:
+            clauses.append("l.response_source = ?")
+            params.append(response_source)
         if success is not None:
             clauses.append("l.success = ?")
             params.append(1 if success else 0)
@@ -4475,6 +4707,10 @@ class SqliteStore:
                        COALESCE(SUM(CASE WHEN l.success = 1 THEN 1 ELSE 0 END), 0) success_calls,
                        COALESCE(SUM(l.input_tokens), 0) input_tokens,
                        COALESCE(SUM(l.output_tokens), 0) output_tokens,
+                       COALESCE(SUM(CASE WHEN l.provider_called = 1 THEN 1 ELSE 0 END), 0) provider_calls,
+                       COALESCE(SUM(CASE WHEN l.response_source = 'cache' THEN 1 ELSE 0 END), 0) cache_hits,
+                       COALESCE(SUM(CASE WHEN l.provider_called = 1 THEN l.input_tokens ELSE 0 END), 0) provider_input_tokens,
+                       COALESCE(SUM(CASE WHEN l.provider_called = 1 THEN l.output_tokens ELSE 0 END), 0) provider_output_tokens,
                        COALESCE(SUM(l.charged_amount), 0) charged_amount
                 FROM ai_usage_logs l
                 LEFT JOIN deployments d ON d.id = l.deployment_id
@@ -4488,8 +4724,14 @@ class SqliteStore:
             "success_calls": int(summary["success_calls"] or 0),
             "input_tokens": int(summary["input_tokens"] or 0),
             "output_tokens": int(summary["output_tokens"] or 0),
+            "provider_calls": int(summary["provider_calls"] or 0),
+            "cache_hits": int(summary["cache_hits"] or 0),
+            "provider_input_tokens": int(summary["provider_input_tokens"] or 0),
+            "provider_output_tokens": int(summary["provider_output_tokens"] or 0),
             "charged_amount": decimal_string(summary["charged_amount"] or 0),
         }
+        calls = data["summary"]["calls"]
+        data["summary"]["cache_hit_rate"] = round((data["summary"]["cache_hits"] / calls) * 100, 2) if calls else 0
         return data
 
     def list_user_ai_usage(
@@ -4528,6 +4770,9 @@ class SqliteStore:
             mapper=self._usage_row,
         )
         data["list"] = self._with_ai_usage_display_names(data["list"])
+        for item in data["list"]:
+            for internal_field in ("provider_called", "response_source", "cache_id"):
+                item.pop(internal_field, None)
 
         with self._connect() as connection:
             summary = connection.execute(
@@ -4688,6 +4933,15 @@ class SqliteStore:
             if payload.get("custom_tokens") is not None
             else (total_tokens if billing_source == "custom" else 0)
         )
+        provider_called = bool(payload.get("provider_called", True))
+        response_source = str(
+            payload.get("response_source") or ("provider" if provider_called else "cache")
+        ).strip().lower()
+        if response_source not in {"provider", "cache", "fallback"}:
+            response_source = "provider" if provider_called else "cache"
+        cache_id = str(payload.get("cache_id") or "").strip()
+        provider_input_tokens = input_tokens if provider_called else 0
+        provider_output_tokens = output_tokens if provider_called else 0
         with self._connect() as connection:
             raw_user_id = str(payload.get("user_id") or "").strip()
             if billing_source == "official" and raw_user_id.isdigit():
@@ -4730,8 +4984,9 @@ class SqliteStore:
                     input_tokens, output_tokens, total_tokens,
                     official_tokens, custom_tokens, billing_source,
                     input_price_snapshot, output_price_snapshot, charged_amount, balance_after,
-                    success, error_message, response_preview, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    success, provider_called, response_source, cache_id,
+                    error_message, response_preview, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     log_id,
@@ -4756,6 +5011,9 @@ class SqliteStore:
                     format(charged_amount, "f"),
                     None if balance_after is None else format(balance_after, "f"),
                     1 if payload.get("success", True) else 0,
+                    1 if provider_called else 0,
+                    response_source,
+                    cache_id or None,
                     str(payload.get("error_message") or ""),
                     str(payload.get("response_preview") or ""),
                     now,
@@ -4766,16 +5024,22 @@ class SqliteStore:
                 INSERT INTO ai_usage_monthly_summaries (
                     user_id, month_key, model_id, provider_id, deployment_id,
                     strategy_code, billing_source, calls, success_calls,
-                    input_tokens, output_tokens, official_tokens, custom_tokens,
+                    provider_calls, cache_hits, input_tokens, output_tokens,
+                    provider_input_tokens, provider_output_tokens,
+                    official_tokens, custom_tokens,
                     charged_amount, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, month_key, model_id, deployment_id, billing_source) DO UPDATE SET
                     provider_id = excluded.provider_id,
                     strategy_code = excluded.strategy_code,
                     calls = ai_usage_monthly_summaries.calls + excluded.calls,
                     success_calls = ai_usage_monthly_summaries.success_calls + excluded.success_calls,
+                    provider_calls = ai_usage_monthly_summaries.provider_calls + excluded.provider_calls,
+                    cache_hits = ai_usage_monthly_summaries.cache_hits + excluded.cache_hits,
                     input_tokens = ai_usage_monthly_summaries.input_tokens + excluded.input_tokens,
                     output_tokens = ai_usage_monthly_summaries.output_tokens + excluded.output_tokens,
+                    provider_input_tokens = ai_usage_monthly_summaries.provider_input_tokens + excluded.provider_input_tokens,
+                    provider_output_tokens = ai_usage_monthly_summaries.provider_output_tokens + excluded.provider_output_tokens,
                     official_tokens = ai_usage_monthly_summaries.official_tokens + excluded.official_tokens,
                     custom_tokens = ai_usage_monthly_summaries.custom_tokens + excluded.custom_tokens,
                     charged_amount = ai_usage_monthly_summaries.charged_amount + excluded.charged_amount,
@@ -4790,8 +5054,12 @@ class SqliteStore:
                     str(payload.get("strategy_code") or ""),
                     billing_source,
                     1 if payload.get("success", True) else 0,
+                    1 if provider_called else 0,
+                    1 if response_source == "cache" else 0,
                     input_tokens,
                     output_tokens,
+                    provider_input_tokens,
+                    provider_output_tokens,
                     official_tokens,
                     custom_tokens,
                     format(charged_amount, "f"),
@@ -5098,6 +5366,7 @@ class SqliteStore:
     def _usage_row(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
         data["success"] = bool(data["success"])
+        data["provider_called"] = bool(data.get("provider_called", True))
         for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount"):
             data[field] = decimal_string(data.get(field))
         data["balance_after"] = None if data.get("balance_after") is None else decimal_string(data.get("balance_after"))
@@ -5177,6 +5446,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_user_table()
         self._ensure_mysql_auth_tables()
         self._ensure_mysql_wallet_tables()
+        self._ensure_mysql_ai_cache_table()
         self._ensure_mysql_ea_download_table()
         self._ensure_mysql_guide_article_table()
         required_tables = {
@@ -5186,6 +5456,7 @@ class MySQLStore(SqliteStore):
             "system_settings",
             "ai_balance_ledger",
             "ai_usage_monthly_summaries",
+            "ai_response_cache",
             "deployments",
             "decisions",
             "heartbeats",
@@ -5220,6 +5491,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_ai_template_endpoint_seed()
         self._ensure_existing_users()
         self._backfill_ai_usage_monthly_summaries()
+        self._backfill_ai_cache_stats()
 
     def _ensure_mysql_ea_download_table(self) -> None:
         with self._connect() as connection:
@@ -5374,8 +5646,12 @@ class MySQLStore(SqliteStore):
                     billing_source VARCHAR(16) NOT NULL DEFAULT '',
                     calls BIGINT NOT NULL DEFAULT 0,
                     success_calls BIGINT NOT NULL DEFAULT 0,
+                    provider_calls BIGINT NOT NULL DEFAULT 0,
+                    cache_hits BIGINT NOT NULL DEFAULT 0,
                     input_tokens BIGINT NOT NULL DEFAULT 0,
                     output_tokens BIGINT NOT NULL DEFAULT 0,
+                    provider_input_tokens BIGINT NOT NULL DEFAULT 0,
+                    provider_output_tokens BIGINT NOT NULL DEFAULT 0,
                     official_tokens BIGINT NOT NULL DEFAULT 0,
                     custom_tokens BIGINT NOT NULL DEFAULT 0,
                     charged_amount DECIMAL(24,6) NOT NULL DEFAULT 0.000000,
@@ -5408,6 +5684,49 @@ class MySQLStore(SqliteStore):
                 ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
                 """,
                 ("ai_usage_detail_retention_days", "60", "AI 调用明细保存天数", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("ai_cache_enabled", "1", "AI 相同请求缓存开关", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("ai_cache_ttl_seconds", "120", "AI 相同请求缓存秒数", now),
+            )
+
+    def _ensure_mysql_ai_cache_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_response_cache (
+                    id VARCHAR(64) NOT NULL,
+                    cache_key CHAR(64) NOT NULL,
+                    endpoint VARCHAR(16) NOT NULL DEFAULT '',
+                    provider_id VARCHAR(128) NOT NULL DEFAULT '',
+                    model_id VARCHAR(128) NOT NULL DEFAULT '',
+                    response_json LONGTEXT NOT NULL,
+                    response_preview TEXT NULL,
+                    input_tokens BIGINT NOT NULL DEFAULT 0,
+                    output_tokens BIGINT NOT NULL DEFAULT 0,
+                    total_tokens BIGINT NOT NULL DEFAULT 0,
+                    hit_count BIGINT NOT NULL DEFAULT 0,
+                    expires_at VARCHAR(40) NOT NULL,
+                    last_hit_at VARCHAR(40) NOT NULL DEFAULT '',
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_ai_response_cache_key (cache_key),
+                    KEY idx_ai_response_cache_expires (expires_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
             )
 
     def _ensure_mysql_auth_tables(self) -> None:
@@ -5514,6 +5833,9 @@ class MySQLStore(SqliteStore):
             "output_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN output_price_snapshot DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER input_price_snapshot",
             "charged_amount": "ALTER TABLE ai_usage_logs ADD COLUMN charged_amount DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER output_price_snapshot",
             "balance_after": "ALTER TABLE ai_usage_logs ADD COLUMN balance_after DECIMAL(18,6) NULL AFTER charged_amount",
+            "provider_called": "ALTER TABLE ai_usage_logs ADD COLUMN provider_called TINYINT(1) NOT NULL DEFAULT 1 AFTER success",
+            "response_source": "ALTER TABLE ai_usage_logs ADD COLUMN response_source VARCHAR(16) NOT NULL DEFAULT 'provider' AFTER provider_called",
+            "cache_id": "ALTER TABLE ai_usage_logs ADD COLUMN cache_id VARCHAR(64) NULL AFTER response_source",
         }
         with self._connect() as connection:
             rows = connection.execute(
@@ -5543,6 +5865,24 @@ class MySQLStore(SqliteStore):
             }
             for index_name, statement in usage_indexes.items():
                 if index_name not in indexes:
+                    connection.execute(statement)
+            monthly_rows = connection.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'ai_usage_monthly_summaries'
+                """,
+            ).fetchall()
+            monthly_columns = {str(row["COLUMN_NAME"]) for row in monthly_rows}
+            monthly_migrations = {
+                "provider_calls": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_calls BIGINT NOT NULL DEFAULT 0 AFTER success_calls",
+                "cache_hits": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN cache_hits BIGINT NOT NULL DEFAULT 0 AFTER provider_calls",
+                "provider_input_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_input_tokens BIGINT NOT NULL DEFAULT 0 AFTER output_tokens",
+                "provider_output_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_output_tokens BIGINT NOT NULL DEFAULT 0 AFTER provider_input_tokens",
+            }
+            for column, statement in monthly_migrations.items():
+                if column not in monthly_columns:
                     connection.execute(statement)
 
     def _ensure_mysql_ai_template_endpoint_seed(self) -> None:

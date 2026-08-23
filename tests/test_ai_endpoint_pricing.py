@@ -86,3 +86,110 @@ def test_ai_client_uses_model_prices_for_realtime_charge(tmp_path: Path, monkeyp
     assert Decimal(usage["input_price_snapshot"]) == Decimal("2")
     assert Decimal(usage["output_price_snapshot"]) == Decimal("8")
     assert Decimal(usage["charged_amount"]) == Decimal("0.006")
+
+
+def test_ai_client_reuses_cached_result_but_records_and_charges_each_request(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "cached-pricing-call.db")
+    store.initialize()
+    user = store.save_user({"email": "cached-pricing@example.com", "status": "active"})
+    store.save_ai_endpoint({
+        "id": "aie_cached_price",
+        "owner_type": "gl",
+        "name": "Cached pricing model",
+        "base_url": "https://example.com/v1",
+        "model": "example-model",
+        "api_key": "sk-cached-price",
+        "is_default": True,
+        "input_price_per_million": "2",
+        "output_price_per_million": "8",
+    })
+    client = AiDecisionClient(store)
+    provider_response = json.dumps({
+        "choices": [{"message": {"content": json.dumps({
+            "should_open": False,
+            "direction": None,
+            "confidence": 0.5,
+            "reason": "缓存测试观望",
+            "analysis": "相同分析内容应复用结果，但每个用户请求仍独立记录并计费。",
+        }, ensure_ascii=False)}}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+    }, ensure_ascii=False)
+    provider_calls = 0
+
+    def fake_provider(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return provider_response
+
+    monkeypatch.setattr(client, "_post_chat_completion", fake_provider)
+    deployment = {"id": "dep_cache", "user_id": str(user["id"]), "strategy_code": "PA_AGENT_V1", "config": {}}
+    payload = {"account": {"login": "123456", "server": "Test"}, "symbol": "XAUUSD", "timeframe": "M5"}
+
+    first = client._chat_json(deployment=deployment, endpoint="open", system_prompt="test", user_payload=payload)
+    second = client._chat_json(deployment=deployment, endpoint="open", system_prompt="test", user_payload=payload)
+
+    assert first is not None and second is not None
+    assert first.content == second.content
+    assert provider_calls == 1
+    assert Decimal(store.get_user(user["id"])["ai_balance"]) == Decimal("-0.012")
+    usage = store.list_ai_usage_logs(page=1, size=10, user_id=str(user["id"]))
+    assert usage["total"] == 2
+    assert usage["list"][0]["response_source"] == "cache"
+    assert usage["list"][0]["provider_called"] is False
+    assert usage["list"][0]["cache_id"]
+    assert usage["list"][1]["response_source"] == "provider"
+    assert usage["list"][1]["provider_called"] is True
+    assert usage["summary"]["provider_calls"] == 1
+    assert usage["summary"]["cache_hits"] == 1
+    assert usage["summary"]["cache_hit_rate"] == 50.0
+    assert usage["summary"]["provider_input_tokens"] == 1000
+    assert usage["summary"]["provider_output_tokens"] == 500
+
+    changed_payload = {**payload, "timeframe": "M15"}
+    client._chat_json(deployment=deployment, endpoint="open", system_prompt="test", user_payload=changed_payload)
+    assert provider_calls == 2
+
+
+def test_ai_client_does_not_cache_executable_trade_action(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "action-cache-safety.db")
+    store.initialize()
+    user = store.save_user({"email": "action-cache@example.com", "status": "active"})
+    store.save_ai_endpoint({
+        "id": "aie_action_cache",
+        "owner_type": "gl",
+        "name": "Action cache safety",
+        "base_url": "https://example.com/v1",
+        "model": "example-model",
+        "api_key": "sk-action-cache",
+        "is_default": True,
+    })
+    client = AiDecisionClient(store)
+    provider_calls = 0
+
+    def fake_provider(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return json.dumps({
+            "choices": [{"message": {"content": json.dumps({
+                "should_open": True,
+                "direction": "buy",
+                "confidence": 0.8,
+                "lot": 0.01,
+                "sl_distance_price": 1,
+                "tp_distance_price": 2,
+                "reason": "测试开仓",
+                "analysis": "带交易动作的结果不得被缓存重复下发。",
+            }, ensure_ascii=False)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(client, "_post_chat_completion", fake_provider)
+    deployment = {"id": "dep_action_cache", "user_id": str(user["id"]), "strategy_code": "PA_AGENT_V1", "config": {}}
+    payload = {"account": {"login": "123456"}, "symbol": "XAUUSD", "timeframe": "M5"}
+    client._chat_json(deployment=deployment, endpoint="open", system_prompt="test", user_payload=payload)
+    client._chat_json(deployment=deployment, endpoint="open", system_prompt="test", user_payload=payload)
+
+    assert provider_calls == 2
+    usage = store.list_ai_usage_logs(page=1, size=10, user_id=str(user["id"]))
+    assert usage["summary"]["cache_hits"] == 0
+    assert usage["summary"]["provider_calls"] == 2

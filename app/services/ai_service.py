@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import logging
 from dataclasses import dataclass
 from socket import timeout as SocketTimeout
+from threading import Lock
 from typing import Any
 from urllib import error, request
 
@@ -23,6 +25,7 @@ class AiDecisionClient:
     def __init__(self, store: SqliteStore, *, timeout: float = 20.0) -> None:
         self.store = store
         self.timeout = timeout
+        self._cache_locks = tuple(Lock() for _ in range(64))
 
     def pa_open_decision(
         self,
@@ -189,6 +192,66 @@ class AiDecisionClient:
         if model is None:
             return None
 
+        cache_settings = self.store.get_ai_cache_settings()
+        if not bool(cache_settings.get("enabled", True)):
+            return self._chat_json_uncached(
+                deployment=deployment,
+                endpoint=endpoint,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                model=model,
+            )
+
+        cache_key = self._cache_key(
+            deployment=deployment,
+            endpoint=endpoint,
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            model=model,
+        )
+        cached = self.store.get_ai_response_cache(cache_key)
+        if cached is not None:
+            return self._cached_result(
+                deployment=deployment,
+                endpoint=endpoint,
+                user_payload=user_payload,
+                model=model,
+                cached=cached,
+            )
+
+        lock = self._cache_locks[int(cache_key[:8], 16) % len(self._cache_locks)]
+        with lock:
+            cached = self.store.get_ai_response_cache(cache_key)
+            if cached is not None:
+                return self._cached_result(
+                    deployment=deployment,
+                    endpoint=endpoint,
+                    user_payload=user_payload,
+                    model=model,
+                    cached=cached,
+                )
+            return self._chat_json_uncached(
+                deployment=deployment,
+                endpoint=endpoint,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                model=model,
+                cache_key=cache_key,
+                cache_ttl_seconds=int(cache_settings.get("ttl_seconds") or 120),
+            )
+
+    def _chat_json_uncached(
+        self,
+        *,
+        deployment: dict[str, Any],
+        endpoint: str,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        model: dict[str, Any],
+        cache_key: str = "",
+        cache_ttl_seconds: int = 120,
+    ) -> AiCallResult:
+
         provider_id = str(model["provider_id"])
         model_id = self._usage_model_id(model)
         is_custom = bool(model.get("is_custom"))
@@ -238,6 +301,17 @@ class AiDecisionClient:
                         "AI decision JSON recovered locally: %s",
                         f"{type(parse_exc).__name__}: {parse_exc}; response_preview={_preview_text(original_response_content)}",
                     )
+                    response_preview = _format_response_preview(raw=original_response_content, parsed=recovered)
+                    cache_id = self._save_cache_result(
+                        cache_key=cache_key,
+                        cache_ttl_seconds=cache_ttl_seconds,
+                        endpoint=endpoint,
+                        provider_id=provider_id,
+                        model_id=model_id,
+                        content=recovered,
+                        usage=usage,
+                        response_preview=response_preview,
+                    )
                     self._save_usage(
                         deployment,
                         endpoint,
@@ -247,7 +321,8 @@ class AiDecisionClient:
                         request_payload=user_payload,
                         success=True,
                         is_custom=is_custom,
-                        response_preview=_format_response_preview(raw=original_response_content, parsed=recovered),
+                        response_preview=response_preview,
+                        cache_id=cache_id,
                     )
                     return AiCallResult(content=recovered, usage=usage)
                 try:
@@ -281,6 +356,17 @@ class AiDecisionClient:
                         response_preview=_format_response_preview(raw=original_response_content or response_content),
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
+            response_preview = _format_response_preview(raw=response_content, parsed=content)
+            cache_id = self._save_cache_result(
+                cache_key=cache_key,
+                cache_ttl_seconds=cache_ttl_seconds,
+                endpoint=endpoint,
+                provider_id=provider_id,
+                model_id=model_id,
+                content=content,
+                usage=usage,
+                response_preview=response_preview,
+            )
             self._save_usage(
                 deployment,
                 endpoint,
@@ -290,7 +376,8 @@ class AiDecisionClient:
                 request_payload=user_payload,
                 success=True,
                 is_custom=is_custom,
-                response_preview=_format_response_preview(raw=response_content, parsed=content),
+                response_preview=response_preview,
+                cache_id=cache_id,
             )
             return AiCallResult(content=content, usage=usage)
         except Exception as exc:  # noqa: BLE001
@@ -316,6 +403,101 @@ class AiDecisionClient:
                 response_preview=response_preview,
             )
             return AiCallResult(content=_fallback_decision(endpoint, "AI调用失败，保守观望"), usage=usage)
+
+    def _cache_key(
+        self,
+        *,
+        deployment: dict[str, Any],
+        endpoint: str,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        model: dict[str, Any],
+    ) -> str:
+        is_custom = bool(model.get("is_custom"))
+        scope = "official"
+        if is_custom:
+            api_key_hash = sha256(str(model.get("provider_api_key") or "").encode("utf-8")).hexdigest()
+            scope = f"custom:{deployment.get('user_id', '')}:{api_key_hash}"
+        material = {
+            "cache_version": 1,
+            "scope": scope,
+            "endpoint": endpoint,
+            "provider_id": str(model.get("provider_id") or ""),
+            "provider_base_url": str(model.get("provider_base_url") or "").rstrip("/"),
+            "model": str(model.get("model") or model.get("name") or ""),
+            "system_prompt": _json_api_system_prompt(endpoint, system_prompt),
+            "user_payload": user_payload,
+            "temperature": 0,
+            "max_tokens": _max_tokens_for_endpoint(endpoint),
+            "strict_json": bool(model.get("strict_json", True)),
+        }
+        canonical = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _cached_result(
+        self,
+        *,
+        deployment: dict[str, Any],
+        endpoint: str,
+        user_payload: dict[str, Any],
+        model: dict[str, Any],
+        cached: dict[str, Any],
+    ) -> AiCallResult:
+        usage = UsageSummary(
+            ai_called=True,
+            input_tokens=int(cached.get("input_tokens") or 0),
+            output_tokens=int(cached.get("output_tokens") or 0),
+            charged_points=int(cached.get("total_tokens") or 0),
+        )
+        self._save_usage(
+            deployment,
+            endpoint,
+            str(model["provider_id"]),
+            self._usage_model_id(model),
+            usage,
+            request_payload=user_payload,
+            success=True,
+            is_custom=bool(model.get("is_custom")),
+            response_preview=str(cached.get("response_preview") or ""),
+            provider_called=False,
+            response_source="cache",
+            cache_id=str(cached.get("id") or ""),
+        )
+        return AiCallResult(content=dict(cached.get("content") or {}), usage=usage)
+
+    def _save_cache_result(
+        self,
+        *,
+        cache_key: str,
+        cache_ttl_seconds: int,
+        endpoint: str,
+        provider_id: str,
+        model_id: str,
+        content: dict[str, Any],
+        usage: UsageSummary,
+        response_preview: str,
+    ) -> str:
+        if not cache_key:
+            return ""
+        if endpoint == "open" and bool(content.get("should_open", False)):
+            return ""
+        if endpoint == "position" and str(content.get("action") or "hold").strip().lower() != "hold":
+            return ""
+        cached = self.store.save_ai_response_cache(
+            {
+                "cache_key": cache_key,
+                "endpoint": endpoint,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "content": content,
+                "response_preview": response_preview,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens,
+            },
+            ttl_seconds=cache_ttl_seconds,
+        )
+        return str(cached.get("id") or "")
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
@@ -460,6 +642,9 @@ class AiDecisionClient:
         is_custom: bool = False,
         error_message: str = "",
         response_preview: str = "",
+        provider_called: bool = True,
+        response_source: str = "",
+        cache_id: str = "",
     ) -> None:
         request_payload = request_payload or {}
         account = request_payload.get("account") if isinstance(request_payload.get("account"), dict) else {}
@@ -484,6 +669,9 @@ class AiDecisionClient:
                 "input_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "input", self.store),
                 "output_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "output", self.store),
                 "success": success,
+                "provider_called": provider_called,
+                "response_source": response_source or ("provider" if success else "fallback"),
+                "cache_id": cache_id,
                 "error_message": error_message,
                 "response_preview": response_preview,
             },
