@@ -3,9 +3,49 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from pathlib import Path
+from urllib import request
 
 from app.services.ai_service import AiDecisionClient
 from app.store import SqliteStore
+
+
+def test_full_chat_completions_url_and_bearer_header_are_supported(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "full-chat-url.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"OK"}}]}'
+
+    def fake_urlopen(req: request.Request, timeout: float):
+        captured["url"] = req.full_url
+        captured["authorization"] = req.get_header("Authorization")
+        captured["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(request, "urlopen", fake_urlopen)
+    client._post_chat_completion(
+        base_url="https://api.example.com/v1/chat/completions/",
+        api_key="sk-header-only",
+        model="example-model",
+        system_prompt="test",
+        user_prompt="test",
+        max_tokens=16,
+        strict_json=False,
+    )
+
+    assert captured["url"] == "https://api.example.com/v1/chat/completions"
+    assert captured["authorization"] == "Bearer sk-header-only"
+    assert "api_key" not in captured["body"]
 
 
 def test_ai_endpoint_connection_test_does_not_create_billing_log(tmp_path: Path, monkeypatch) -> None:

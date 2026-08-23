@@ -623,7 +623,8 @@ class AiDecisionClient:
         max_tokens: int,
         strict_json: bool = True,
     ) -> str:
-        url = f"{base_url.rstrip('/')}/chat/completions"
+        normalized_base_url = base_url.strip().rstrip("/")
+        url = normalized_base_url if normalized_base_url.lower().endswith("/chat/completions") else f"{normalized_base_url}/chat/completions"
         body = {
             "model": model,
             "messages": [
