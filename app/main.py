@@ -65,6 +65,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         store.initialize()
         store.cleanup_expired_ai_usage_details()
         store.cleanup_expired_ai_response_cache()
+        store.cleanup_expired_order_details()
         if resolved.environment != "production":
             store.ensure_demo_deployment(resolved.demo_deployment_key)
 
@@ -75,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if datetime.now(timezone.utc).hour != 3:
                     continue
                 await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
+                await asyncio.to_thread(store.cleanup_expired_order_details)
 
         cleanup_task = asyncio.create_task(cleanup_usage_details_daily())
         try:

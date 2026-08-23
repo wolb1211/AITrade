@@ -155,6 +155,16 @@ def _time_bucket(timestamp: int, bucket: str) -> str:
     return value.strftime("%m-%d")
 
 
+def _bucket_timestamp(timestamp: int, bucket_type: str) -> int:
+    """Return the UTC timestamp for an Asia/Shanghai hour/day boundary."""
+    value = datetime.fromtimestamp(int(timestamp), LOCAL_TIMEZONE)
+    if bucket_type == "hour":
+        value = value.replace(minute=0, second=0, microsecond=0)
+    else:
+        value = value.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(value.timestamp())
+
+
 def _pnl_curve_points(bucket_values: dict[str, float]) -> list[dict[str, Any]]:
     running = 0.0
     points: list[dict[str, Any]] = []
@@ -379,6 +389,48 @@ class SqliteStore:
                     ON mt5_history_deals(deployment_id, close_time);
                 CREATE INDEX IF NOT EXISTS idx_mt5_history_deployment_symbol_close
                     ON mt5_history_deals(deployment_id, symbol, close_time);
+
+                CREATE TABLE IF NOT EXISTS mt_order_time_summaries (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    account_login TEXT NOT NULL DEFAULT '',
+                    account_server TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    bucket_type TEXT NOT NULL,
+                    bucket_start INTEGER NOT NULL,
+                    order_count INTEGER NOT NULL DEFAULT 0,
+                    win_count INTEGER NOT NULL DEFAULT 0,
+                    loss_count INTEGER NOT NULL DEFAULT 0,
+                    total_volume REAL NOT NULL DEFAULT 0,
+                    gross_profit REAL NOT NULL DEFAULT 0,
+                    gross_loss REAL NOT NULL DEFAULT 0,
+                    commission REAL NOT NULL DEFAULT 0,
+                    swap REAL NOT NULL DEFAULT 0,
+                    net_profit REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(deployment_id, account_login, account_server, symbol, bucket_type, bucket_start),
+                    FOREIGN KEY(deployment_id) REFERENCES deployments(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mt_order_summary_user_bucket
+                    ON mt_order_time_summaries(user_id, bucket_type, bucket_start);
+                CREATE INDEX IF NOT EXISTS idx_mt_order_summary_deployment_bucket
+                    ON mt_order_time_summaries(deployment_id, bucket_type, bucket_start);
+
+                CREATE TABLE IF NOT EXISTS mt_order_archived_deals (
+                    account_login TEXT NOT NULL,
+                    account_server TEXT NOT NULL DEFAULT '',
+                    deal_id TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    close_time INTEGER NOT NULL DEFAULT 0,
+                    archived_at TEXT NOT NULL,
+                    PRIMARY KEY(account_login, account_server, deal_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mt_order_archive_deployment
+                    ON mt_order_archived_deals(deployment_id, close_time);
 
                 CREATE TABLE IF NOT EXISTS ai_providers (
                     id TEXT PRIMARY KEY,
@@ -630,6 +682,7 @@ class SqliteStore:
             self._ensure_user_columns(connection)
         self._backfill_ai_usage_monthly_summaries()
         self._backfill_ai_cache_stats()
+        self._backfill_order_time_summaries()
         self._ensure_existing_users()
 
     def _migrate_sqlite_user_id(self, connection: sqlite3.Connection) -> None:
@@ -721,6 +774,11 @@ class SqliteStore:
             ("ai_cache_ttl_seconds", "120", "AI 相同请求缓存秒数", now),
         )
 
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("order_detail_retention_days", "365", "订单明细保存天数", now),
+        )
+
     def _backfill_ai_usage_monthly_summaries(self) -> None:
         now = utc_now_iso()
         with self._connect() as connection:
@@ -759,6 +817,139 @@ class SqliteStore:
                     updated_at = excluded.updated_at
                 """,
                 ("ai_usage_monthly_summary_backfilled", "1", "AI 月度汇总历史数据已初始化", now),
+            )
+
+    def _upsert_order_summary_row(
+        self,
+        connection: sqlite3.Connection | MySqlConnection,
+        row: dict[str, Any],
+        *,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO mt_order_time_summaries (
+                id, user_id, deployment_id, account_login, account_server,
+                symbol, bucket_type, bucket_start, order_count, win_count,
+                loss_count, total_volume, gross_profit, gross_loss, commission,
+                swap, net_profit, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(deployment_id, account_login, account_server, symbol, bucket_type, bucket_start)
+            DO UPDATE SET
+                user_id = excluded.user_id,
+                order_count = excluded.order_count,
+                win_count = excluded.win_count,
+                loss_count = excluded.loss_count,
+                total_volume = excluded.total_volume,
+                gross_profit = excluded.gross_profit,
+                gross_loss = excluded.gross_loss,
+                commission = excluded.commission,
+                swap = excluded.swap,
+                net_profit = excluded.net_profit,
+                updated_at = excluded.updated_at
+            """,
+            (
+                f"ordersum_{uuid4().hex}", row["user_id"], row["deployment_id"],
+                row["account_login"], row["account_server"], row["symbol"],
+                row["bucket_type"], row["bucket_start"], row["order_count"],
+                row["win_count"], row["loss_count"], row["total_volume"],
+                row["gross_profit"], row["gross_loss"], row["commission"],
+                row["swap"], row["net_profit"], now, now,
+            ),
+        )
+
+    def _refresh_order_summary_bucket(
+        self,
+        connection: sqlite3.Connection | MySqlConnection,
+        *,
+        deployment_id: str,
+        bucket_type: str,
+        bucket_start: int,
+        now: str,
+    ) -> None:
+        seconds = 3600 if bucket_type == "hour" else 86400
+        connection.execute(
+            """
+            DELETE FROM mt_order_time_summaries
+            WHERE deployment_id = ? AND bucket_type = ? AND bucket_start = ?
+            """,
+            (deployment_id, bucket_type, bucket_start),
+        )
+        rows = connection.execute(
+            """
+            SELECT d.user_id, h.deployment_id, h.account_login, h.account_server,
+                   h.symbol, COUNT(*) order_count,
+                   COALESCE(SUM(CASE WHEN h.net_profit > 0 THEN 1 ELSE 0 END), 0) win_count,
+                   COALESCE(SUM(CASE WHEN h.net_profit < 0 THEN 1 ELSE 0 END), 0) loss_count,
+                   COALESCE(SUM(h.volume), 0) total_volume,
+                   COALESCE(SUM(CASE WHEN h.net_profit > 0 THEN h.net_profit ELSE 0 END), 0) gross_profit,
+                   COALESCE(SUM(CASE WHEN h.net_profit < 0 THEN h.net_profit ELSE 0 END), 0) gross_loss,
+                   COALESCE(SUM(h.commission), 0) commission,
+                   COALESCE(SUM(h.swap), 0) swap,
+                   COALESCE(SUM(h.net_profit), 0) net_profit
+            FROM mt5_history_deals h
+            JOIN deployments d ON d.id = h.deployment_id
+            WHERE h.deployment_id = ?
+              AND LOWER(h.entry) IN ('out', 'out_by', 'inout')
+              AND COALESCE(NULLIF(h.close_time, 0), h.deal_time) >= ?
+              AND COALESCE(NULLIF(h.close_time, 0), h.deal_time) < ?
+            GROUP BY d.user_id, h.deployment_id, h.account_login, h.account_server, h.symbol
+            """,
+            (deployment_id, bucket_start, bucket_start + seconds),
+        ).fetchall()
+        for source in rows:
+            self._upsert_order_summary_row(connection, {
+                **dict(source),
+                "bucket_type": bucket_type,
+                "bucket_start": bucket_start,
+            }, now=now)
+
+    def _backfill_order_time_summaries(self) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            marker = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("order_time_summaries_backfilled",),
+            ).fetchone()
+            if marker is not None:
+                return
+            buckets: set[tuple[str, str, int]] = set()
+            time_expr = "COALESCE(NULLIF(close_time, 0), deal_time)"
+            for bucket_type, seconds in (("hour", 3600), ("day", 86400)):
+                if isinstance(connection, MySqlConnection):
+                    bucket_expr = f"FLOOR(({time_expr} + 28800) / {seconds}) * {seconds} - 28800"
+                else:
+                    bucket_expr = f"CAST(({time_expr} + 28800) / {seconds} AS INTEGER) * {seconds} - 28800"
+                rows = connection.execute(
+                    f"""
+                    SELECT DISTINCT deployment_id, {bucket_expr} bucket_start
+                    FROM mt5_history_deals
+                    WHERE LOWER(entry) IN ('out', 'out_by', 'inout')
+                      AND {time_expr} > 0
+                    """
+                ).fetchall()
+                buckets.update(
+                    (str(row["deployment_id"]), bucket_type, int(row["bucket_start"]))
+                    for row in rows
+                )
+            for deployment_id, bucket_type, bucket_start in buckets:
+                self._refresh_order_summary_bucket(
+                    connection,
+                    deployment_id=deployment_id,
+                    bucket_type=bucket_type,
+                    bucket_start=bucket_start,
+                    now=now,
+                )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                ("order_time_summaries_backfilled", "1", "订单小时和每日汇总已初始化", now),
             )
 
     def _ensure_existing_users(self) -> None:
@@ -1400,14 +1591,14 @@ class SqliteStore:
                 """,
                 (deployment_id,),
             ).fetchone()
-            history_rows = connection.execute(
+            history_summary = connection.execute(
                 """
-                SELECT entry, net_profit
-                FROM mt5_history_deals
-                WHERE deployment_id = ?
+                SELECT COALESCE(SUM(net_profit), 0) net_profit
+                FROM mt_order_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
                 """,
                 (deployment_id,),
-            ).fetchall()
+            ).fetchone()
 
         stats["analysis_count"] = len(decision_rows)
         for row in decision_rows:
@@ -1425,57 +1616,52 @@ class SqliteStore:
             stats["official_tokens_used"] = int(usage_row["official_tokens_used"] or 0)
             stats["custom_tokens_used"] = int(usage_row["custom_tokens_used"] or 0)
 
-        pnl = sum(
-            float(row["net_profit"] or 0)
-            for row in history_rows
-            if _is_profit_deal_entry(str(row["entry"] or ""))
-        )
-        stats["pnl"] = round(pnl, 2)
+        stats["pnl"] = round(float(history_summary["net_profit"] or 0), 2) if history_summary else 0.0
         return stats
 
     def deployment_detail_stats(self, deployment_id: str) -> dict[str, Any]:
         stats = self.deployment_runtime_stats(deployment_id)
         with self._connect() as connection:
+            summary_row = connection.execute(
+                """
+                SELECT COALESCE(SUM(order_count), 0) closed_count,
+                       COALESCE(SUM(win_count), 0) win_count,
+                       COALESCE(SUM(loss_count), 0) loss_count,
+                       COUNT(DISTINCT CASE WHEN symbol <> '' THEN symbol END) symbol_count
+                FROM mt_order_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
+                """,
+                (deployment_id,),
+            ).fetchone()
             history_rows = connection.execute(
                 """
-                SELECT symbol, entry, net_profit, deal_time
-                FROM mt5_history_deals
-                WHERE deployment_id = ?
-                ORDER BY deal_time ASC, updated_at ASC
+                SELECT bucket_start, COALESCE(SUM(net_profit), 0) net_profit
+                FROM mt_order_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
+                GROUP BY bucket_start
+                ORDER BY bucket_start
                 """,
                 (deployment_id,),
             ).fetchall()
 
-        win_count = 0
-        loss_count = 0
-        flat_count = 0
-        symbols: set[str] = set()
+        closed_count = int(summary_row["closed_count"] or 0) if summary_row else 0
+        win_count = int(summary_row["win_count"] or 0) if summary_row else 0
+        loss_count = int(summary_row["loss_count"] or 0) if summary_row else 0
+        flat_count = max(0, closed_count - win_count - loss_count)
         curve: list[dict[str, Any]] = []
         cumulative_pnl = 0.0
 
         for row in history_rows:
-            if not _is_profit_deal_entry(str(row["entry"] or "")):
-                continue
-            symbol = str(row["symbol"] or "").strip()
-            if symbol:
-                symbols.add(symbol)
             pnl = round(float(row["net_profit"] or 0), 2)
-            if pnl > 0:
-                win_count += 1
-            elif pnl < 0:
-                loss_count += 1
-            else:
-                flat_count += 1
             cumulative_pnl = round(cumulative_pnl + pnl, 2)
             curve.append(
                 {
-                    "time": int(row["deal_time"] or 0),
+                    "time": int(row["bucket_start"] or 0),
                     "pnl": pnl,
                     "cumulative_pnl": cumulative_pnl,
                 },
             )
 
-        closed_count = win_count + loss_count + flat_count
         return {
             "summary": {
                 **stats,
@@ -1483,7 +1669,7 @@ class SqliteStore:
                 "loss_count": loss_count,
                 "flat_count": flat_count,
                 "win_rate": round((win_count / closed_count) * 100, 2) if closed_count else 0.0,
-                "traded_symbol_count": len(symbols),
+                "traded_symbol_count": int(summary_row["symbol_count"] or 0) if summary_row else 0,
             },
             "curve": curve,
         }
@@ -1575,14 +1761,22 @@ class SqliteStore:
             history_rows = connection.execute(
                 """
                 SELECT
-                    account_login, account_server, symbol, mt_type, volume,
-                    net_profit, close_time, deal_time, updated_at
-                FROM mt5_history_deals
+                    account_login, account_server, symbol,
+                    COALESCE(SUM(total_volume), 0) volume,
+                    COALESCE(SUM(net_profit), 0) net_profit,
+                    COALESCE(SUM(order_count), 0) order_count,
+                    COALESCE(SUM(win_count), 0) win_count,
+                    COALESCE(SUM(loss_count), 0) loss_count,
+                    MAX(bucket_start) close_time,
+                    MAX(updated_at) updated_at
+                FROM mt_order_time_summaries
                 WHERE deployment_id = ?
-                  AND COALESCE(NULLIF(close_time, 0), deal_time) >= ?
-                  AND COALESCE(NULLIF(close_time, 0), deal_time) <= ?
+                  AND bucket_type = 'day'
+                  AND bucket_start >= ?
+                  AND bucket_start <= ?
+                GROUP BY account_login, account_server, symbol
                 """,
-                (deployment_id, start_ts, end_ts),
+                (deployment_id, _bucket_timestamp(start_ts, "day"), _bucket_timestamp(end_ts, "day")),
             ).fetchall()
 
         normalized_accounts = self._normalized_account_items(
@@ -1636,16 +1830,16 @@ class SqliteStore:
                 },
             )
             profit = float(row["net_profit"] or 0)
-            item["close_order_count"] += 1
+            row_count = int(row["order_count"] or 0)
+            row_wins = int(row["win_count"] or 0)
+            row_losses = int(row["loss_count"] or 0)
+            item["close_order_count"] += row_count
             item["volume"] = round(float(item["volume"]) + float(row["volume"] or 0), 4)
             item["pnl"] = round(float(item["pnl"]) + profit, 2)
-            if profit > 0:
-                item["win_count"] += 1
-            elif profit < 0:
-                item["loss_count"] += 1
-            else:
-                item["flat_count"] += 1
-            close_time = int(row["close_time"] or row["deal_time"] or 0)
+            item["win_count"] += row_wins
+            item["loss_count"] += row_losses
+            item["flat_count"] += max(0, row_count - row_wins - row_losses)
+            close_time = int(row["close_time"] or 0)
             item["last_close_time"] = max(int(item["last_close_time"] or 0), close_time)
             item["last_active_at"] = max(str(item["last_active_at"] or ""), str(row["updated_at"] or ""))
 
@@ -1811,8 +2005,10 @@ class SqliteStore:
             ).fetchone()
             history_rows = connection.execute(
                 """
-                SELECT deployment_id, entry, net_profit
-                FROM mt5_history_deals
+                SELECT deployment_id, COALESCE(SUM(net_profit), 0) net_profit
+                FROM mt_order_time_summaries
+                WHERE bucket_type = 'day'
+                GROUP BY deployment_id
                 """
             ).fetchall()
 
@@ -1878,8 +2074,6 @@ class SqliteStore:
 
         total_pnl = 0.0
         for row in history_rows:
-            if not _is_profit_deal_entry(str(row["entry"] or "")):
-                continue
             profit = float(row["net_profit"] or 0)
             total_pnl += profit
             item = by_deployment.get(row["deployment_id"])
@@ -2146,22 +2340,28 @@ class SqliteStore:
             history_rows = connection.execute(
                 """
                 SELECT
-                    h.deployment_id,
-                    h.account_login,
-                    h.account_server,
-                    h.symbol,
-                    h.entry,
-                    h.net_profit,
-                    h.close_time,
-                    h.deal_time,
-                    h.updated_at
-                FROM mt5_history_deals h
-                JOIN deployments d ON d.id = h.deployment_id
+                    s.deployment_id,
+                    s.account_login,
+                    s.account_server,
+                    s.symbol,
+                    COALESCE(SUM(s.order_count), 0) close_order_count,
+                    COALESCE(SUM(s.net_profit), 0) net_profit,
+                    s.bucket_start close_time,
+                    MAX(s.updated_at) updated_at
+                FROM mt_order_time_summaries s
+                JOIN deployments d ON d.id = s.deployment_id
                 WHERE d.strategy_code = ?
-                  AND COALESCE(NULLIF(h.close_time, 0), h.deal_time) >= ?
-                  AND COALESCE(NULLIF(h.close_time, 0), h.deal_time) <= ?
+                  AND s.bucket_type = ?
+                  AND s.bucket_start >= ?
+                  AND s.bucket_start <= ?
+                GROUP BY s.deployment_id, s.account_login, s.account_server,
+                         s.symbol, s.bucket_start
                 """,
-                (strategy_code, start_ts, end_ts),
+                (
+                    strategy_code, bucket,
+                    _bucket_timestamp(start_ts, bucket),
+                    _bucket_timestamp(end_ts, bucket),
+                ),
             ).fetchall()
             activity_rows = connection.execute(
                 """
@@ -2374,12 +2574,11 @@ class SqliteStore:
         account_trade_stats: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         account_symbols: dict[tuple[str, str, str], set[str]] = {}
         for row in history_rows:
-            if not _is_profit_deal_entry(str(row["entry"] or "")):
-                continue
             profit = float(row["net_profit"] or 0)
+            close_order_count = int(row["close_order_count"] or 0)
             total_pnl += profit
-            total_close_orders += 1
-            close_time = int(row["close_time"] or row["deal_time"] or 0)
+            total_close_orders += close_order_count
+            close_time = int(row["close_time"] or 0)
             bucket_key = _time_bucket(close_time, bucket)
             pnl_buckets[bucket_key] = round(pnl_buckets.get(bucket_key, 0.0) + profit, 2)
             item = by_deployment.get(row["deployment_id"])
@@ -2387,7 +2586,7 @@ class SqliteStore:
                 active_deployments.add(row["deployment_id"])
                 item["last_active_at"] = max(str(item["last_active_at"] or ""), str(row["updated_at"] or ""))
                 item["pnl"] = round(float(item["pnl"]) + profit, 2)
-                item["close_order_count"] += 1
+                item["close_order_count"] += close_order_count
             symbol = str(row["symbol"] or "").strip().upper()
             account_base_key = (
                 str(row["deployment_id"] or ""),
@@ -2410,7 +2609,7 @@ class SqliteStore:
             if symbol:
                 account_symbols.setdefault(account_base_key, set()).add(symbol)
             account_stats["pnl"] = round(float(account_stats["pnl"] or 0) + profit, 2)
-            account_stats["close_order_count"] = int(account_stats["close_order_count"] or 0) + 1
+            account_stats["close_order_count"] = int(account_stats["close_order_count"] or 0) + close_order_count
             account_stats["last_active_at"] = max(
                 str(account_stats["last_active_at"] or ""),
                 str(row["updated_at"] or ""),
@@ -2839,13 +3038,25 @@ class SqliteStore:
         now = utc_now_iso()
         inserted_count = 0
         updated_count = 0
+        archived_count = 0
         profit_deals_count = 0
         net_profit_total = 0.0
+        affected_buckets: set[tuple[str, str, int]] = set()
 
         with self._connect() as connection:
             for order in orders:
                 order_id = str(order.get("order_id") or order.get("deal_id") or "").strip()
                 if not order_id:
+                    continue
+                archived = connection.execute(
+                    """
+                    SELECT 1 FROM mt_order_archived_deals
+                    WHERE account_login = ? AND account_server = ? AND deal_id = ?
+                    """,
+                    (account_login, account_server, order_id),
+                ).fetchone()
+                if archived is not None:
+                    archived_count += 1
                     continue
                 entry = "out"
                 net_profit = _deal_net_profit(order)
@@ -2856,7 +3067,8 @@ class SqliteStore:
                 legacy_server_backfill = False
                 existing = connection.execute(
                     """
-                    SELECT id
+                    SELECT id, deployment_id,
+                           COALESCE(NULLIF(close_time, 0), deal_time) close_timestamp
                     FROM mt5_history_deals
                     WHERE account_login = ? AND account_server = ? AND deal_id = ?
                     """,
@@ -2865,7 +3077,8 @@ class SqliteStore:
                 if existing is None and account_server:
                     existing = connection.execute(
                         """
-                        SELECT id
+                        SELECT id, deployment_id,
+                               COALESCE(NULLIF(close_time, 0), deal_time) close_timestamp
                         FROM mt5_history_deals
                         WHERE deployment_id = ?
                           AND account_login = ?
@@ -2875,6 +3088,13 @@ class SqliteStore:
                         (deployment_id, account_login, order_id),
                     ).fetchone()
                     legacy_server_backfill = existing is not None
+                if existing and int(existing["close_timestamp"] or 0) > 0:
+                    old_timestamp = int(existing["close_timestamp"])
+                    old_deployment_id = str(existing["deployment_id"] or deployment_id)
+                    for bucket_type in ("hour", "day"):
+                        affected_buckets.add(
+                            (old_deployment_id, bucket_type, _bucket_timestamp(old_timestamp, bucket_type))
+                        )
                 if legacy_server_backfill:
                     connection.execute(
                         """
@@ -2947,10 +3167,27 @@ class SqliteStore:
                 else:
                     inserted_count += 1
 
+                close_timestamp = int(order.get("close_time") or 0)
+                if close_timestamp > 0:
+                    for bucket_type in ("hour", "day"):
+                        affected_buckets.add(
+                            (deployment_id, bucket_type, _bucket_timestamp(close_timestamp, bucket_type))
+                        )
+
+            for affected_deployment, bucket_type, bucket_start in affected_buckets:
+                self._refresh_order_summary_bucket(
+                    connection,
+                    deployment_id=affected_deployment,
+                    bucket_type=bucket_type,
+                    bucket_start=bucket_start,
+                    now=now,
+                )
+
         return {
             "received_count": len(orders),
             "inserted_count": inserted_count,
             "updated_count": updated_count,
+            "archived_count": archived_count,
             "profit_orders_count": profit_deals_count,
             "profit_deals_count": profit_deals_count,
             "net_profit": round(net_profit_total, 2),
@@ -3450,6 +3687,17 @@ class SqliteStore:
         except (TypeError, ValueError):
             return 60
 
+    def get_order_detail_retention_days(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("order_detail_retention_days",),
+            ).fetchone()
+        try:
+            return max(30, min(3650, int(str(row["setting_value"])))) if row else 365
+        except (TypeError, ValueError):
+            return 365
+
     def get_ai_cache_settings(self) -> dict[str, Any]:
         values: dict[str, Any] = {"enabled": True, "ttl_seconds": 120}
         with self._connect() as connection:
@@ -3615,6 +3863,93 @@ class SqliteStore:
                 )
                 deleted += len(ids)
             if len(ids) < batch_size:
+                break
+        return deleted
+
+    def cleanup_expired_order_details(self, *, batch_size: int = 5000, max_batches: int = 100) -> int:
+        """Delete old details only after both permanent summary levels exist."""
+        cutoff = int((datetime.now(timezone.utc) - timedelta(days=self.get_order_detail_retention_days())).timestamp())
+        normalized_batch = max(1, min(10000, int(batch_size)))
+        deleted = 0
+        for _ in range(max_batches):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, deployment_id, account_login, account_server, symbol,
+                           COALESCE(NULLIF(close_time, 0), deal_time) close_timestamp
+                    FROM mt5_history_deals
+                    WHERE LOWER(entry) IN ('out', 'out_by', 'inout')
+                      AND COALESCE(NULLIF(close_time, 0), deal_time) > 0
+                      AND COALESCE(NULLIF(close_time, 0), deal_time) < ?
+                    ORDER BY COALESCE(NULLIF(close_time, 0), deal_time)
+                    LIMIT ?
+                    """,
+                    (cutoff, normalized_batch),
+                ).fetchall()
+                if not rows:
+                    break
+                summary_keys: set[tuple[str, str, str, str, str, int]] = set()
+                for row in rows:
+                    timestamp = int(row["close_timestamp"] or 0)
+                    for bucket_type in ("hour", "day"):
+                        summary_keys.add((
+                            str(row["deployment_id"]), str(row["account_login"] or ""),
+                            str(row["account_server"] or ""), str(row["symbol"] or ""),
+                            bucket_type, _bucket_timestamp(timestamp, bucket_type),
+                        ))
+                existing_keys: set[tuple[str, str, str, str, str, int]] = set()
+                bucket_pairs = sorted({(item[4], item[5]) for item in summary_keys})
+                for bucket_type, bucket_start in bucket_pairs:
+                    summary_rows = connection.execute(
+                        """
+                        SELECT deployment_id, account_login, account_server, symbol,
+                               bucket_type, bucket_start
+                        FROM mt_order_time_summaries
+                        WHERE bucket_type = ? AND bucket_start = ?
+                        """,
+                        (bucket_type, bucket_start),
+                    ).fetchall()
+                    existing_keys.update(
+                        (
+                            str(item["deployment_id"]), str(item["account_login"] or ""),
+                            str(item["account_server"] or ""), str(item["symbol"] or ""),
+                            str(item["bucket_type"]), int(item["bucket_start"]),
+                        )
+                        for item in summary_rows
+                    )
+                safe_ids: list[str] = []
+                safe_rows: list[Any] = []
+                for row in rows:
+                    timestamp = int(row["close_timestamp"] or 0)
+                    base = (
+                        str(row["deployment_id"]), str(row["account_login"] or ""),
+                        str(row["account_server"] or ""), str(row["symbol"] or ""),
+                    )
+                    if all(
+                        (*base, bucket_type, _bucket_timestamp(timestamp, bucket_type)) in existing_keys
+                        for bucket_type in ("hour", "day")
+                    ):
+                        safe_ids.append(str(row["id"]))
+                        safe_rows.append(row)
+                if not safe_ids:
+                    break
+                archived_at = utc_now_iso()
+                for row in safe_rows:
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO mt_order_archived_deals (
+                            account_login, account_server, deal_id, deployment_id,
+                            close_time, archived_at
+                        ) SELECT account_login, account_server, deal_id, deployment_id,
+                                 COALESCE(NULLIF(close_time, 0), deal_time), ?
+                          FROM mt5_history_deals WHERE id = ?
+                        """,
+                        (archived_at, str(row["id"])),
+                    )
+                placeholders = ",".join("?" for _ in safe_ids)
+                connection.execute(f"DELETE FROM mt5_history_deals WHERE id IN ({placeholders})", safe_ids)
+                deleted += len(safe_ids)
+            if len(rows) < normalized_batch:
                 break
         return deleted
 
@@ -3821,14 +4156,13 @@ class SqliteStore:
             order_summary = connection.execute(
                 """
                 SELECT
-                    COUNT(*) AS total,
-                    COALESCE(SUM(CASE WHEN h.net_profit > 0 THEN 1 ELSE 0 END), 0) AS wins,
-                    COALESCE(SUM(CASE WHEN h.net_profit < 0 THEN 1 ELSE 0 END), 0) AS losses,
-                    COALESCE(SUM(h.net_profit), 0) AS pnl,
-                    COUNT(DISTINCT h.symbol) AS symbol_count
-                FROM mt5_history_deals h
-                JOIN deployments d ON d.id = h.deployment_id
-                WHERE d.user_id = ? AND LOWER(h.entry) IN ('out', 'out_by', 'inout')
+                    COALESCE(SUM(order_count), 0) AS total,
+                    COALESCE(SUM(win_count), 0) AS wins,
+                    COALESCE(SUM(loss_count), 0) AS losses,
+                    COALESCE(SUM(net_profit), 0) AS pnl,
+                    COUNT(DISTINCT CASE WHEN symbol <> '' THEN symbol END) AS symbol_count
+                FROM mt_order_time_summaries
+                WHERE user_id = ? AND bucket_type = 'day'
                 """,
                 (str(user_id),),
             ).fetchone()
@@ -3969,9 +4303,14 @@ class SqliteStore:
         normalized_page = max(1, int(page))
         normalized_size = max(1, min(100, int(size)))
         offset = (normalized_page - 1) * normalized_size
+        retention_days = self.get_order_detail_retention_days()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        detail_cutoff = now_ts - retention_days * 86400
         time_expr = "COALESCE(NULLIF(h.close_time, 0), h.deal_time)"
         clauses = ["d.user_id = ?", "LOWER(h.entry) IN ('out', 'out_by', 'inout')"]
         params: list[Any] = [str(user_id)]
+        start_ts: int | None = None
+        end_ts: int | None = None
         if deployment_id:
             clauses.append("h.deployment_id = ?")
             params.append(deployment_id)
@@ -3979,11 +4318,13 @@ class SqliteStore:
             clauses.append("UPPER(h.symbol) = UPPER(?)")
             params.append(symbol)
         if start_at:
+            start_ts = int(datetime.fromisoformat(normalized_utc_iso(start_at)).timestamp())
             clauses.append(f"{time_expr} >= ?")
-            params.append(int(datetime.fromisoformat(normalized_utc_iso(start_at)).timestamp()))
+            params.append(start_ts)
         if end_at:
+            end_ts = int(datetime.fromisoformat(normalized_utc_iso(end_at)).timestamp())
             clauses.append(f"{time_expr} <= ?")
-            params.append(int(datetime.fromisoformat(normalized_utc_iso(end_at)).timestamp()))
+            params.append(end_ts)
         where = f"WHERE {' AND '.join(clauses)}"
 
         deployments = self.list_web_deployments(str(user_id))
@@ -3997,13 +4338,13 @@ class SqliteStore:
         }
 
         with self._connect() as connection:
-            summary = connection.execute(
+            detail_summary_row = connection.execute(
                 f"""
                 SELECT COUNT(*) total,
                        COALESCE(SUM(CASE WHEN h.net_profit > 0 THEN 1 ELSE 0 END), 0) wins,
                        COALESCE(SUM(CASE WHEN h.net_profit < 0 THEN 1 ELSE 0 END), 0) losses,
                        COALESCE(SUM(h.net_profit), 0) pnl,
-                       COUNT(DISTINCT h.symbol) symbol_count
+                       COUNT(DISTINCT CASE WHEN h.symbol <> '' THEN h.symbol END) symbol_count
                 FROM mt5_history_deals h
                 JOIN deployments d ON d.id = h.deployment_id
                 {where}
@@ -4021,29 +4362,90 @@ class SqliteStore:
                 """,
                 [*params, normalized_size, offset],
             ).fetchall()
+            summary_clauses = ["user_id = ?", "bucket_type = 'day'"]
+            summary_params: list[Any] = [str(user_id)]
+            if deployment_id:
+                summary_clauses.append("deployment_id = ?")
+                summary_params.append(deployment_id)
+            if symbol:
+                summary_clauses.append("UPPER(symbol) = UPPER(?)")
+                summary_params.append(symbol)
+            if start_ts is not None:
+                summary_clauses.append("bucket_start >= ?")
+                summary_params.append(_bucket_timestamp(start_ts, "day"))
+            if end_ts is not None:
+                summary_clauses.append("bucket_start <= ?")
+                summary_params.append(_bucket_timestamp(end_ts, "day"))
+            summary_where = " AND ".join(summary_clauses)
+            summary = connection.execute(
+                f"""
+                SELECT COALESCE(SUM(order_count), 0) total,
+                       COALESCE(SUM(win_count), 0) wins,
+                       COALESCE(SUM(loss_count), 0) losses,
+                       COALESCE(SUM(net_profit), 0) pnl,
+                       COUNT(DISTINCT CASE WHEN symbol <> '' THEN symbol END) symbol_count,
+                       MIN(bucket_start) first_timestamp,
+                       MAX(bucket_start) last_timestamp
+                FROM mt_order_time_summaries
+                WHERE {summary_where}
+                """,
+                summary_params,
+            ).fetchone()
+            summary_first_timestamp = int(summary["first_timestamp"] or 0) if summary else 0
+            if start_ts is not None and start_ts >= detail_cutoff:
+                summary = detail_summary_row
             symbol_rows = connection.execute(
                 """
-                SELECT DISTINCT h.symbol
-                FROM mt5_history_deals h
-                JOIN deployments d ON d.id = h.deployment_id
-                WHERE d.user_id = ?
-                  AND LOWER(h.entry) IN ('out', 'out_by', 'inout')
-                  AND h.symbol <> ''
-                ORDER BY h.symbol
+                SELECT DISTINCT symbol
+                FROM mt_order_time_summaries
+                WHERE user_id = ? AND bucket_type = 'day' AND symbol <> ''
+                ORDER BY symbol
                 """,
                 (str(user_id),),
             ).fetchall()
-            curve_rows = connection.execute(
-                f"""
-                SELECT {time_expr} close_timestamp,
-                       COALESCE(h.net_profit, 0) change_amount
-                FROM mt5_history_deals h
-                JOIN deployments d ON d.id = h.deployment_id
-                {where}
-                ORDER BY {time_expr}, h.updated_at, h.id
-                """,
-                params,
-            ).fetchall()
+
+            curve_start = start_ts if start_ts is not None else summary_first_timestamp
+            curve_end = end_ts if end_ts is not None else now_ts
+            span_seconds = max(0, curve_end - curve_start) if curve_start else 10 * 86400 + 1
+            if span_seconds <= 3 * 86400 and curve_start >= detail_cutoff:
+                curve_granularity = "order"
+                curve_rows = connection.execute(
+                    f"""
+                    SELECT {time_expr} close_timestamp,
+                           COALESCE(h.net_profit, 0) change_amount
+                    FROM mt5_history_deals h
+                    JOIN deployments d ON d.id = h.deployment_id
+                    {where}
+                    ORDER BY {time_expr}, h.updated_at, h.id
+                    """,
+                    params,
+                ).fetchall()
+            else:
+                curve_granularity = "hour" if span_seconds <= 10 * 86400 else "day"
+                curve_clauses = ["user_id = ?", "bucket_type = ?"]
+                curve_params: list[Any] = [str(user_id), curve_granularity]
+                if deployment_id:
+                    curve_clauses.append("deployment_id = ?")
+                    curve_params.append(deployment_id)
+                if symbol:
+                    curve_clauses.append("UPPER(symbol) = UPPER(?)")
+                    curve_params.append(symbol)
+                if start_ts is not None:
+                    curve_clauses.append("bucket_start >= ?")
+                    curve_params.append(_bucket_timestamp(start_ts, curve_granularity))
+                if end_ts is not None:
+                    curve_clauses.append("bucket_start <= ?")
+                    curve_params.append(_bucket_timestamp(end_ts, curve_granularity))
+                curve_rows = connection.execute(
+                    f"""
+                    SELECT bucket_start close_timestamp, COALESCE(SUM(net_profit), 0) change_amount
+                    FROM mt_order_time_summaries
+                    WHERE {' AND '.join(curve_clauses)}
+                    GROUP BY bucket_start
+                    ORDER BY bucket_start
+                    """,
+                    curve_params,
+                ).fetchall()
 
         orders = []
         for row in rows:
@@ -4071,12 +4473,13 @@ class SqliteStore:
             change = float(row["change_amount"] or 0)
             cumulative = round(cumulative + change, 2)
             curve.append({
-                "time": datetime.fromtimestamp(int(row["close_timestamp"]), timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "time": datetime.fromtimestamp(int(row["close_timestamp"]), LOCAL_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
                 "change": round(change, 2),
                 "pnl": cumulative,
             })
 
-        total = int(summary["total"] or 0) if summary else 0
+        total = int(detail_summary_row["total"] or 0) if detail_summary_row else 0
+        summary_total = int(summary["total"] or 0) if summary else 0
         wins = int(summary["wins"] or 0) if summary else 0
         losses = int(summary["losses"] or 0) if summary else 0
         return {
@@ -4086,14 +4489,16 @@ class SqliteStore:
             "pages": max(1, (total + normalized_size - 1) // normalized_size),
             "list": orders,
             "summary": {
-                "total": total,
+                "total": summary_total,
                 "wins": wins,
                 "losses": losses,
-                "win_rate": round((wins / total) * 100, 2) if total else 0,
+                "win_rate": round((wins / summary_total) * 100, 2) if summary_total else 0,
                 "pnl": round(float(summary["pnl"] or 0), 2) if summary else 0,
                 "symbol_count": int(summary["symbol_count"] or 0) if summary else 0,
             },
             "curve": curve,
+            "curve_granularity": curve_granularity,
+            "detail_retention_days": retention_days,
             "filters": {
                 "deployments": list(deployment_map.values()),
                 "symbols": [str(row["symbol"] or "") for row in symbol_rows],
@@ -5449,6 +5854,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_ai_cache_table()
         self._ensure_mysql_ea_download_table()
         self._ensure_mysql_guide_article_table()
+        self._ensure_mysql_order_summary_table()
         required_tables = {
             "users",
             "email_verification_codes",
@@ -5462,6 +5868,8 @@ class MySQLStore(SqliteStore):
             "heartbeats",
             "execution_reports",
             "mt5_history_deals",
+            "mt_order_time_summaries",
+            "mt_order_archived_deals",
             "ai_templates",
             "ai_endpoints",
             "ai_user_quotas",
@@ -5492,6 +5900,57 @@ class MySQLStore(SqliteStore):
         self._ensure_existing_users()
         self._backfill_ai_usage_monthly_summaries()
         self._backfill_ai_cache_stats()
+        self._backfill_order_time_summaries()
+
+    def _ensure_mysql_order_summary_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mt_order_time_summaries (
+                    id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL,
+                    deployment_id VARCHAR(128) NOT NULL,
+                    account_login VARCHAR(64) NOT NULL DEFAULT '',
+                    account_server VARCHAR(128) NOT NULL DEFAULT '',
+                    symbol VARCHAR(32) NOT NULL DEFAULT '',
+                    bucket_type VARCHAR(8) NOT NULL,
+                    bucket_start BIGINT NOT NULL,
+                    order_count BIGINT NOT NULL DEFAULT 0,
+                    win_count BIGINT NOT NULL DEFAULT 0,
+                    loss_count BIGINT NOT NULL DEFAULT 0,
+                    total_volume DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    gross_profit DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    gross_loss DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    commission DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    swap DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    net_profit DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_mt_order_summary_dimension (
+                        deployment_id, account_login, account_server, symbol, bucket_type, bucket_start
+                    ),
+                    KEY idx_mt_order_summary_user_bucket (user_id, bucket_type, bucket_start),
+                    KEY idx_mt_order_summary_deployment_bucket (deployment_id, bucket_type, bucket_start),
+                    CONSTRAINT fk_mt_order_summary_deployment
+                        FOREIGN KEY (deployment_id) REFERENCES deployments(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mt_order_archived_deals (
+                    account_login VARCHAR(64) NOT NULL,
+                    account_server VARCHAR(128) NOT NULL DEFAULT '',
+                    deal_id VARCHAR(128) NOT NULL,
+                    deployment_id VARCHAR(128) NOT NULL,
+                    close_time BIGINT NOT NULL DEFAULT 0,
+                    archived_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (account_login, account_server, deal_id),
+                    KEY idx_mt_order_archive_deployment (deployment_id, close_time)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
 
     def _ensure_mysql_ea_download_table(self) -> None:
         with self._connect() as connection:
@@ -5700,6 +6159,15 @@ class MySQLStore(SqliteStore):
                 ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
                 """,
                 ("ai_cache_ttl_seconds", "120", "AI 相同请求缓存秒数", now),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("order_detail_retention_days", "365", "订单明细保存天数", now),
             )
 
     def _ensure_mysql_ai_cache_table(self) -> None:

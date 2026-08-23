@@ -248,9 +248,8 @@ def test_user_order_filters_stats_account_and_curve(tmp_path: Path) -> None:
     data = store.list_user_orders(user_id=user["id"], page=1, size=10)
     assert data["summary"] == {"total": 3, "wins": 2, "losses": 1, "win_rate": 66.67, "pnl": 75.0, "symbol_count": 2}
     assert data["list"][0]["account_login"] == "20002"
-    assert len(data["curve"]) == 3
-    assert data["curve"][0]["time"] == "2023-11-14 22:13:20"
-    assert data["curve"][1]["time"] == "2023-11-14 23:13:20"
+    assert data["curve_granularity"] == "day"
+    assert len(data["curve"]) == 2
     assert data["curve"][-1]["pnl"] == 75.0
 
     filtered = store.list_user_orders(
@@ -260,6 +259,79 @@ def test_user_order_filters_stats_account_and_curve(tmp_path: Path) -> None:
     assert filtered["total"] == 2
     assert filtered["summary"]["pnl"] == 125.0
     assert filtered["list"][0]["deployment_key"] == "gl_order_first"
+
+
+def test_order_summaries_are_idempotent_and_survive_detail_cleanup(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "order-summaries.db")
+    store.initialize()
+    user = store.save_user({"email": "order-summary@example.com", "status": "active"})
+    deployment = store.upsert_web_deployment(
+        "gl_order_summary", user_id=str(user["id"]), strategy_code="PA_AGENT_V1",
+        strategy_name="Summary", status="active", symbol="*", timeframe="*",
+        config={"deployment_key": "gl_order_summary"},
+    )
+    old_time = int((datetime.now(timezone.utc) - timedelta(days=400)).timestamp())
+    payload = [{
+        "order_id": "old-1", "symbol": "XAUUSD", "mt_type": "buy", "volume": 0.1,
+        "profit": 12, "commission": -1, "swap": -1, "close_time": old_time,
+    }]
+    store.sync_mt5_history_deals(
+        deployment["id"], account_login="10001", account_server="Demo", orders=payload,
+    )
+    store.sync_mt5_history_deals(
+        deployment["id"], account_login="10001", account_server="Demo", orders=payload,
+    )
+    before = store.list_user_orders(user_id=user["id"], page=1, size=10)
+    assert before["summary"]["total"] == 1
+    assert before["summary"]["pnl"] == 10.0
+
+    assert store.cleanup_expired_order_details() == 1
+    after = store.list_user_orders(user_id=user["id"], page=1, size=10)
+    assert after["total"] == 0
+    assert after["summary"]["total"] == 1
+    assert after["summary"]["pnl"] == 10.0
+    assert after["curve"][-1]["pnl"] == 10.0
+    repeated = store.sync_mt5_history_deals(
+        deployment["id"], account_login="10001", account_server="Demo", orders=payload,
+    )
+    assert repeated["archived_count"] == 1
+    assert store.list_user_orders(user_id=user["id"], page=1, size=10)["total"] == 0
+
+
+def test_order_curve_uses_requested_time_granularity(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "order-granularity.db")
+    store.initialize()
+    user = store.save_user({"email": "order-granularity@example.com", "status": "active"})
+    deployment = store.upsert_web_deployment(
+        "gl_order_granularity", user_id=str(user["id"]), strategy_code="PA_AGENT_V1",
+        strategy_name="Granularity", status="active", symbol="*", timeframe="*",
+        config={"deployment_key": "gl_order_granularity"},
+    )
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    orders = [
+        {"order_id": str(index), "symbol": "EURUSD", "net_profit": index + 1,
+         "close_time": int((now - timedelta(hours=index * 12)).timestamp())}
+        for index in range(24)
+    ]
+    store.sync_mt5_history_deals(
+        deployment["id"], account_login="20002", account_server="Demo", orders=orders,
+    )
+
+    three_days = store.list_user_orders(
+        user_id=user["id"], page=1, size=10,
+        start_at=(now - timedelta(days=3)).isoformat(), end_at=now.isoformat(),
+    )
+    ten_days = store.list_user_orders(
+        user_id=user["id"], page=1, size=10,
+        start_at=(now - timedelta(days=10)).isoformat(), end_at=now.isoformat(),
+    )
+    eleven_days = store.list_user_orders(
+        user_id=user["id"], page=1, size=10,
+        start_at=(now - timedelta(days=11)).isoformat(), end_at=now.isoformat(),
+    )
+    assert three_days["curve_granularity"] == "order"
+    assert ten_days["curve_granularity"] == "hour"
+    assert eleven_days["curve_granularity"] == "day"
 
 
 def test_user_can_pause_resume_and_soft_delete_own_strategy(tmp_path: Path) -> None:
