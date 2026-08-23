@@ -636,29 +636,49 @@ class AiDecisionClient:
         }
         if strict_json:
             body["response_format"] = {"type": "json_object"}
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = request.Request(
-            url,
-            data=payload,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with request.urlopen(req, timeout=self.timeout) as response:
-                return response.read().decode("utf-8")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"AI provider HTTP {exc.code}: {detail[:500]}") from exc
-        except TimeoutError as exc:
-            raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
-        except SocketTimeout as exc:
-            raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"AI provider connection failed: {exc.reason}; model={model}, url={url}") from exc
+        attempts = [body]
+        if strict_json:
+            compatible_body = dict(body)
+            compatible_body.pop("response_format", None)
+            attempts.append(compatible_body)
+
+        first_compatibility_error = ""
+        for index, attempt_body in enumerate(attempts):
+            payload = json.dumps(attempt_body, ensure_ascii=False).encode("utf-8")
+            req = request.Request(
+                url,
+                data=payload,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with request.urlopen(req, timeout=self.timeout) as response:
+                    return response.read().decode("utf-8")
+            except error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if index == 0 and strict_json and exc.code in {400, 404, 422}:
+                    first_compatibility_error = detail[:500]
+                    logger.info(
+                        "AI provider rejected response_format; retrying compatible request: model=%s, url=%s, status=%s",
+                        model,
+                        url,
+                        exc.code,
+                    )
+                    continue
+                suffix = f"; initial response_format error: {first_compatibility_error}" if first_compatibility_error else ""
+                raise RuntimeError(f"AI provider HTTP {exc.code}: {detail[:500]}; url={url}{suffix}") from exc
+            except TimeoutError as exc:
+                raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+            except SocketTimeout as exc:
+                raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+            except error.URLError as exc:
+                raise RuntimeError(f"AI provider connection failed: {exc.reason}; model={model}, url={url}") from exc
+
+        raise RuntimeError(f"AI provider request failed: model={model}, url={url}")
 
     def _repair_json_response(
         self,

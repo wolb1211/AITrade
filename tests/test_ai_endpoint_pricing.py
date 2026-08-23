@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
-from urllib import request
+from urllib import error, request
 
 from app.services.ai_service import AiDecisionClient
 from app.store import SqliteStore
@@ -46,6 +47,48 @@ def test_full_chat_completions_url_and_bearer_header_are_supported(tmp_path: Pat
     assert captured["url"] == "https://api.example.com/v1/chat/completions"
     assert captured["authorization"] == "Bearer sk-header-only"
     assert "api_key" not in captured["body"]
+
+
+def test_response_format_rejection_retries_openai_compatible_body(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "response-format-fallback.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    request_bodies = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{\\"status\\":\\"ok\\"}"}}]}'
+
+    def fake_urlopen(req: request.Request, timeout: float):
+        request_bodies.append(json.loads((req.data or b"{}").decode("utf-8")))
+        if len(request_bodies) == 1:
+            raise error.HTTPError(
+                req.full_url,
+                404,
+                "unsupported request format",
+                hdrs=None,
+                fp=BytesIO(b'{"error":{"message":"request path format is incorrect"}}'),
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(request, "urlopen", fake_urlopen)
+    result = client.test_configuration(
+        base_url="https://api.example.com/v1",
+        api_key="sk-fallback-test",
+        model="example-model",
+        strict_json=True,
+    )
+
+    assert result["success"] is True
+    assert len(request_bodies) == 2
+    assert request_bodies[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in request_bodies[1]
 
 
 def test_ai_endpoint_connection_test_does_not_create_billing_log(tmp_path: Path, monkeypatch) -> None:
