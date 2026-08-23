@@ -48,6 +48,7 @@ from app.models import (
 )
 from app.services.decision_service import DecisionService
 from app.services.auth_service import AuthError, UserAuthService
+from app.services.ai_service import AiDecisionClient
 from app.store import SqliteStore
 
 
@@ -632,9 +633,11 @@ def create_mt5_executions_router(
 def create_admin_ai_router(
     store: SqliteStore,
     *,
+    ai_client: AiDecisionClient | None = None,
     admin_jwt_secret: str = "",
     require_admin_auth: bool = False,
 ) -> APIRouter:
+    endpoint_test_client = ai_client or AiDecisionClient(store)
     def require_admin(authorization: str = Header(default="")) -> None:
         if not require_admin_auth:
             return
@@ -970,6 +973,16 @@ def create_admin_ai_router(
             payload[field] = format(price, "f")
         return ok(store.save_ai_endpoint(payload), "saved")
 
+    @router.post("/endpoint/test")
+    def endpoint_test(payload: dict[str, object]) -> dict[str, object]:
+        endpoint_id = str(payload.get("id") or "").strip()
+        if not endpoint_id:
+            raise HTTPException(status_code=400, detail="endpoint_id_required")
+        try:
+            return ok(endpoint_test_client.test_endpoint(endpoint_id), "connection_successful")
+        except (RuntimeError, ValueError, TimeoutError) as exc:
+            return ok({"success": False, "error": str(exc)}, "connection_failed")
+
     @router.post("/endpoint/delete")
     def endpoint_delete(payload: dict[str, object]) -> dict[str, object]:
         endpoint_id = str(payload.get("id") or "").strip()
@@ -1050,8 +1063,13 @@ def create_admin_ai_router(
     return router
 
 
-def create_auth_router(auth_service: UserAuthService) -> APIRouter:
+def create_auth_router(
+    auth_service: UserAuthService,
+    *,
+    ai_client: AiDecisionClient | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api/v1/auth", default_response_class=AsciiJSONResponse)
+    custom_ai_test_client = ai_client or AiDecisionClient(auth_service.store)
 
     def ok(data: object = None, message: str = "success") -> dict[str, object]:
         return {"code": 0, "data": data if data is not None else {}, "message": message}
@@ -1143,6 +1161,24 @@ def create_auth_router(auth_service: UserAuthService) -> APIRouter:
     def user_ai_model_options(authorization: str = Header(default="")) -> dict[str, object]:
         token = bearer_token(authorization)
         return execute(lambda: auth_service.ai_model_options(token))
+
+    @router.post("/custom-ai/test")
+    def test_custom_ai(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        execute(lambda: auth_service.me(token))
+        try:
+            result = custom_ai_test_client.test_configuration(
+                base_url=str(payload.get("base_url") or ""),
+                model=str(payload.get("model") or ""),
+                api_key=str(payload.get("api_key") or ""),
+                strict_json=True,
+            )
+            return ok(result, "connection_successful")
+        except (RuntimeError, ValueError, TimeoutError) as exc:
+            return ok({"success": False, "error": str(exc)}, "connection_failed")
 
     @router.get("/ea-downloads")
     def user_ea_downloads(authorization: str = Header(default="")) -> dict[str, object]:

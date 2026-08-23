@@ -148,10 +148,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(create_mt5_executions_router(store, service))
     application.include_router(create_admin_ai_router(
         store,
+        ai_client=ai_client,
         admin_jwt_secret=resolved.admin_jwt_secret,
         require_admin_auth=resolved.environment == "production" or bool(resolved.admin_jwt_secret),
     ))
-    application.include_router(create_auth_router(auth_service))
+    application.include_router(create_auth_router(auth_service, ai_client=ai_client))
     application.state.settings = resolved
     application.state.store = store
     return application

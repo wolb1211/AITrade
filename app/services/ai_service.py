@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from socket import timeout as SocketTimeout
 from threading import Lock
+from time import perf_counter
 from typing import Any
 from urllib import error, request
 
@@ -103,6 +104,81 @@ class AiDecisionClient:
                 },
             },
         )
+
+    def test_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        """Make a minimal provider call without billing, caching, or usage logging."""
+        endpoint = self.store.get_private_ai_endpoint(endpoint_id)
+        if endpoint is None:
+            raise RuntimeError("ai_endpoint_not_found")
+        return self.test_configuration(
+            base_url=str(endpoint.get("base_url") or endpoint.get("provider_base_url") or ""),
+            api_key=str(endpoint.get("api_key") or endpoint.get("provider_api_key") or ""),
+            model=str(endpoint.get("model") or endpoint.get("name") or ""),
+            strict_json=bool(endpoint.get("strict_json", True)),
+            endpoint_id=endpoint_id,
+        )
+
+    def test_configuration(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        strict_json: bool = True,
+        endpoint_id: str = "",
+    ) -> dict[str, Any]:
+        """Test an unsaved OpenAI-compatible configuration without side effects."""
+        base_url = str(base_url or "").strip()
+        api_key = str(api_key or "").strip()
+        model = str(model or "").strip()
+        if not base_url:
+            raise RuntimeError("ai_endpoint_base_url_missing")
+        if not api_key:
+            raise RuntimeError("ai_endpoint_api_key_missing")
+        if not model:
+            raise RuntimeError("ai_endpoint_model_missing")
+
+        started_at = perf_counter()
+        raw_response = self._post_chat_completion(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system_prompt="You are an API connection tester. Follow the user's output instruction exactly.",
+            user_prompt=(
+                'Return only this JSON object: {"status":"ok","message":"connection successful"}'
+                if strict_json else "Reply with exactly: OK"
+            ),
+            max_tokens=256,
+            strict_json=strict_json,
+        )
+        elapsed_ms = max(1, round((perf_counter() - started_at) * 1000))
+        try:
+            parsed = json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"AI provider returned invalid JSON: {_preview_text(raw_response)}") from exc
+        choice = (parsed.get("choices") or [{}])[0] if isinstance(parsed, dict) else {}
+        message_payload = choice.get("message") if isinstance(choice, dict) else {}
+        if not isinstance(message_payload, dict):
+            message_payload = {}
+        content = str(message_payload.get("content") or "").strip()
+        if not content and message_payload.get("reasoning_content"):
+            content = str(message_payload.get("reasoning_content") or "").strip()
+        if not content:
+            raise RuntimeError(f"AI provider response content empty: {_preview_text(raw_response)}")
+        if strict_json:
+            _extract_json_object(content)
+        usage = parsed.get("usage") if isinstance(parsed, dict) else {}
+        usage = usage if isinstance(usage, dict) else {}
+        return {
+            "success": True,
+            "endpoint_id": endpoint_id,
+            "model": model,
+            "elapsed_ms": elapsed_ms,
+            "response_preview": _preview_text(content, limit=200),
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        }
 
     def pa_position_decision(
         self,
@@ -580,6 +656,8 @@ class AiDecisionClient:
             raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
         except SocketTimeout as exc:
             raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"AI provider connection failed: {exc.reason}; model={model}, url={url}") from exc
 
     def _repair_json_response(
         self,

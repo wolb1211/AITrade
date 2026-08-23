@@ -8,6 +8,67 @@ from app.services.ai_service import AiDecisionClient
 from app.store import SqliteStore
 
 
+def test_ai_endpoint_connection_test_does_not_create_billing_log(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "endpoint-connection-test.db")
+    store.initialize()
+    store.save_ai_endpoint({
+        "id": "aie_connection_test",
+        "owner_type": "gl",
+        "name": "Connection test",
+        "base_url": "https://example.com/v1",
+        "model": "example-model",
+        "api_key": "sk-connection-test",
+        "strict_json": True,
+    })
+    client = AiDecisionClient(store)
+    provider_args = {}
+
+    def fake_provider(**kwargs):
+        provider_args.update(kwargs)
+        return json.dumps({
+            "choices": [{"message": {"content": '{"status":"ok"}'}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+        })
+
+    monkeypatch.setattr(client, "_post_chat_completion", fake_provider)
+    result = client.test_endpoint("aie_connection_test")
+
+    assert result["success"] is True
+    assert result["model"] == "example-model"
+    assert result["total_tokens"] == 12
+    assert provider_args["strict_json"] is True
+    assert store.list_ai_usage_logs(page=1, size=10)["total"] == 0
+
+
+def test_unsaved_custom_ai_connection_test_has_no_side_effects(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "custom-connection-test.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    provider_args = {}
+
+    def fake_provider(**kwargs):
+        provider_args.update(kwargs)
+        return json.dumps({
+            "choices": [{"message": {"content": '{"status":"ok"}'}}],
+            "usage": {"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9},
+        })
+
+    monkeypatch.setattr(client, "_post_chat_completion", fake_provider)
+    result = client.test_configuration(
+        base_url="https://custom.example.com/v1",
+        api_key="sk-custom-test",
+        model="custom-model",
+    )
+
+    assert result["success"] is True
+    assert result["endpoint_id"] == ""
+    assert result["total_tokens"] == 9
+    assert provider_args["base_url"] == "https://custom.example.com/v1"
+    assert provider_args["api_key"] == "sk-custom-test"
+    assert provider_args["strict_json"] is True
+    assert store.list_ai_usage_logs(page=1, size=10)["total"] == 0
+
+
 def test_ai_endpoint_prices_are_saved_per_model(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "pricing.db")
     store.initialize()
