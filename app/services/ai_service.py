@@ -399,7 +399,7 @@ class AiDecisionClient:
             system_prompt="You are an image recognition tester. Follow the output instruction exactly.",
             user_prompt="Identify the two colored shapes from left to right. Reply exactly: RED CIRCLE, BLUE SQUARE",
             user_image_url=_VISION_TEST_IMAGE_DATA_URL,
-            max_tokens=32,
+            max_tokens=512,
             strict_json=False,
         )
         elapsed_ms = max(1, round((perf_counter() - started_at) * 1000))

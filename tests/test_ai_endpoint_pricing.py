@@ -128,9 +128,9 @@ def test_vision_parameter_rejection_retries_new_and_minimal_parameters(tmp_path:
 
     assert result["success"] is True
     assert len(request_bodies) == 3
-    assert request_bodies[0]["max_tokens"] == 32
+    assert request_bodies[0]["max_tokens"] == 512
     assert request_bodies[0]["temperature"] == 0
-    assert request_bodies[1]["max_completion_tokens"] == 32
+    assert request_bodies[1]["max_completion_tokens"] == 512
     assert "temperature" not in request_bodies[1]
     assert "max_tokens" not in request_bodies[1]
     assert "max_tokens" not in request_bodies[2]
