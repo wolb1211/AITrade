@@ -1567,6 +1567,14 @@ class SqliteStore:
                 config["open_logic"] = str(payload.get("open_logic") or "").strip()
             if "position_logic" in payload:
                 config["position_logic"] = str(payload.get("position_logic") or "").strip()
+            if "ea_description" in payload:
+                ea_description = str(payload.get("ea_description") or "").strip()
+                if len(ea_description) > 1000:
+                    raise RuntimeError("invalid_strategy_description")
+                config["ea_description"] = ea_description
+            compiled_config = payload.get("_compiled_config")
+            if isinstance(compiled_config, dict):
+                config.update(compiled_config)
             for prefix in ("open", "position"):
                 data_type = str(payload.get(f"{prefix}_data_type") or config.get(f"{prefix}_data_type") or "kline").strip().lower()
                 try:
@@ -4204,6 +4212,7 @@ class SqliteStore:
                 "strategy_code": deployment["strategy_code"],
                 "mt_login": str(deployment.get("mt_login") or ""),
                 "summary": str(official_strategy.get("summary") or config.get("summary") or "") if official_strategy else str(config.get("summary") or ""),
+                "ea_description": str(config.get("ea_description") or ""),
                 "strategy_type": str(config.get("strategy_type") or ("custom" if deployment["strategy_code"] == "CUSTOM_AI_V1" else "official")),
                 "open_logic": str(config.get("open_logic") or ""),
                 "position_logic": str(config.get("position_logic") or ""),

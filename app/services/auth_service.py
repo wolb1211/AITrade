@@ -160,6 +160,26 @@ class UserAuthService:
             (item for item in self.store.list_web_deployments(str(user["id"])) if item["id"] == deployment_id),
             None,
         )
+        if previous and previous.get("strategy_code") == "CUSTOM_AI_V1":
+            previous_config = dict(previous.get("config") or {})
+            next_open_logic = str(payload.get("open_logic", previous_config.get("open_logic") or "")).strip()
+            next_position_logic = str(payload.get("position_logic", previous_config.get("position_logic") or "")).strip()
+            logic_changed = (
+                next_open_logic != str(previous_config.get("open_logic") or "")
+                or next_position_logic != str(previous_config.get("position_logic") or "")
+            )
+            if logic_changed or payload.get("compiled_config") is not None:
+                if self.ai_client is None:
+                    raise AuthError("custom_strategy_compile_unavailable", 503)
+                try:
+                    compiled = self.ai_client.normalize_custom_strategy_compilation(
+                        payload.get("compiled_config"),
+                        open_logic=next_open_logic,
+                        position_logic=next_position_logic,
+                    )
+                except RuntimeError as exc:
+                    raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
+                payload = {**payload, "_compiled_config": compiled}
         try:
             deployment = self.store.update_user_deployment_settings(
                 user_id=int(user["id"]),
@@ -179,7 +199,7 @@ class UserAuthService:
                 open_logic != str(previous_config.get("open_logic") or "")
                 or position_logic != str(previous_config.get("position_logic") or "")
             )
-            if logic_changed:
+            if logic_changed and "_compiled_config" not in payload:
                 selected_data = {
                     f"{prefix}_{field}": config.get(f"{prefix}_{field}")
                     for prefix in ("open", "position")
@@ -213,14 +233,40 @@ class UserAuthService:
                 )
         return {"id": deployment["id"], "updated_at": deployment["updated_at"]}
 
-    def create_strategy(self, token: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+    def preview_custom_strategy(self, token: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+        prepared = {**payload, "strategy_code": "CUSTOM_AI_V1"}
+        deployment_id = str(payload.get("deployment_id") or "").strip()
+        if deployment_id:
+            user = self.me(token)
+            existing = next(
+                (item for item in self.store.list_web_deployments(str(user["id"])) if item["id"] == deployment_id),
+                None,
+            )
+            if existing is None or existing.get("strategy_code") != "CUSTOM_AI_V1":
+                raise AuthError("deployment_not_found", 404)
+            existing_config = dict(existing.get("config") or {})
+            for prefix in ("open", "position"):
+                if str(prepared.get(f"{prefix}_ai_mode") or "official") == "custom":
+                    prepared[f"{prefix}_ai_key"] = str(
+                        prepared.get(f"{prefix}_ai_key") or existing_config.get(f"{prefix}_ai_key") or ""
+                    )
+        return self.create_strategy(token, payload=prepared, preview_only=True)
+
+    def create_strategy(
+        self,
+        token: str,
+        *,
+        payload: dict[str, Any],
+        preview_only: bool = False,
+    ) -> dict[str, Any]:
         session_user = self.me(token)
         user = self.store.get_user(int(session_user["id"]))
         if user is None:
             raise AuthError("user_not_found", 404)
         if not bool(user.get("vip_active")):
             raise AuthError("vip_required", 403)
-        if int(user.get("strategy_count") or 0) >= int(user.get("max_strategy_keys") or 0):
+        is_existing_preview = preview_only and bool(str(payload.get("deployment_id") or "").strip())
+        if not is_existing_preview and int(user.get("strategy_count") or 0) >= int(user.get("max_strategy_keys") or 0):
             raise AuthError("strategy_key_limit_reached", 409)
         strategy_code = str(payload.get("strategy_code") or "PA_AGENT_V1").strip()
         is_custom_strategy = strategy_code == "CUSTOM_AI_V1"
@@ -229,8 +275,11 @@ class UserAuthService:
             raise AuthError("official_strategy_not_found", 404)
         open_logic = str(payload.get("open_logic") or "").strip()
         position_logic = str(payload.get("position_logic") or "").strip()
+        ea_description = str(payload.get("ea_description") or "").strip()
         if is_custom_strategy and (len(open_logic) < 5 or len(position_logic) < 5):
             raise AuthError("custom_strategy_logic_required")
+        if len(ea_description) > 1000:
+            raise AuthError("invalid_strategy_description")
         custom_data: dict[str, Any] = {}
         if is_custom_strategy:
             for prefix in ("open", "position"):
@@ -258,6 +307,7 @@ class UserAuthService:
             config.update({
                 "open_logic": open_logic,
                 "position_logic": position_logic,
+                "ea_description": ea_description,
                 "indicator_output_count": 100,
                 "prompt_version": 1,
                 "compile_status": "pending",
@@ -315,6 +365,43 @@ class UserAuthService:
             "allow_add": bool(payload.get("allow_add", default_config.get("allow_add_position", False))),
             "ai_user_configured": True,
         })
+        if preview_only:
+            if not is_custom_strategy or self.ai_client is None:
+                raise AuthError("custom_strategy_compile_unavailable", 503)
+            temporary = {
+                "id": "",
+                "user_id": str(user["id"]),
+                "strategy_code": strategy_code,
+                "strategy_name": str(payload.get("name") or "自定义策略").strip(),
+                "config": config,
+            }
+            try:
+                compiled = self.ai_client.compile_custom_strategy(temporary)
+            except RuntimeError as exc:
+                raise AuthError(str(exc) or "custom_strategy_compile_failed", 502) from exc
+            self._apply_custom_compilation(config, compiled, custom_data)
+            fields = (
+                "summary", "open_prompt_template", "position_prompt_template",
+                "open_indicators", "position_indicators", "open_kline_count",
+                "position_kline_count", "open_requested_kline_count",
+                "position_requested_kline_count", "open_indicator_kline_count",
+                "position_indicator_kline_count", "open_data_type", "position_data_type",
+                "unsupported_indicators", "warnings", "prompt_version", "compile_status",
+            )
+            return {key: config[key] for key in fields}
+
+        if is_custom_strategy:
+            if self.ai_client is None:
+                raise AuthError("custom_strategy_compile_unavailable", 503)
+            try:
+                compiled = self.ai_client.normalize_custom_strategy_compilation(
+                    payload.get("compiled_config"),
+                    open_logic=open_logic,
+                    position_logic=position_logic,
+                )
+            except RuntimeError as exc:
+                raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
+            self._apply_custom_compilation(config, compiled, custom_data)
         raw_key = "gl_" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")
         config["deployment_key"] = raw_key
         deployment = self.store.upsert_web_deployment(
@@ -327,33 +414,28 @@ class UserAuthService:
             timeframe="*",
             config=config,
         )
-        if is_custom_strategy and self.ai_client is not None:
-            compiled = self.ai_client.compile_custom_strategy(deployment)
-            config.update(compiled)
-            for prefix in ("open", "position"):
-                selected_type = str(custom_data[f"{prefix}_data_type"])
-                selected_count = int(custom_data[f"{prefix}_kline_count"])
-                required_count = int(compiled.get(f"{prefix}_kline_count") or 100)
-                config[f"{prefix}_data_type"] = selected_type
-                config[f"{prefix}_requested_kline_count"] = selected_count
-                config[f"{prefix}_indicator_kline_count"] = required_count
-                config[f"{prefix}_kline_count"] = (
-                    max(selected_count, required_count) if selected_type in {"kline", "both"} else 1
-                )
-            deployment = self.store.upsert_web_deployment(
-                raw_key,
-                user_id=str(user["id"]),
-                strategy_code=strategy_code,
-                strategy_name=str(payload.get("name") or "自定义策略").strip(),
-                status="active" if str(payload.get("status") or "active") == "active" else "paused",
-                symbol="*",
-                timeframe="*",
-                config=config,
-            )
         mt_login = str(payload.get("mt_login") or "").strip()
         if mt_login:
             deployment = self.store.set_deployment_login(raw_key, mt_login) or deployment
         return {"id": deployment["id"], "deployment_key": raw_key, "status": deployment["status"]}
+
+    @staticmethod
+    def _apply_custom_compilation(
+        config: dict[str, Any],
+        compiled: dict[str, Any],
+        custom_data: dict[str, Any],
+    ) -> None:
+        config.update(compiled)
+        for prefix in ("open", "position"):
+            selected_type = str(custom_data[f"{prefix}_data_type"])
+            selected_count = int(custom_data[f"{prefix}_kline_count"])
+            required_count = int(compiled.get(f"{prefix}_kline_count") or 100)
+            config[f"{prefix}_data_type"] = selected_type
+            config[f"{prefix}_requested_kline_count"] = selected_count
+            config[f"{prefix}_indicator_kline_count"] = required_count
+            config[f"{prefix}_kline_count"] = (
+                max(selected_count, required_count) if selected_type in {"kline", "both"} else 1
+            )
 
     def usage(
         self,

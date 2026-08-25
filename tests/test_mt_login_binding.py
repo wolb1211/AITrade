@@ -68,7 +68,7 @@ def test_init_binds_only_mt_login(tmp_path: Path) -> None:
             status="active",
             symbol="*",
             timeframe="*",
-            config={"deployment_key": key},
+            config={"deployment_key": key, "ea_description": "EA端显示的用户填写说明"},
         )
 
         missing_account = client.post(
@@ -90,6 +90,7 @@ def test_init_binds_only_mt_login(tmp_path: Path) -> None:
         )
         assert first.status_code == 200
         assert first.json()["strategy"]["name"] == "MT login binding test"
+        assert first.json()["strategy"]["summary"] == "EA端显示的用户填写说明"
         assert store.find_deployment_by_key(key)["mt_login"] == "12345678"
 
         # Platform and server are deliberately different: only login is binding.

@@ -13,6 +13,7 @@ from urllib import error, request
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, UsageSummary
 from app.services.custom_indicators import (
+    INDICATOR_DEFINITIONS,
     calculate_indicator_payload,
     normalize_indicator_specs,
     public_indicator_catalog,
@@ -128,29 +129,124 @@ class AiDecisionClient:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
         open_logic = str(config.get("open_logic") or "").strip()
         position_logic = str(config.get("position_logic") or "").strip()
-        fallback = _custom_strategy_fallback(open_logic, position_logic)
-        result = self._chat_json(
+        open_result = self._chat_json(
             deployment=deployment,
-            endpoint="compile",
-            system_prompt=_custom_strategy_compile_prompt(),
+            endpoint="compile_open",
+            system_prompt=_custom_strategy_stage_compile_prompt("open"),
             user_payload={
-                "task": "compile_custom_trading_strategy",
-                "open_logic": open_logic,
-                "position_logic": position_logic,
+                "task": "compile_custom_open_strategy",
+                "stage": "open",
+                "user_logic": open_logic,
                 "available_indicators": public_indicator_catalog(),
                 "rules": {
                     "candlestick_patterns": "Do not create indicators for candlestick patterns; runtime supplies OHLCV arrays.",
                     "unsupported_indicator": "Put indicators outside available_indicators into unsupported_indicators.",
+                    "indicators": "Include every explicitly referenced built-in indicator and every period, such as EMA5 and EMA30.",
                     "data_type": "Use kline unless the rule explicitly requires a chart image or an unsupported custom indicator.",
-                    "execution": "Do not invent new action types. Position actions are hold, close, add, modify.",
+                    "execution": "Preserve entry direction, trigger, stop-loss and take-profit rules without inventing conditions.",
                 },
             },
         )
-        content = result.content if result is not None else {}
-        if not isinstance(content, dict) or not content.get("open_prompt_template"):
-            return fallback
-        open_specs, open_unsupported = normalize_indicator_specs(content.get("open_indicators"))
-        position_specs, position_unsupported = normalize_indicator_specs(content.get("position_indicators"))
+        position_result = self._chat_json(
+            deployment=deployment,
+            endpoint="compile_position",
+            system_prompt=_custom_strategy_stage_compile_prompt("position"),
+            user_payload={
+                "task": "compile_custom_position_strategy",
+                "stage": "position",
+                "user_logic": position_logic,
+                "available_indicators": public_indicator_catalog(),
+                "runtime_data_contract": {
+                    "positions": {
+                        "fields": ["ticket", "side", "volume", "open_price", "current_price", "profit", "sl", "tp"],
+                        "profit": "Account-currency P/L. Never compare it with ATR or another price distance.",
+                        "favorable_price_move": "BUY: current_price - open_price; SELL: open_price - current_price.",
+                    },
+                    "indicators": (
+                        "indicators.values is a map of alias arrays such as atr14, ema5 and ema30. Arrays are oldest "
+                        "to newest; [-1] is the latest closed candle and [-2] is the previous closed candle."
+                    ),
+                    "atr": "ATR is a price distance calculated from high, low and close; it is not account-currency profit.",
+                    "stop_safety": "A BUY stop may only move upward; a SELL stop may only move downward. Never loosen a stop.",
+                    "priority": "When a close condition and stop-modification condition trigger together, close takes priority.",
+                },
+                "rules": {
+                    "candlestick_patterns": "Do not create indicators for candlestick patterns; runtime supplies OHLCV arrays.",
+                    "unsupported_indicator": "Put indicators outside available_indicators into unsupported_indicators.",
+                    "indicators": "Include every explicitly referenced built-in indicator and every period, even when also used for opening.",
+                    "data_type": "Use kline unless the rule explicitly requires a chart image or an unsupported custom indicator.",
+                    "execution": "Do not invent new action types. Position actions are hold, close, add, modify.",
+                    "add_volume": (
+                        "If position rules request adding but do not define a lot calculation, preserve the add condition, "
+                        "state in the position template that lot must be null so the server uses the opening sizing algorithm, "
+                        "and add a Chinese warning explaining this default. If a calculation is defined, preserve it exactly."
+                    ),
+                    "partial_close": (
+                        "If position rules request partial close without a percentage or explicit volume, add a Chinese warning "
+                        "asking the user to specify it. The runtime template must hold instead of guessing a close volume."
+                    ),
+                },
+            },
+        )
+        open_content = open_result.content if open_result is not None else {}
+        position_content = position_result.content if position_result is not None else {}
+        open_prompt = str(
+            open_content.get("prompt_template") or open_content.get("open_prompt_template") or ""
+        ).strip() if isinstance(open_content, dict) else ""
+        position_prompt = str(
+            position_content.get("prompt_template") or position_content.get("position_prompt_template") or ""
+        ).strip() if isinstance(position_content, dict) else ""
+        if not open_prompt or not position_prompt:
+            raise RuntimeError("custom_strategy_compile_failed")
+        open_summary = _clean_stage_summary(open_content.get("summary"))
+        position_summary = _clean_stage_summary(position_content.get("summary"))
+        combined = {
+            "summary": "；".join(filter(None, (
+                f"开仓：{open_summary}" if open_summary else "",
+                f"持仓风控：{position_summary}" if position_summary else "",
+            ))),
+            "open_prompt_template": open_prompt,
+            "position_prompt_template": position_prompt,
+            "open_indicators": open_content.get("indicators") or open_content.get("open_indicators") or [],
+            "position_indicators": position_content.get("indicators") or position_content.get("position_indicators") or [],
+            "open_data_type": open_content.get("data_type") or open_content.get("open_data_type") or "kline",
+            "position_data_type": position_content.get("data_type") or position_content.get("position_data_type") or "kline",
+            "unsupported_indicators": [
+                *_as_list(open_content.get("unsupported_indicators")),
+                *_as_list(position_content.get("unsupported_indicators")),
+            ],
+            "warnings": [*_as_list(open_content.get("warnings")), *_as_list(position_content.get("warnings"))],
+        }
+        return self.normalize_custom_strategy_compilation(
+            combined,
+            open_logic=open_logic,
+            position_logic=position_logic,
+        )
+
+    def normalize_custom_strategy_compilation(
+        self,
+        content: Any,
+        *,
+        open_logic: str = "",
+        position_logic: str = "",
+    ) -> dict[str, Any]:
+        """Validate and normalize an AI compilation before previewing or persisting it."""
+        if not isinstance(content, dict):
+            raise RuntimeError("invalid_custom_strategy_compilation")
+        open_prompt = str(content.get("open_prompt_template") or "").strip()
+        position_prompt = str(content.get("position_prompt_template") or "").strip()
+        if not open_prompt or not position_prompt:
+            raise RuntimeError("invalid_custom_strategy_compilation")
+        open_detected = _extract_explicit_indicator_specs(open_logic)
+        position_detected = _extract_explicit_indicator_specs(position_logic)
+        open_specs, open_unsupported = normalize_indicator_specs([
+            *(content.get("open_indicators") if isinstance(content.get("open_indicators"), list) else []),
+            *open_detected,
+        ])
+        position_specs, position_unsupported = normalize_indicator_specs([
+            *(content.get("position_indicators") if isinstance(content.get("position_indicators"), list) else []),
+            *position_detected,
+        ])
         raw_unsupported = content.get("unsupported_indicators")
         unsupported_items = raw_unsupported if isinstance(raw_unsupported, list) else [raw_unsupported] if raw_unsupported else []
         unsupported = []
@@ -160,10 +256,12 @@ class AiDecisionClient:
                 unsupported.append(name)
         raw_warnings = content.get("warnings")
         warning_items = raw_warnings if isinstance(raw_warnings, list) else [raw_warnings] if raw_warnings else []
+        warnings = _reconcile_compilation_warnings(position_logic, warning_items)
+        position_prompt = _apply_position_template_guardrails(position_prompt, position_specs)
         return {
-            "summary": str(content.get("summary") or fallback["summary"]).strip()[:1000],
-            "open_prompt_template": str(content.get("open_prompt_template") or fallback["open_prompt_template"]).strip()[:8000],
-            "position_prompt_template": str(content.get("position_prompt_template") or fallback["position_prompt_template"]).strip()[:8000],
+            "summary": str(content.get("summary") or "").strip()[:1000],
+            "open_prompt_template": open_prompt[:8000],
+            "position_prompt_template": position_prompt[:8000],
             "open_indicators": open_specs,
             "position_indicators": position_specs,
             "open_kline_count": required_candle_count(open_specs),
@@ -171,8 +269,8 @@ class AiDecisionClient:
             "open_data_type": _custom_data_type(content.get("open_data_type"), unsupported),
             "position_data_type": _custom_data_type(content.get("position_data_type"), unsupported),
             "unsupported_indicators": unsupported[:20],
-            "warnings": [str(item)[:300] for item in warning_items if str(item).strip()][:10],
-            "prompt_version": 1,
+            "warnings": warnings[:10],
+            "prompt_version": 2,
             "compile_status": "generated",
         }
 
@@ -203,6 +301,7 @@ class AiDecisionClient:
                     "order": "oldest_to_latest",
                     "last_item": "latest_closed_candle",
                     "prices": "absolute market prices",
+                    "crossover_source": "indicators.crossovers is calculated deterministically by the server from the last two closed candles",
                 },
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
@@ -253,6 +352,7 @@ class AiDecisionClient:
                     "order": "oldest_to_latest",
                     "last_item": "latest_closed_candle",
                     "prices": "absolute market prices",
+                    "crossover_source": "indicators.crossovers is calculated deterministically by the server from the last two closed candles",
                 },
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
@@ -269,6 +369,8 @@ class AiDecisionClient:
                     "action": "hold|close|add|modify",
                     "ticket": "target ticket or null",
                     "direction": "buy|sell|null, required for add",
+                    "lot": "add volume or null; null tells server to use the opening sizing algorithm",
+                    "close_scope": "full|partial|null, required for close",
                     "volume": "close volume or null; null means full close",
                     "sl": "absolute stop-loss price or null",
                     "tp": "absolute take-profit price or null",
@@ -629,7 +731,10 @@ class AiDecisionClient:
                         "AI decision JSON recovered locally: %s",
                         f"{type(parse_exc).__name__}: {parse_exc}; response_preview={_preview_text(original_response_content)}",
                     )
-                    response_preview = _format_response_preview(raw=original_response_content, parsed=recovered)
+                    response_preview = _with_indicator_request_preview(
+                        _format_response_preview(raw=original_response_content, parsed=recovered),
+                        user_payload,
+                    )
                     cache_id = self._save_cache_result(
                         cache_key=cache_key,
                         cache_ttl_seconds=cache_ttl_seconds,
@@ -684,7 +789,10 @@ class AiDecisionClient:
                         response_preview=_format_response_preview(raw=original_response_content or response_content),
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
-            response_preview = _format_response_preview(raw=response_content, parsed=content)
+            response_preview = _with_indicator_request_preview(
+                _format_response_preview(raw=response_content, parsed=content),
+                user_payload,
+            )
             cache_id = self._save_cache_result(
                 cache_key=cache_key,
                 cache_ttl_seconds=cache_ttl_seconds,
@@ -829,7 +937,7 @@ class AiDecisionClient:
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        prefix = "open" if endpoint in {"open", "compile"} else "position"
+        prefix = "open" if endpoint in {"open", "compile", "compile_open"} else "position"
         if str(config.get(f"{prefix}_ai_mode") or "official") == "custom":
             base_url = str(config.get(f"{prefix}_ai_base_url") or config.get(f"{prefix}_ai_provider") or "").strip()
             model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
@@ -1075,14 +1183,25 @@ def _pa_system_prompt() -> str:
     )
 
 
-def _custom_strategy_compile_prompt() -> str:
-    return (
-        "You compile a user's natural-language trading rules into reusable prompt templates. "
-        "Preserve every condition and do not add trading conditions the user did not request. "
-        "Extract only indicators that must be calculated by the server. Candlestick sequences, engulfing, "
-        "pin bars, support, resistance, recent highs and recent lows are inferred directly from OHLCV and "
-        "must not be listed as indicators. Templates must tell the runtime model to apply the user's rule "
-        "strictly to supplied closed candles and calculated indicator arrays. Return Chinese template text."
+def _custom_strategy_stage_compile_prompt(stage: str) -> str:
+    common = (
+        "You compile one stage of a user's natural-language trading strategy into a reusable prompt template. "
+        "Analyze only the supplied stage. Preserve every condition and do not add conditions the user did not request. "
+        "Extract every explicitly referenced built-in indicator and period. Candlestick sequences, engulfing, pin bars, "
+        "support, resistance, recent highs and recent lows are inferred directly from OHLCV and are not indicators. "
+        "The template must apply the rule strictly to supplied closed candles and calculated indicator arrays. "
+    )
+    if stage == "open":
+        return common + (
+            "Preserve entry direction, trigger, stop-loss and take-profit semantics. Return Chinese summary, template and warnings."
+        )
+    return common + (
+        "Preserve hold, close, add, partial-close and stop modification semantics. Preserve an explicit add-lot formula; "
+        "when add has no sizing formula, declare that server opening sizing is used. Never invent a partial-close amount. "
+        "Write the template as clear Chinese instructions, not executable code or pseudocode. Follow runtime_data_contract "
+        "exactly. warnings must contain only user-actionable missing, ambiguous, unsupported or conflicting rules; never "
+        "put implementation notes, default data sources, array indexes or normal calculation conventions in warnings. "
+        "Return Chinese summary, template and warnings."
     )
 
 
@@ -1092,13 +1211,25 @@ def _custom_runtime_prompt(endpoint: str) -> str:
             "You execute a user-defined trading strategy. Apply the supplied user_rule and prompt_template "
             "strictly to closed OHLCV candles and indicator arrays. Candles are oldest to newest and the last "
             "item is the latest closed candle. Infer candlestick patterns directly from OHLCV. Do not invent "
-            "missing facts or prices. If every requested condition is not clearly satisfied, do not open. "
+            "missing facts or prices. For crossover rules, indicators.crossovers is the authoritative server-calculated "
+            "result; do not contradict it. In analysis, cite the relevant previous/latest values and crossover event. "
+            "If every requested condition is not clearly satisfied, do not open. "
             "Return absolute sl and tp prices when the rule defines them."
         )
     return (
         "You execute the position-management part of a user-defined trading strategy. Apply only the supplied "
         "user_rule and prompt_template to the closed candles, indicators and current positions. If no explicit "
-        "risk condition is met, hold. Use only hold, close, add or modify. Never close or add without a clear rule."
+        "risk condition is met, hold. Use only hold, close, add or modify. Never close or add without a clear rule. "
+        "Indicator arrays are in indicators.values keyed by aliases such as atr14 and ema5, oldest to newest; [-1] "
+        "is the latest closed candle. For crossover rules, indicators.crossovers is the authoritative server-calculated "
+        "result; do not contradict it. In analysis, cite the relevant previous/latest values and crossover event. "
+        "ATR is a price distance, while position.profit is account-currency P/L: never "
+        "compare them directly. For ATR-based favorable movement use BUY current_price-open_price and SELL "
+        "open_price-current_price. A BUY stop can only move up and a SELL stop can only move down; never loosen a stop. "
+        "If close and modify conditions both trigger, close has priority. "
+        "For add, return lot calculated strictly from an explicit user formula; if the user gave no lot formula, return "
+        "lot as null and let the server use opening sizing. For close, return close_scope as full or partial. A partial "
+        "close must include a positive volume calculated from the target position; otherwise hold instead of guessing."
     )
 
 
@@ -1119,7 +1250,7 @@ def _custom_strategy_fallback(open_logic: str, position_logic: str) -> dict[str,
         "position_data_type": "kline",
         "unsupported_indicators": [],
         "warnings": [],
-        "prompt_version": 1,
+        "prompt_version": 2,
         "compile_status": "fallback",
         "open_logic": open_logic,
         "position_logic": position_logic,
@@ -1135,12 +1266,123 @@ def _custom_data_type(value: Any, unsupported: list[str]) -> str:
     return normalized
 
 
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    return [] if value is None or value == "" else [value]
+
+
+def _clean_stage_summary(value: Any) -> str:
+    return str(value or "").strip().strip("；;。 ")
+
+
+def _extract_explicit_indicator_specs(logic: str) -> list[dict[str, Any]]:
+    """Extract unambiguous built-in indicator references such as EMA5 or ATR(14)."""
+    text = str(logic or "").lower()
+    if not text:
+        return []
+    definitions = {item.name: item for item in INDICATOR_DEFINITIONS}
+    names = sorted(definitions, key=len, reverse=True)
+    specs: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | None]] = set()
+    for name in [*names, "ma", "boll", "kdj", "stochastic"]:
+        canonical = {"ma": "sma", "boll": "bbands", "kdj": "stoch", "stochastic": "stoch"}.get(name, name)
+        pattern = re.compile(
+            rf"(?<![a-z_]){re.escape(name)}\s*(?:\(|（)?\s*(\d+(?:\.\d+)?)?\s*(?:\)|）)?(?![a-z_])",
+            re.IGNORECASE,
+        )
+        definition = definitions[canonical]
+        for match in pattern.finditer(text):
+            raw_period = match.group(1)
+            period = int(float(raw_period)) if raw_period else None
+            signature = (canonical, period)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            params = dict(definition.default_params)
+            if period is not None and "length" in params:
+                params["length"] = period
+            specs.append({"name": canonical, "source": "close", "params": params})
+    return specs
+
+
+def _reconcile_compilation_warnings(position_logic: str, raw_warnings: list[Any]) -> list[str]:
+    text = str(position_logic or "").strip().lower()
+    has_add = bool(re.search(r"加仓|补仓|增仓|add\s*(?:position)?|pyramid", text, re.IGNORECASE))
+    has_partial_close = bool(re.search(r"部分平仓|减仓|平(?:掉|掉仓)?\s*(?:一半|半仓|\d+(?:\.\d+)?\s*(?:%|％|手))|reduce", text, re.IGNORECASE))
+    warnings: list[str] = []
+    for raw in raw_warnings:
+        warning = str(raw or "").strip()[:300]
+        if not warning:
+            continue
+        lowered = warning.lower()
+        if re.search(r"默认(?:数据)?源|基于收盘价|索引|闭合性|不变更\s*input|default\s*source", lowered, re.IGNORECASE):
+            continue
+        if not has_add and re.search(r"加仓|补仓|增仓|add|pyramid|sizing", lowered, re.IGNORECASE):
+            continue
+        if not has_partial_close and re.search(r"部分平仓|减仓|partial\s*close|reduce", lowered, re.IGNORECASE):
+            continue
+        if not re.search(
+            r"不支持|无法|缺少|未指定|未明确|不明确|歧义|冲突|需要.{0,8}(?:截图|补充|确认)|数据不足|默认使用策略|请补充|unsupported|missing|ambiguous|conflict",
+            warning,
+            re.IGNORECASE,
+        ):
+            continue
+        if warning not in warnings:
+            warnings.append(warning)
+
+    if has_add:
+        has_add_sizing = bool(re.search(
+            r"(?:加仓|补仓|增仓).{0,30}(?:\d+(?:\.\d+)?\s*(?:倍|手|%|％)|一半|半仓|相同|同等|固定|仓位|手数|lot|比例)",
+            text,
+            re.IGNORECASE,
+        ))
+        default_warning = "未指定加仓手数计算方式，将默认使用策略的开仓仓位算法。"
+        if not has_add_sizing and not any("加仓" in item and ("手数" in item or "仓位" in item or "sizing" in item.lower()) for item in warnings):
+            warnings.append(default_warning)
+
+    if has_partial_close:
+        has_partial_size = bool(re.search(
+            r"(?:部分平仓|减仓|平(?:掉|掉仓)?).{0,30}(?:\d+(?:\.\d+)?\s*(?:%|％|手)|一半|半仓|三分之一|四分之一|比例|全部的)",
+            text,
+            re.IGNORECASE,
+        ))
+        partial_warning = "部分平仓规则未指定平仓比例或手数，请补充具体数量。"
+        if not has_partial_size and not any("部分平仓" in item or "减仓" in item for item in warnings):
+            warnings.append(partial_warning)
+    return warnings
+
+
+def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any]]) -> str:
+    marker = "【系统运行约束】"
+    cleaned = str(template or "").strip()
+    if marker in cleaned:
+        cleaned = cleaned.split(marker, 1)[0].rstrip()
+    cleaned = re.sub(r"\b([a-z][a-z0-9_]*)\s*\[\s*(\d+)\s*\]", r"\1\2", cleaned, flags=re.IGNORECASE)
+    if any(str(spec.get("name") or "") in {"atr", "natr"} for spec in specs):
+        lines = []
+        for line in cleaned.splitlines():
+            if re.search(r"\bprofit\b", line, re.IGNORECASE) and re.search(r"\b(?:n?atr)\d*\b", line, re.IGNORECASE):
+                line = re.sub(r"\bprofit\b", "favorable_price_move", line, flags=re.IGNORECASE)
+            lines.append(line)
+        cleaned = "\n".join(lines)
+    aliases = "、".join(str(spec.get("alias") or spec.get("name") or "") for spec in specs) or "无"
+    guardrails = (
+        f"{marker}\n"
+        f"1. 指标数组别名：{aliases}；数组按时间从旧到新排列，[-1] 是最新已收盘K线，[-2] 是上一根已收盘K线。\n"
+        "2. ATR是由最高价、最低价和收盘价计算的价格距离，不能与账户货币盈亏profit直接比较。"
+        "多单有利价格移动=current_price-open_price，空单有利价格移动=open_price-current_price。\n"
+        "3. 移动止损只能收紧：多单止损只能上移，空单止损只能下移，不得放宽已有止损。\n"
+        "4. 同时满足平仓和修改止损条件时，优先执行平仓；未明确触发任何条件时继续持有。"
+    )
+    return f"{cleaned}\n\n{guardrails}".strip()
+
+
 def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
-    if endpoint == "compile":
+    if endpoint.startswith("compile"):
         return (
             "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
-            "Required keys: summary, open_prompt_template, position_prompt_template, open_indicators, "
-            "position_indicators, open_data_type, position_data_type, unsupported_indicators, warnings. "
+            "Required keys: summary, prompt_template, indicators, data_type, unsupported_indicators, warnings. "
             "Each indicator item uses {name,source,params,alias}. data_type is kline, screenshot, or both. "
             f"Task: {task_prompt}"
         )
@@ -1150,7 +1392,7 @@ def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
         '"reason":"short Chinese reason","analysis":"detailed Chinese market and risk explanation"}'
         if endpoint == "open"
         else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
-        '"lot":0,"sl":null,"tp":null,'
+        '"lot":null,"close_scope":null,"volume":null,"sl":null,"tp":null,'
         '"reason":"short Chinese reason","analysis":"detailed Chinese position and risk explanation"}'
     )
     return (
@@ -1168,8 +1410,8 @@ def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
 
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
-    if endpoint == "compile":
-        return 1600
+    if endpoint.startswith("compile"):
+        return 1200
     if endpoint == "open":
         return 1000
     if endpoint == "position":
@@ -1372,6 +1614,25 @@ def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = N
     if parsed is not None:
         parts.append(f"解析结果:\n{_preview_text(json.dumps(parsed, ensure_ascii=False), 1600)}")
     return "\n\n".join(parts)[:3200]
+
+
+def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) -> str:
+    indicators = user_payload.get("indicators")
+    if not isinstance(indicators, dict):
+        return preview
+    recent_values = indicators.get("recent_values")
+    crossovers = indicators.get("crossovers")
+    if not recent_values and not crossovers:
+        return preview
+    snapshot = json.dumps(
+        {
+            "recent_values": recent_values or {},
+            "crossovers": crossovers or [],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"请求指标快照:\n{snapshot}\n\n{preview}"[:4000]
 
 def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
     if endpoint == "open":

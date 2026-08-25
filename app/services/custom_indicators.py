@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
+import math
 from typing import Any
 
 import pandas as pd
@@ -228,14 +230,64 @@ def calculate_indicator_payload(
     if values.empty:
         return {"order": "oldest_to_latest", "timestamps": [], "values": {}}
     valid = values.dropna(how="all").tail(max(10, min(int(output_count or 100), 300)))
+    compact_values = {
+        column: [_compact_number(item) for item in valid[column].tolist()]
+        for column in valid.columns
+    }
     return {
         "order": "oldest_to_latest",
         "timestamps": [int(frame.loc[index, "timestamp"]) for index in valid.index],
-        "values": {
-            column: [_compact_number(item) for item in valid[column].tolist()]
-            for column in valid.columns
+        "values": compact_values,
+        "recent_values": {
+            column: items[-3:]
+            for column, items in compact_values.items()
         },
+        "crossovers": _indicator_crossovers(compact_values),
     }
+
+
+def _indicator_crossovers(values: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    """Summarize the last closed-bar crossover for simple indicator series.
+
+    The raw arrays remain available to the model. This compact, deterministic
+    summary prevents a model from overlooking the previous value in a long
+    indicator array when the user rule explicitly depends on a crossover.
+    """
+    comparable = [
+        name for name, items in values.items()
+        if "." not in name and len(items) >= 2
+    ]
+    result: list[dict[str, Any]] = []
+    for left, right in combinations(comparable, 2):
+        if len(result) >= 30:
+            break
+        left_previous = _finite_number(values[left][-2])
+        left_latest = _finite_number(values[left][-1])
+        right_previous = _finite_number(values[right][-2])
+        right_latest = _finite_number(values[right][-1])
+        if None in {left_previous, left_latest, right_previous, right_latest}:
+            continue
+        event = "none"
+        if left_previous <= right_previous and left_latest > right_latest:
+            event = "left_crossed_above"
+        elif left_previous >= right_previous and left_latest < right_latest:
+            event = "left_crossed_below"
+        result.append({
+            "left": left,
+            "right": right,
+            "previous": {"left": left_previous, "right": right_previous},
+            "latest": {"left": left_latest, "right": right_latest},
+            "event": event,
+        })
+    return result
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _calculate_one(frame: pd.DataFrame, spec: dict[str, Any]) -> pd.Series | pd.DataFrame | None:

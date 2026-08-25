@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from app.models import OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision, UsageSummary
 from app.services.ai_service import AiDecisionClient
-from app.strategies.pa_agent_lite import _fixed_lot, _position_size_lot
+from app.strategies.pa_agent_lite import _position_size_lot
 
 
 class CustomAiStrategy:
@@ -67,12 +67,21 @@ class CustomAiStrategy:
         confidence = _confidence(content.get("confidence"))
         reason = _reason(content, "自定义风控条件未触发，继续持有")
         if action == "close":
-            volume = _positive_float(content.get("volume"))
+            close_scope = str(content.get("close_scope") or "").strip().lower()
+            requested_volume = _positive_float(content.get("volume"))
+            if close_scope == "partial" and requested_volume is None:
+                return self._position_hold(request, target.ticket, "部分平仓未明确手数或比例，未执行操作", usage=result.usage)
+            if close_scope == "partial" or requested_volume is not None:
+                volume = _normalized_partial_close_volume(requested_volume, target.volume, request.symbol_info or {})
+                if volume is None:
+                    return self._position_hold(request, target.ticket, "部分平仓手数不符合交易品种限制，未执行操作", usage=result.usage)
+            else:
+                volume = target.volume
             return TradeDecision(
                 decision_id=_decision_id(), request_id=request.request_id, status="APPROVED",
                 action="CLOSE", symbol=request.symbol, confidence=confidence, reason=reason,
                 expires_at=_expires_at(), position_ticket=target.ticket,
-                volume=min(volume, target.volume) if volume else target.volume, usage=result.usage,
+                volume=volume, usage=result.usage,
             )
         if action == "modify":
             sl = _optional_price(content.get("sl"))
@@ -93,11 +102,21 @@ class CustomAiStrategy:
             direction = str(content.get("direction") or target.side).strip().lower()
             direction = "buy" if direction == "buy" else "sell" if direction == "sell" else target.side.lower()
             entry = request.ask if direction == "buy" else request.bid
+            sl = _optional_price(content.get("sl"))
+            if sl is not None and not _valid_stop(direction, entry, sl):
+                return self._position_hold(request, target.ticket, "AI返回的加仓止损价方向无效，未执行加仓", usage=result.usage)
+            requested_lot = _positive_float(content.get("lot"))
+            if requested_lot is not None:
+                lot = _normalized_order_volume(requested_lot, request.symbol_info or {})
+            else:
+                if config.get("position_size_mode") == "risk" and sl is None:
+                    return self._position_hold(request, target.ticket, "缺少有效止损价，无法计算加仓手数", usage=result.usage)
+                lot = _position_size_lot(config, request, entry=entry, sl=sl)
             return TradeDecision(
                 decision_id=_decision_id(), request_id=request.request_id, status="APPROVED",
                 action="BUY" if direction == "buy" else "SELL", symbol=request.symbol,
                 confidence=confidence, reason=reason, expires_at=_expires_at(),
-                lot=_fixed_lot(config), entry=entry, sl=_optional_price(content.get("sl")),
+                lot=lot, entry=entry, sl=sl,
                 tp=_optional_price(content.get("tp")), usage=result.usage,
             )
         return self._position_hold(request, target.ticket, reason, confidence=confidence, usage=result.usage)
@@ -168,3 +187,44 @@ def _truthy_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _normalized_order_volume(volume: float, symbol_info: dict[str, Any]) -> float:
+    minimum, maximum, step = _volume_limits(symbol_info, fallback_max=volume)
+    capped = min(max(volume, minimum), maximum)
+    steps = int((capped + step * 1e-9) / step)
+    return round(max(minimum, steps * step), 8)
+
+
+def _normalized_partial_close_volume(
+    requested: float | None,
+    current: float,
+    symbol_info: dict[str, Any],
+) -> float | None:
+    if requested is None or requested <= 0 or requested >= current:
+        return None
+    minimum, _, step = _volume_limits(symbol_info, fallback_max=current)
+    if current < minimum * 2:
+        return None
+    maximum_partial = current - minimum
+    capped = min(requested, maximum_partial)
+    steps = int((capped + step * 1e-9) / step)
+    normalized = round(steps * step, 8)
+    if normalized < minimum or current - normalized < minimum - 1e-9:
+        return None
+    return normalized
+
+
+def _volume_limits(symbol_info: dict[str, Any], *, fallback_max: float) -> tuple[float, float, float]:
+    minimum = _first_positive(symbol_info, "volume_min", "lots_min", "min_lot", "minLot") or 0.01
+    maximum = _first_positive(symbol_info, "volume_max", "lots_max", "max_lot", "maxLot") or max(fallback_max, minimum)
+    step = _first_positive(symbol_info, "volume_step", "lots_step", "lot_step", "lotStep") or 0.01
+    return minimum, maximum, step
+
+
+def _first_positive(payload: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = _positive_float(payload.get(key))
+        if value is not None:
+            return value
+    return None

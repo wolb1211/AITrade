@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision
+from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision
 from app.services.ai_service import AiDecisionClient
 
 
@@ -140,16 +140,15 @@ class PaAgentLiteStrategy:
 
         ai_decision = self._evaluate_position_with_ai(request, deployment, features)
         if ai_decision is not None:
-            if ai_decision.action == "CLOSE" and _cooldown_blocks_close(request, position, features):
-                return _position_hold(
-                    request,
-                    self._decision_id(),
-                    position.ticket,
-                    _cooldown_reason(request, position, features),
-                    confidence=0.52,
-                    usage=ai_decision.usage,
-                )
-            return ai_decision
+            if ai_decision.action != "HOLD":
+                return ai_decision
+            protective_stop = _atr_protective_stop(
+                request,
+                position,
+                atr=features.atr14,
+                usage=ai_decision.usage,
+            )
+            return protective_stop or ai_decision
 
         open_signal = _open_direction(features)
         if position.side == "BUY" and open_signal == "SELL":
@@ -161,16 +160,9 @@ class PaAgentLiteStrategy:
                 return _position_hold(request, self._decision_id(), position.ticket, _cooldown_reason(request, position, features))
             return _close(request, self._decision_id(), position.ticket, "PA Agent detected opposite bullish price-action setup")
 
-        spread_price = abs(request.ask - request.bid)
-        trail_gap = max(features.atr14, spread_price * 5)
-        if position.side == "BUY" and position.profit > 0:
-            new_sl = max(position.sl or 0.0, request.bid - trail_gap)
-            if new_sl > 0 and (position.sl is None or new_sl > position.sl):
-                return _modify(request, self._decision_id(), position.ticket, "PA Agent moved buy stop under recent structure", sl=new_sl, tp=position.tp)
-        if position.side == "SELL" and position.profit > 0:
-            new_sl = request.ask + trail_gap
-            if position.sl is None or new_sl < position.sl:
-                return _modify(request, self._decision_id(), position.ticket, "PA Agent moved sell stop above recent structure", sl=new_sl, tp=position.tp)
+        protective_stop = _atr_protective_stop(request, position, atr=features.atr14)
+        if protective_stop is not None:
+            return protective_stop
 
         return _position_hold(request, self._decision_id(), position.ticket, "PA Agent position management conditions remain valid")
 
@@ -431,6 +423,61 @@ def _modify(
         sl=sl,
         tp=tp,
     )
+
+
+def _atr_protective_stop(
+    request: PositionEvaluateRequest,
+    position: PositionSnapshot,
+    *,
+    atr: float,
+    usage: Any = None,
+) -> TradeDecision | None:
+    """Apply the official strategy's deterministic break-even/trailing stop.
+
+    At 0.5 ATR favorable movement the stop moves to entry. Afterwards, whenever
+    price is at least 1 ATR away from the protected stop, the stop catches up to
+    0.5 ATR behind the executable market price. Stops are never loosened.
+    """
+    if atr <= 0:
+        return None
+
+    existing_sl = position.sl if position.sl is not None and position.sl > 0 else None
+    tolerance = max(1e-9, abs(position.open_price) * 1e-10)
+
+    if position.side == "BUY":
+        current_price = request.bid
+        if current_price - position.open_price < atr * 0.5:
+            return None
+        protected_sl = max(position.open_price, existing_sl or position.open_price)
+        reason = "浮盈达到0.5 ATR，止损移动到保本价"
+        if current_price - protected_sl >= atr:
+            protected_sl = max(protected_sl, current_price - atr * 0.5)
+            reason = "当前价格与止损相距达到1 ATR，止损跟进至距当前价格0.5 ATR"
+        if existing_sl is not None and protected_sl <= existing_sl + tolerance:
+            return None
+    else:
+        current_price = request.ask
+        if position.open_price - current_price < atr * 0.5:
+            return None
+        protected_sl = min(position.open_price, existing_sl or position.open_price)
+        reason = "浮盈达到0.5 ATR，止损移动到保本价"
+        if protected_sl - current_price >= atr:
+            protected_sl = min(protected_sl, current_price + atr * 0.5)
+            reason = "当前价格与止损相距达到1 ATR，止损跟进至距当前价格0.5 ATR"
+        if existing_sl is not None and protected_sl >= existing_sl - tolerance:
+            return None
+
+    decision = _modify(
+        request,
+        PaAgentLiteStrategy._decision_id(),
+        position.ticket,
+        reason,
+        sl=protected_sl,
+        tp=position.tp,
+    )
+    if usage is not None:
+        decision.usage = usage
+    return decision
 
 
 def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:

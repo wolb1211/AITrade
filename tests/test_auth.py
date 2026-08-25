@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -153,6 +154,68 @@ def test_authenticated_vip_user_can_create_strategy(tmp_path: Path) -> None:
     assert deployments[0]["id"] == created["id"]
     assert service.store.get_user_portal_data(prepared["user_id"])["strategies"][0]["name"] == "新策略"
     assert deployments[0]["config"]["risk_base_mode"] == "balance_percent"
+
+
+class FakeCustomStrategyCompiler:
+    def __init__(self) -> None:
+        self.compile_calls = 0
+
+    def compile_custom_strategy(self, deployment: dict[str, Any]) -> dict[str, Any]:
+        self.compile_calls += 1
+        return {
+            "summary": "EMA 均线交叉策略",
+            "open_prompt_template": "严格判断 EMA10 上穿 EMA20。",
+            "position_prompt_template": "没有触发风控条件时继续持有。",
+            "open_indicators": [{"name": "ema", "source": "close", "params": {"length": 20}, "alias": "ema20"}],
+            "position_indicators": [],
+            "open_kline_count": 80,
+            "position_kline_count": 60,
+            "open_data_type": "kline",
+            "position_data_type": "kline",
+            "unsupported_indicators": [],
+            "warnings": [],
+            "prompt_version": 1,
+            "compile_status": "generated",
+        }
+
+    def normalize_custom_strategy_compilation(self, content: Any, **_: Any) -> dict[str, Any]:
+        if not isinstance(content, dict) or not content.get("open_prompt_template") or not content.get("position_prompt_template"):
+            raise RuntimeError("invalid_custom_strategy_compilation")
+        return dict(content)
+
+
+def test_custom_strategy_is_previewed_before_key_is_created(tmp_path: Path) -> None:
+    service, email = create_service(tmp_path)
+    compiler = FakeCustomStrategyCompiler()
+    service.ai_client = compiler
+    prepared = service.register(email="custom@example.com", password="Password123")
+    session = service.verify_registration(email="custom@example.com", code=email.codes[("custom@example.com", "register")])
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    with service.store._connect() as connection:
+        connection.execute("UPDATE users SET vip_level = 1, vip_expires_at = ? WHERE id = ?", (expires_at, prepared["user_id"]))
+    endpoint = service.store.save_ai_endpoint({
+        "id": "aie_custom_preview", "owner_type": "gl", "name": "测试模型", "base_url": "https://example.com/v1",
+        "model": "test-model", "api_key": "sk-platform", "enabled": True, "selectable_by_user": True,
+    })
+    payload = {
+        "strategy_code": "CUSTOM_AI_V1", "name": "均线策略", "ea_description": "EA显示的均线策略说明", "open_logic": "EMA10 上穿 EMA20 时开多",
+        "position_logic": "出现反向交叉时平仓，否则继续持有", "open_data_type": "kline", "open_kline_count": 50,
+        "position_data_type": "kline", "position_kline_count": 50, "open_ai_mode": "official",
+        "open_ai_endpoint_id": endpoint["id"], "position_ai_mode": "official", "position_ai_endpoint_id": endpoint["id"],
+        "position_size_mode": "fixed", "fixed_volume": 0.01, "risk_amount": 100, "risk_percent": 1,
+        "max_positions": 1,
+    }
+    preview = service.preview_custom_strategy(session["token"], payload=payload)
+    assert compiler.compile_calls == 1
+    assert service.store.list_web_deployments(str(prepared["user_id"])) == []
+    assert preview["open_kline_count"] == 80
+    created = service.create_strategy(session["token"], payload={**payload, "compiled_config": preview})
+    assert compiler.compile_calls == 1
+    assert created["deployment_key"].startswith("gl_")
+    saved = service.store.list_web_deployments(str(prepared["user_id"]))[0]
+    assert saved["config"]["open_prompt_template"] == preview["open_prompt_template"]
+    assert saved["config"]["ea_description"] == "EA显示的均线策略说明"
+    assert service.store.get_user_portal_data(prepared["user_id"])["strategies"][0]["ea_description"] == "EA显示的均线策略说明"
 
 
 def test_agent_invite_registration_and_dashboard(tmp_path: Path) -> None:

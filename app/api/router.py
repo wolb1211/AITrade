@@ -478,7 +478,7 @@ def create_mt5_router(
         config = deployment["config"]
         official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
         strategy_name = deployment["strategy_name"]
-        strategy_summary = config.get("summary", "")
+        strategy_summary = config.get("ea_description") or config.get("summary", "")
         if official_strategy is not None:
             strategy_summary = official_strategy["summary"]
         return Mt5StrategyInitResponse(
@@ -1213,6 +1213,14 @@ def create_auth_router(
         token = bearer_token(authorization)
         execute(lambda: auth_service.me(token))
         return ok({"list": public_indicator_catalog(), "default_output_count": 100})
+
+    @router.post("/custom-strategy/preview")
+    def preview_custom_strategy(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.preview_custom_strategy(token, payload=payload))
 
     @router.get("/ea-downloads")
     def user_ea_downloads(authorization: str = Header(default="")) -> dict[str, object]:
