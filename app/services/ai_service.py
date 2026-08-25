@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from hashlib import sha256
 import logging
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 _VISION_TEST_IMAGE_DATA_URL = (
     "data:image/png;base64,"
-    "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"
+    "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"
 )
 
 
@@ -389,8 +390,8 @@ class AiDecisionClient:
             base_url=base_url,
             api_key=api_key,
             model=model,
-            system_prompt="You are an image recognition tester. Return only the digits visible in the image.",
-            user_prompt="Read the four digits in this image. Reply with digits only.",
+            system_prompt="You are an image recognition tester. Follow the output instruction exactly.",
+            user_prompt="Identify the two colored shapes from left to right. Reply exactly: RED CIRCLE, BLUE SQUARE",
             user_image_url=_VISION_TEST_IMAGE_DATA_URL,
             max_tokens=32,
             strict_json=False,
@@ -403,9 +404,13 @@ class AiDecisionClient:
         choice = (parsed.get("choices") or [{}])[0] if isinstance(parsed, dict) else {}
         message_payload = choice.get("message") if isinstance(choice, dict) else {}
         content = str(message_payload.get("content") or "").strip() if isinstance(message_payload, dict) else ""
-        recognized_digits = "".join(character for character in content if character.isdigit())
-        if "8264" not in recognized_digits:
-            raise RuntimeError(f"模型未能正确识别测试图片（期望 8264，返回：{_preview_text(content or raw_response)}）")
+        normalized_content = re.sub(r"[^A-Z\u4e00-\u9fff]", "", content.upper())
+        english_correct = "REDCIRCLE" in normalized_content and "BLUESQUARE" in normalized_content
+        chinese_correct = "红色圆" in normalized_content and "蓝色方" in normalized_content
+        if not (english_correct or chinese_correct):
+            raise RuntimeError(
+                f"模型未能正确识别测试图片（期望：红色圆形、蓝色方形；返回：{_preview_text(content or raw_response)}）"
+            )
         usage = parsed.get("usage") if isinstance(parsed, dict) else {}
         usage = usage if isinstance(usage, dict) else {}
         return {

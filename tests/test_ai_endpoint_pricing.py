@@ -169,7 +169,7 @@ def test_vision_test_sends_image_and_persists_capability(tmp_path: Path, monkeyp
     def fake_provider(**kwargs):
         provider_args.update(kwargs)
         return json.dumps({
-            "choices": [{"message": {"content": "8264"}}],
+            "choices": [{"message": {"content": "RED CIRCLE, BLUE SQUARE"}}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
         })
 
