@@ -899,8 +899,18 @@ class AiDecisionClient:
             compatible_body = dict(body)
             compatible_body.pop("response_format", None)
             attempts.append(compatible_body)
+        if user_image_url:
+            vision_compatible_body = dict(attempts[-1])
+            vision_compatible_body.pop("temperature", None)
+            vision_compatible_body.pop("max_tokens", None)
+            vision_compatible_body["max_completion_tokens"] = max_tokens
+            attempts.append(vision_compatible_body)
 
-        first_compatibility_error = ""
+            minimal_vision_body = dict(vision_compatible_body)
+            minimal_vision_body.pop("max_completion_tokens", None)
+            attempts.append(minimal_vision_body)
+
+        compatibility_errors: list[str] = []
         for index, attempt_body in enumerate(attempts):
             payload = json.dumps(attempt_body, ensure_ascii=False).encode("utf-8")
             req = request.Request(
@@ -918,16 +928,17 @@ class AiDecisionClient:
                     return response.read().decode("utf-8")
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
-                if index == 0 and strict_json and exc.code in {400, 404, 422}:
-                    first_compatibility_error = detail[:500]
+                if index < len(attempts) - 1 and exc.code in {400, 404, 422}:
+                    compatibility_errors.append(detail[:500])
                     logger.info(
-                        "AI provider rejected response_format; retrying compatible request: model=%s, url=%s, status=%s",
+                        "AI provider rejected request parameters; retrying compatible request: model=%s, url=%s, status=%s, attempt=%s",
                         model,
                         url,
                         exc.code,
+                        index + 1,
                     )
                     continue
-                suffix = f"; initial response_format error: {first_compatibility_error}" if first_compatibility_error else ""
+                suffix = f"; previous compatibility error: {compatibility_errors[0]}" if compatibility_errors else ""
                 raise RuntimeError(f"AI provider HTTP {exc.code}: {detail[:500]}; url={url}{suffix}") from exc
             except TimeoutError as exc:
                 raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc

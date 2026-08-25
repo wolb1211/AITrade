@@ -91,6 +91,52 @@ def test_response_format_rejection_retries_openai_compatible_body(tmp_path: Path
     assert "response_format" not in request_bodies[1]
 
 
+def test_vision_parameter_rejection_retries_new_and_minimal_parameters(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "vision-parameter-fallback.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    request_bodies = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"RED CIRCLE, BLUE SQUARE"}}]}'
+
+    def fake_urlopen(req: request.Request, timeout: float):
+        request_bodies.append(json.loads((req.data or b"{}").decode("utf-8")))
+        if len(request_bodies) < 3:
+            raise error.HTTPError(
+                req.full_url,
+                404,
+                "parameter error",
+                hdrs=None,
+                fp=BytesIO(b'{"error":{"message":"Parameter error"}}'),
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(request, "urlopen", fake_urlopen)
+    result = client.test_vision_configuration(
+        base_url="https://api.example.com/v1",
+        api_key="sk-vision-fallback",
+        model="vision-model",
+    )
+
+    assert result["success"] is True
+    assert len(request_bodies) == 3
+    assert request_bodies[0]["max_tokens"] == 32
+    assert request_bodies[0]["temperature"] == 0
+    assert request_bodies[1]["max_completion_tokens"] == 32
+    assert "temperature" not in request_bodies[1]
+    assert "max_tokens" not in request_bodies[1]
+    assert "max_tokens" not in request_bodies[2]
+    assert "max_completion_tokens" not in request_bodies[2]
+
+
 def test_ai_endpoint_connection_test_does_not_create_billing_log(tmp_path: Path, monkeypatch) -> None:
     store = SqliteStore(tmp_path / "endpoint-connection-test.db")
     store.initialize()
