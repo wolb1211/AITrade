@@ -224,7 +224,7 @@ def test_vision_test_sends_image_and_persists_capability(tmp_path: Path, monkeyp
     saved = store.get_ai_endpoint("aie_vision_test")
 
     assert result["supports_vision"] is True
-    assert provider_args["user_image_url"].startswith("data:image/png;base64,")
+    assert provider_args["user_image_url"].startswith("data:image/jpeg;base64,")
     assert saved is not None
     assert saved["supports_vision"] is True
     assert saved["vision_test_status"] == "passed"
