@@ -11,9 +11,20 @@ from typing import Any
 from urllib import error, request
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, UsageSummary
+from app.services.custom_indicators import (
+    calculate_indicator_payload,
+    normalize_indicator_specs,
+    public_indicator_catalog,
+    required_candle_count,
+)
 from app.store import SqliteStore
 
 logger = logging.getLogger(__name__)
+
+_VISION_TEST_IMAGE_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAPAAAABgCAIAAACsUWiGAAABbElEQVR42u3cUQrEIBBEQe9/6UhOEAiidlMP9nskFuwSlhmPVNR4P1JFQKsXtG8rBf/SAFpAS0BLQEtAC2igBbQEtAS0BLSABlpAnz797/+vmAU00EADDTTQQAMNNNBAAx0FeuHl7XTwOeuqw9z5DIEGGmiggQYaaKCBBhpooIEGGmiggQYaaKCBBhpooIEGGmiggQYaaKCBBhpooIEGGmiggQYaaKCBBhpooF0G0EADDTTQQAMNNNBAAw000C4DaKCB9gxtTrI5yZYmoM0CGmizgAbaLKAhA9pbDm8eQo8NNNBAAw000EADDTTQQAMNNNBAAw000EADDTTQQAMNNNBAAw000EADDTTQQAMNNNBAAw000EADDTTQQAMNNNBAAw000EADDTTQQAMNNNBAAw000EADbZtR8DYjoIEGGmiggQbaLKCBBhpoCWgJaAENtICWgJaAloAW0EALaAloCWgJaAEtpQe0GkFLNU07nX/NRiJJzgAAAABJRU5ErkJggg=="
+)
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,162 @@ class AiDecisionClient:
             },
         )
 
+    def compile_custom_strategy(self, deployment: dict[str, Any]) -> dict[str, Any]:
+        """Turn the user's natural-language rules into a reusable runtime definition."""
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        open_logic = str(config.get("open_logic") or "").strip()
+        position_logic = str(config.get("position_logic") or "").strip()
+        fallback = _custom_strategy_fallback(open_logic, position_logic)
+        result = self._chat_json(
+            deployment=deployment,
+            endpoint="compile",
+            system_prompt=_custom_strategy_compile_prompt(),
+            user_payload={
+                "task": "compile_custom_trading_strategy",
+                "open_logic": open_logic,
+                "position_logic": position_logic,
+                "available_indicators": public_indicator_catalog(),
+                "rules": {
+                    "candlestick_patterns": "Do not create indicators for candlestick patterns; runtime supplies OHLCV arrays.",
+                    "unsupported_indicator": "Put indicators outside available_indicators into unsupported_indicators.",
+                    "data_type": "Use kline unless the rule explicitly requires a chart image or an unsupported custom indicator.",
+                    "execution": "Do not invent new action types. Position actions are hold, close, add, modify.",
+                },
+            },
+        )
+        content = result.content if result is not None else {}
+        if not isinstance(content, dict) or not content.get("open_prompt_template"):
+            return fallback
+        open_specs, open_unsupported = normalize_indicator_specs(content.get("open_indicators"))
+        position_specs, position_unsupported = normalize_indicator_specs(content.get("position_indicators"))
+        raw_unsupported = content.get("unsupported_indicators")
+        unsupported_items = raw_unsupported if isinstance(raw_unsupported, list) else [raw_unsupported] if raw_unsupported else []
+        unsupported = []
+        for item in [*unsupported_items, *open_unsupported, *position_unsupported]:
+            name = str(item).strip()
+            if name and name not in unsupported:
+                unsupported.append(name)
+        raw_warnings = content.get("warnings")
+        warning_items = raw_warnings if isinstance(raw_warnings, list) else [raw_warnings] if raw_warnings else []
+        return {
+            "summary": str(content.get("summary") or fallback["summary"]).strip()[:1000],
+            "open_prompt_template": str(content.get("open_prompt_template") or fallback["open_prompt_template"]).strip()[:8000],
+            "position_prompt_template": str(content.get("position_prompt_template") or fallback["position_prompt_template"]).strip()[:8000],
+            "open_indicators": open_specs,
+            "position_indicators": position_specs,
+            "open_kline_count": required_candle_count(open_specs),
+            "position_kline_count": required_candle_count(position_specs),
+            "open_data_type": _custom_data_type(content.get("open_data_type"), unsupported),
+            "position_data_type": _custom_data_type(content.get("position_data_type"), unsupported),
+            "unsupported_indicators": unsupported[:20],
+            "warnings": [str(item)[:300] for item in warning_items if str(item).strip()][:10],
+            "prompt_version": 1,
+            "compile_status": "generated",
+        }
+
+    def custom_open_decision(
+        self,
+        *,
+        deployment: dict[str, Any],
+        request_payload: OpenEvaluateRequest,
+    ) -> AiCallResult | None:
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        indicator_count = max(20, min(int(config.get("indicator_output_count") or 100), 300))
+        candle_count = max(10, min(int(config.get("open_requested_kline_count") or config.get("open_kline_count") or 100), 1000))
+        indicators = calculate_indicator_payload(
+            request_payload.candles,
+            list(config.get("open_indicators") or []),
+            output_count=indicator_count,
+        )
+        return self._chat_json(
+            deployment=deployment,
+            endpoint="open",
+            system_prompt=_custom_runtime_prompt("open"),
+            user_payload={
+                "task": "custom_strategy_open_decision",
+                "strategy_name": deployment.get("strategy_name", ""),
+                "user_rule": config.get("open_logic", ""),
+                "prompt_template": config.get("open_prompt_template", ""),
+                "data_convention": {
+                    "order": "oldest_to_latest",
+                    "last_item": "latest_closed_candle",
+                    "prices": "absolute market prices",
+                },
+                "symbol": request_payload.symbol,
+                "timeframe": request_payload.timeframe,
+                "account": request_payload.account.model_dump(mode="json"),
+                "bid": request_payload.bid,
+                "ask": request_payload.ask,
+                "spread_points": request_payload.spread_points,
+                "balance": request_payload.balance,
+                "equity": request_payload.equity,
+                "candles": _compact_candles(request_payload.candles, limit=candle_count),
+                "indicators": indicators,
+                "required_json_schema": {
+                    "should_open": "boolean",
+                    "direction": "buy|sell|null",
+                    "confidence": "0..1 number",
+                    "sl": "absolute stop-loss price or null",
+                    "tp": "absolute take-profit price or null",
+                    "reason": "short Chinese reason",
+                    "analysis": "detailed final Chinese explanation",
+                },
+            },
+        )
+
+    def custom_position_decision(
+        self,
+        *,
+        deployment: dict[str, Any],
+        request_payload: PositionEvaluateRequest,
+    ) -> AiCallResult | None:
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        indicator_count = max(20, min(int(config.get("indicator_output_count") or 100), 300))
+        candle_count = max(10, min(int(config.get("position_requested_kline_count") or config.get("position_kline_count") or 100), 1000))
+        indicators = calculate_indicator_payload(
+            request_payload.candles,
+            list(config.get("position_indicators") or []),
+            output_count=indicator_count,
+        )
+        return self._chat_json(
+            deployment=deployment,
+            endpoint="position",
+            system_prompt=_custom_runtime_prompt("position"),
+            user_payload={
+                "task": "custom_strategy_position_decision",
+                "strategy_name": deployment.get("strategy_name", ""),
+                "user_rule": config.get("position_logic", ""),
+                "prompt_template": config.get("position_prompt_template", ""),
+                "data_convention": {
+                    "order": "oldest_to_latest",
+                    "last_item": "latest_closed_candle",
+                    "prices": "absolute market prices",
+                },
+                "symbol": request_payload.symbol,
+                "timeframe": request_payload.timeframe,
+                "account": request_payload.account.model_dump(mode="json"),
+                "bid": request_payload.bid,
+                "ask": request_payload.ask,
+                "spread_points": request_payload.spread_points,
+                "balance": request_payload.balance,
+                "equity": request_payload.equity,
+                "positions": [item.model_dump(mode="json") for item in request_payload.positions],
+                "candles": _compact_candles(request_payload.candles, limit=candle_count),
+                "indicators": indicators,
+                "required_json_schema": {
+                    "action": "hold|close|add|modify",
+                    "ticket": "target ticket or null",
+                    "direction": "buy|sell|null, required for add",
+                    "volume": "close volume or null; null means full close",
+                    "sl": "absolute stop-loss price or null",
+                    "tp": "absolute take-profit price or null",
+                    "confidence": "0..1 number",
+                    "reason": "short Chinese reason",
+                    "analysis": "detailed final Chinese explanation",
+                },
+            },
+        )
+
     def test_endpoint(self, endpoint_id: str) -> dict[str, Any]:
         """Make a minimal provider call without billing, caching, or usage logging."""
         endpoint = self.store.get_private_ai_endpoint(endpoint_id)
@@ -171,6 +338,80 @@ class AiDecisionClient:
         usage = usage if isinstance(usage, dict) else {}
         return {
             "success": True,
+            "endpoint_id": endpoint_id,
+            "model": model,
+            "elapsed_ms": elapsed_ms,
+            "response_preview": _preview_text(content, limit=200),
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        }
+
+    def test_vision_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        """Test and persist whether an official endpoint can understand images."""
+        endpoint = self.store.get_private_ai_endpoint(endpoint_id)
+        if endpoint is None:
+            raise RuntimeError("ai_endpoint_not_found")
+        try:
+            result = self.test_vision_configuration(
+                base_url=str(endpoint.get("base_url") or endpoint.get("provider_base_url") or ""),
+                api_key=str(endpoint.get("api_key") or endpoint.get("provider_api_key") or ""),
+                model=str(endpoint.get("model") or endpoint.get("name") or ""),
+                endpoint_id=endpoint_id,
+            )
+        except (RuntimeError, ValueError, TimeoutError) as exc:
+            self.store.save_ai_endpoint_vision_test(endpoint_id, passed=False, error_message=str(exc))
+            raise
+        self.store.save_ai_endpoint_vision_test(endpoint_id, passed=True)
+        return result
+
+    def test_vision_configuration(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        endpoint_id: str = "",
+    ) -> dict[str, Any]:
+        """Test image understanding without billing, cache, or usage records."""
+        base_url = str(base_url or "").strip()
+        api_key = str(api_key or "").strip()
+        model = str(model or "").strip()
+        if not base_url:
+            raise RuntimeError("ai_endpoint_base_url_missing")
+        if not api_key:
+            raise RuntimeError("ai_endpoint_api_key_missing")
+        if not model:
+            raise RuntimeError("ai_endpoint_model_missing")
+
+        started_at = perf_counter()
+        raw_response = self._post_chat_completion(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system_prompt="You are an image recognition tester. Return only the digits visible in the image.",
+            user_prompt="Read the four digits in this image. Reply with digits only.",
+            user_image_url=_VISION_TEST_IMAGE_DATA_URL,
+            max_tokens=32,
+            strict_json=False,
+        )
+        elapsed_ms = max(1, round((perf_counter() - started_at) * 1000))
+        try:
+            parsed = json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"AI provider returned invalid JSON: {_preview_text(raw_response)}") from exc
+        choice = (parsed.get("choices") or [{}])[0] if isinstance(parsed, dict) else {}
+        message_payload = choice.get("message") if isinstance(choice, dict) else {}
+        content = str(message_payload.get("content") or "").strip() if isinstance(message_payload, dict) else ""
+        recognized_digits = "".join(character for character in content if character.isdigit())
+        if "8264" not in recognized_digits:
+            raise RuntimeError(f"模型未能正确识别测试图片（期望 8264，返回：{_preview_text(content or raw_response)}）")
+        usage = parsed.get("usage") if isinstance(parsed, dict) else {}
+        usage = usage if isinstance(usage, dict) else {}
+        return {
+            "success": True,
+            "supports_vision": True,
+            "vision_test_status": "passed",
             "endpoint_id": endpoint_id,
             "model": model,
             "elapsed_ms": elapsed_ms,
@@ -577,7 +818,7 @@ class AiDecisionClient:
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        prefix = "open" if endpoint == "open" else "position"
+        prefix = "open" if endpoint in {"open", "compile"} else "position"
         if str(config.get(f"{prefix}_ai_mode") or "official") == "custom":
             base_url = str(config.get(f"{prefix}_ai_base_url") or config.get(f"{prefix}_ai_provider") or "").strip()
             model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
@@ -594,6 +835,11 @@ class AiDecisionClient:
                     "strict_json": True,
                     "is_custom": True,
                 }
+        configured_endpoint_id = str(config.get(f"{prefix}_ai_endpoint_id") or "").strip()
+        if configured_endpoint_id:
+            configured_endpoint = self.store.get_private_ai_endpoint(configured_endpoint_id)
+            if configured_endpoint is not None:
+                return configured_endpoint
         official_strategy = self.store.get_official_ai_strategy(str(deployment.get("strategy_code") or ""))
         if official_strategy is not None:
             endpoint_key = "open_ai_endpoint_id" if endpoint == "open" else "position_ai_endpoint_id"
@@ -620,16 +866,23 @@ class AiDecisionClient:
         model: str,
         system_prompt: str,
         user_prompt: str,
+        user_image_url: str = "",
         max_tokens: int,
         strict_json: bool = True,
     ) -> str:
         normalized_base_url = base_url.strip().rstrip("/")
         url = normalized_base_url if normalized_base_url.lower().endswith("/chat/completions") else f"{normalized_base_url}/chat/completions"
+        user_content: str | list[dict[str, Any]] = user_prompt
+        if user_image_url:
+            user_content = [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": user_image_url}},
+            ]
         body = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0,
             "max_tokens": max_tokens,
@@ -800,35 +1053,78 @@ def _pa_system_prompt() -> str:
     )
 
 
-def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
-    schema = (
-        '{"should_open":false,"direction":null,"confidence":0,'
-        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,'
-        '"reason":"短原因","analysis":"详细中文行情和风控说明"}'
-        if endpoint == "open"
-        else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
-        '"lot":0,"sl":null,"tp":null,'
-        '"reason":"短原因","analysis":"详细中文持仓和风控说明"}'
-    )
+def _custom_strategy_compile_prompt() -> str:
     return (
-        "You are a strict JSON API endpoint, not a chat assistant. "
-        "Return exactly one minified JSON object only. "
-        "The first character of your response must be { and the last character must be }. "
-        "Do not output private reasoning, thoughts, markdown, code fences, explanations, prefixes, or suffixes outside JSON. "
-        "Never say what you need to do. Never mention JSON rules. "
-        "Do not use chain-of-thought. Make the decision silently and put only the final explanation in analysis. "
-        "If uncertain or unsafe, return the safe object directly. "
-        f"Required JSON shape: {schema}. "
-        "reason must be a concrete concise Chinese market/strategy reason, max 60 characters. "
-        "analysis must be 120-300 Chinese characters and include concrete market structure, setup score, price/risk context, and action rationale. "
-        "Never copy placeholder text such as 观望原因, 根据行情给出具体原因, reason, analysis, or .... "
-        f"Task: {task_prompt}"
+        "You compile a user's natural-language trading rules into reusable prompt templates. "
+        "Preserve every condition and do not add trading conditions the user did not request. "
+        "Extract only indicators that must be calculated by the server. Candlestick sequences, engulfing, "
+        "pin bars, support, resistance, recent highs and recent lows are inferred directly from OHLCV and "
+        "must not be listed as indicators. Templates must tell the runtime model to apply the user's rule "
+        "strictly to supplied closed candles and calculated indicator arrays. Return Chinese template text."
     )
 
+
+def _custom_runtime_prompt(endpoint: str) -> str:
+    if endpoint == "open":
+        return (
+            "You execute a user-defined trading strategy. Apply the supplied user_rule and prompt_template "
+            "strictly to closed OHLCV candles and indicator arrays. Candles are oldest to newest and the last "
+            "item is the latest closed candle. Infer candlestick patterns directly from OHLCV. Do not invent "
+            "missing facts or prices. If every requested condition is not clearly satisfied, do not open. "
+            "Return absolute sl and tp prices when the rule defines them."
+        )
+    return (
+        "You execute the position-management part of a user-defined trading strategy. Apply only the supplied "
+        "user_rule and prompt_template to the closed candles, indicators and current positions. If no explicit "
+        "risk condition is met, hold. Use only hold, close, add or modify. Never close or add without a clear rule."
+    )
+
+
+def _custom_strategy_fallback(open_logic: str, position_logic: str) -> dict[str, Any]:
+    return {
+        "summary": "根据用户自然语言规则，由 AI 结合已收盘 K 线和所需指标执行开仓与持仓风控判断。",
+        "open_prompt_template": (
+            "严格按用户开仓规则判断。必须逐项验证全部条件；K线形态、连续涨跌、近期高低点直接从"
+            "按时间升序提供的OHLCV判断。条件不完整、不明确或数据不足时不开仓。"
+        ),
+        "position_prompt_template": (
+            "严格按用户持仓风控规则判断。只有明确触发规则时才能平仓、加仓或修改止盈止损；"
+            "没有触发时继续持有。"
+        ),
+        "open_indicators": [],
+        "position_indicators": [],
+        "open_data_type": "kline",
+        "position_data_type": "kline",
+        "unsupported_indicators": [],
+        "warnings": [],
+        "prompt_version": 1,
+        "compile_status": "fallback",
+        "open_logic": open_logic,
+        "position_logic": position_logic,
+    }
+
+
+def _custom_data_type(value: Any, unsupported: list[str]) -> str:
+    normalized = str(value or "kline").strip().lower()
+    if normalized not in {"kline", "screenshot", "both"}:
+        normalized = "kline"
+    if unsupported and normalized == "kline":
+        return "both"
+    return normalized
+
+
 def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
+    if endpoint == "compile":
+        return (
+            "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
+            "Required keys: summary, open_prompt_template, position_prompt_template, open_indicators, "
+            "position_indicators, open_data_type, position_data_type, unsupported_indicators, warnings. "
+            "Each indicator item uses {name,source,params,alias}. data_type is kline, screenshot, or both. "
+            f"Task: {task_prompt}"
+        )
     schema = (
         '{"should_open":false,"direction":null,"confidence":0,'
-        '"lot":0,"sl_distance_price":0,"tp_distance_price":0,'
+        '"lot":0,"sl":null,"tp":null,"sl_distance_price":0,"tp_distance_price":0,'
         '"reason":"short Chinese reason","analysis":"detailed Chinese market and risk explanation"}'
         if endpoint == "open"
         else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
@@ -850,6 +1146,8 @@ def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
 
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
+    if endpoint == "compile":
+        return 1600
     if endpoint == "open":
         return 1000
     if endpoint == "position":

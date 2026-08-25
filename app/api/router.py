@@ -49,6 +49,7 @@ from app.models import (
 from app.services.decision_service import DecisionService
 from app.services.auth_service import AuthError, UserAuthService
 from app.services.ai_service import AiDecisionClient
+from app.services.custom_indicators import public_indicator_catalog
 from app.store import SqliteStore
 
 
@@ -983,6 +984,16 @@ def create_admin_ai_router(
         except (RuntimeError, ValueError, TimeoutError) as exc:
             return ok({"success": False, "error": str(exc)}, "connection_failed")
 
+    @router.post("/endpoint/test-vision")
+    def endpoint_test_vision(payload: dict[str, object]) -> dict[str, object]:
+        endpoint_id = str(payload.get("id") or "").strip()
+        if not endpoint_id:
+            raise HTTPException(status_code=400, detail="endpoint_id_required")
+        try:
+            return ok(endpoint_test_client.test_vision_endpoint(endpoint_id), "vision_test_successful")
+        except (RuntimeError, ValueError, TimeoutError) as exc:
+            return ok({"success": False, "supports_vision": False, "vision_test_status": "failed", "error": str(exc)}, "vision_test_failed")
+
     @router.post("/endpoint/delete")
     def endpoint_delete(payload: dict[str, object]) -> dict[str, object]:
         endpoint_id = str(payload.get("id") or "").strip()
@@ -1179,6 +1190,29 @@ def create_auth_router(
             return ok(result, "connection_successful")
         except (RuntimeError, ValueError, TimeoutError) as exc:
             return ok({"success": False, "error": str(exc)}, "connection_failed")
+
+    @router.post("/custom-ai/test-vision")
+    def test_custom_ai_vision(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        execute(lambda: auth_service.me(token))
+        try:
+            result = custom_ai_test_client.test_vision_configuration(
+                base_url=str(payload.get("base_url") or ""),
+                model=str(payload.get("model") or ""),
+                api_key=str(payload.get("api_key") or ""),
+            )
+            return ok(result, "vision_test_successful")
+        except (RuntimeError, ValueError, TimeoutError) as exc:
+            return ok({"success": False, "supports_vision": False, "vision_test_status": "failed", "error": str(exc)}, "vision_test_failed")
+
+    @router.get("/custom-strategy/indicators")
+    def custom_strategy_indicators(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        execute(lambda: auth_service.me(token))
+        return ok({"list": public_indicator_catalog(), "default_output_count": 100})
 
     @router.get("/ea-downloads")
     def user_ea_downloads(authorization: str = Header(default="")) -> dict[str, object]:
@@ -1656,7 +1690,7 @@ def _mt5_position_response(
                 action="close",
                 ticket=str(target.ticket),
                 mt_type=target.mt_type,
-                volume=target.volume,
+                volume=min(decision.volume, target.volume) if decision.volume else target.volume,
                 order_type="market",
                 price=0.0,
                 comment=decision.reason,

@@ -490,6 +490,10 @@ class SqliteStore:
                     billing_multiplier REAL NOT NULL DEFAULT 1,
                     input_price_per_million NUMERIC NOT NULL DEFAULT 0,
                     output_price_per_million NUMERIC NOT NULL DEFAULT 0,
+                    supports_vision INTEGER NOT NULL DEFAULT 0,
+                    vision_test_status TEXT NOT NULL DEFAULT 'untested',
+                    vision_tested_at TEXT NOT NULL DEFAULT '',
+                    vision_test_error TEXT NOT NULL DEFAULT '',
                     is_default INTEGER NOT NULL DEFAULT 0,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     selectable_by_user INTEGER NOT NULL DEFAULT 0,
@@ -1125,6 +1129,10 @@ class SqliteStore:
                 billing_multiplier REAL NOT NULL DEFAULT 1,
                 input_price_per_million NUMERIC NOT NULL DEFAULT 0,
                 output_price_per_million NUMERIC NOT NULL DEFAULT 0,
+                supports_vision INTEGER NOT NULL DEFAULT 0,
+                vision_test_status TEXT NOT NULL DEFAULT 'untested',
+                vision_tested_at TEXT NOT NULL DEFAULT '',
+                vision_test_error TEXT NOT NULL DEFAULT '',
                 is_default INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 selectable_by_user INTEGER NOT NULL DEFAULT 0,
@@ -1154,6 +1162,10 @@ class SqliteStore:
             "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier REAL NOT NULL DEFAULT 1",
             "input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN input_price_per_million NUMERIC NOT NULL DEFAULT 0",
             "output_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN output_price_per_million NUMERIC NOT NULL DEFAULT 0",
+            "supports_vision": "ALTER TABLE ai_endpoints ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0",
+            "vision_test_status": "ALTER TABLE ai_endpoints ADD COLUMN vision_test_status TEXT NOT NULL DEFAULT 'untested'",
+            "vision_tested_at": "ALTER TABLE ai_endpoints ADD COLUMN vision_tested_at TEXT NOT NULL DEFAULT ''",
+            "vision_test_error": "ALTER TABLE ai_endpoints ADD COLUMN vision_test_error TEXT NOT NULL DEFAULT ''",
             "is_default": "ALTER TABLE ai_endpoints ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
             "enabled": "ALTER TABLE ai_endpoints ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
             "selectable_by_user": "ALTER TABLE ai_endpoints ADD COLUMN selectable_by_user INTEGER NOT NULL DEFAULT 0",
@@ -1475,7 +1487,7 @@ class SqliteStore:
                     endpoint_id = str(payload.get(f"{prefix}_ai_endpoint_id") or "").strip()
                     endpoint = connection.execute(
                         """
-                        SELECT id, model FROM ai_endpoints
+                        SELECT id, model, supports_vision FROM ai_endpoints
                         WHERE id = ? AND owner_type = 'gl' AND enabled = 1
                           AND selectable_by_user = 1 AND api_key <> ''
                         """,
@@ -1487,6 +1499,7 @@ class SqliteStore:
                     config[f"{prefix}_ai_model"] = str(endpoint["model"] or "")
                     config[f"{prefix}_ai_base_url"] = ""
                     config[f"{prefix}_ai_key"] = ""
+                    config[f"{prefix}_ai_vision_verified"] = bool(endpoint["supports_vision"])
                 else:
                     base_url = str(payload.get(f"{prefix}_ai_base_url") or "").strip()
                     model = str(payload.get(f"{prefix}_ai_model") or "").strip()
@@ -1499,6 +1512,9 @@ class SqliteStore:
                     config[f"{prefix}_ai_model"] = model
                     if new_key:
                         config[f"{prefix}_ai_key"] = new_key
+                    config[f"{prefix}_ai_vision_verified"] = bool(
+                        payload.get(f"{prefix}_ai_vision_verified", config.get(f"{prefix}_ai_vision_verified", False))
+                    )
             config["ai_user_configured"] = True
             connection.execute(
                 "UPDATE deployments SET config_json = ?, updated_at = ? WHERE id = ?",
@@ -1546,6 +1562,32 @@ class SqliteStore:
             "max_positions": max_positions,
             "allow_add": bool(payload.get("allow_add", config.get("allow_add", False))),
         })
+        if deployment.get("strategy_code") == "CUSTOM_AI_V1":
+            if "open_logic" in payload:
+                config["open_logic"] = str(payload.get("open_logic") or "").strip()
+            if "position_logic" in payload:
+                config["position_logic"] = str(payload.get("position_logic") or "").strip()
+            for prefix in ("open", "position"):
+                data_type = str(payload.get(f"{prefix}_data_type") or config.get(f"{prefix}_data_type") or "kline").strip().lower()
+                try:
+                    requested_count = int(
+                        payload.get(
+                            f"{prefix}_kline_count",
+                            config.get(f"{prefix}_requested_kline_count") or config.get(f"{prefix}_kline_count") or 100,
+                        ),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("invalid_strategy_data_settings") from exc
+                if data_type not in {"kline", "screenshot", "both"} or not 10 <= requested_count <= 1000:
+                    raise RuntimeError("invalid_strategy_data_settings")
+                config[f"{prefix}_data_type"] = data_type
+                config[f"{prefix}_requested_kline_count"] = requested_count
+                indicator_count = int(config.get(f"{prefix}_indicator_kline_count") or 100)
+                config[f"{prefix}_kline_count"] = (
+                    max(requested_count, indicator_count) if data_type in {"kline", "both"} else 1
+                )
+                if data_type in {"screenshot", "both"} and not bool(config.get(f"{prefix}_ai_vision_verified", False)):
+                    raise RuntimeError("ai_vision_test_required")
         strategy_name = str(payload.get("name") or deployment.get("strategy_name") or "").strip()
         mt_login = str(payload.get("mt_login") if "mt_login" in payload else deployment.get("mt_login") or "").strip()
         now = utc_now_iso()
@@ -3248,6 +3290,19 @@ class SqliteStore:
             if "output_price_per_million" in payload
             else (existing or {}).get("output_price_per_million"),
         )
+        effective_vision_config = {
+            "base_url": payload.get("base_url") if "base_url" in payload else (existing or {}).get("base_url"),
+            "model": payload.get("model") if "model" in payload else (existing or {}).get("model"),
+            "api_key": api_key,
+        }
+        vision_config_changed = bool(existing) and any(
+            str(effective_vision_config[field] or "").strip() != str(existing.get(field) or "").strip()
+            for field in effective_vision_config
+        )
+        supports_vision = bool((existing or {}).get("supports_vision")) and not vision_config_changed
+        vision_test_status = str((existing or {}).get("vision_test_status") or "untested") if not vision_config_changed else "untested"
+        vision_tested_at = str((existing or {}).get("vision_tested_at") or "") if not vision_config_changed else ""
+        vision_test_error = str((existing or {}).get("vision_test_error") or "") if not vision_config_changed else ""
         with self._connect() as connection:
             if payload.get("is_default", False) and str(payload.get("owner_type") or "gl") == "gl":
                 connection.execute("UPDATE ai_endpoints SET is_default = 0 WHERE owner_type = 'gl'")
@@ -3257,9 +3312,10 @@ class SqliteStore:
                     id, owner_type, user_id, template_code, name, base_url, model,
                     api_key, strict_json, context_window, input_token_rate, output_token_rate,
                     billing_multiplier, input_price_per_million, output_price_per_million,
+                    supports_vision, vision_test_status, vision_tested_at, vision_test_error,
                     is_default, enabled, selectable_by_user,
                     sort, remark, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     owner_type = excluded.owner_type,
                     user_id = excluded.user_id,
@@ -3275,6 +3331,10 @@ class SqliteStore:
                     billing_multiplier = excluded.billing_multiplier,
                     input_price_per_million = excluded.input_price_per_million,
                     output_price_per_million = excluded.output_price_per_million,
+                    supports_vision = excluded.supports_vision,
+                    vision_test_status = excluded.vision_test_status,
+                    vision_tested_at = excluded.vision_tested_at,
+                    vision_test_error = excluded.vision_test_error,
                     is_default = excluded.is_default,
                     enabled = excluded.enabled,
                     selectable_by_user = excluded.selectable_by_user,
@@ -3298,6 +3358,10 @@ class SqliteStore:
                     float(payload.get("billing_multiplier") or 1),
                     input_price,
                     output_price,
+                    1 if supports_vision else 0,
+                    vision_test_status,
+                    vision_tested_at,
+                    vision_test_error,
                     1 if payload.get("is_default", False) else 0,
                     1 if payload.get("enabled", True) else 0,
                     1 if payload.get("selectable_by_user", False) else 0,
@@ -3310,6 +3374,29 @@ class SqliteStore:
         endpoint = self.get_ai_endpoint(endpoint_id)
         if endpoint is None:
             raise RuntimeError("ai_endpoint_save_failed")
+        return endpoint
+
+    def save_ai_endpoint_vision_test(
+        self,
+        endpoint_id: str,
+        *,
+        passed: bool,
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE ai_endpoints
+                SET supports_vision = ?, vision_test_status = ?, vision_tested_at = ?,
+                    vision_test_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (1 if passed else 0, "passed" if passed else "failed", now, str(error_message or "")[:500], now, endpoint_id),
+            )
+        endpoint = self.get_ai_endpoint(endpoint_id)
+        if endpoint is None:
+            raise RuntimeError("ai_endpoint_not_found")
         return endpoint
 
     def get_ai_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
@@ -3600,6 +3687,8 @@ class SqliteStore:
                     "output_price_per_million": decimal_string(row["output_price_per_million"] or 0),
                     "is_default": bool(row["is_default"]),
                     "official_available": True,
+                    "supports_vision": bool(row["supports_vision"]),
+                    "vision_test_status": str(row["vision_test_status"] or "untested"),
                 }
                 for row in endpoint_rows
             ],
@@ -4115,12 +4204,20 @@ class SqliteStore:
                 "strategy_code": deployment["strategy_code"],
                 "mt_login": str(deployment.get("mt_login") or ""),
                 "summary": str(official_strategy.get("summary") or config.get("summary") or "") if official_strategy else str(config.get("summary") or ""),
+                "strategy_type": str(config.get("strategy_type") or ("custom" if deployment["strategy_code"] == "CUSTOM_AI_V1" else "official")),
+                "open_logic": str(config.get("open_logic") or ""),
+                "position_logic": str(config.get("position_logic") or ""),
+                "open_indicators": list(config.get("open_indicators") or []),
+                "position_indicators": list(config.get("position_indicators") or []),
+                "unsupported_indicators": list(config.get("unsupported_indicators") or []),
+                "compile_status": str(config.get("compile_status") or ""),
                 "open_ai_mode": open_ai_mode,
                 "open_ai_model": str(config.get("open_ai_model") or ""),
                 "open_ai_endpoint_id": open_ai_endpoint_id,
                 "open_ai_endpoint_name": str(open_ai_endpoint.get("name") or "") if open_ai_endpoint else "",
                 "open_ai_base_url": str(config.get("open_ai_base_url") or ""),
                 "open_ai_key_configured": bool(str(config.get("open_ai_key") or "").strip()),
+                "open_ai_vision_verified": bool(config.get("open_ai_vision_verified", False)),
                 "ai_user_configured": bool(config.get("ai_user_configured", False)),
                 "position_ai_mode": position_ai_mode,
                 "position_ai_model": str(config.get("position_ai_model") or ""),
@@ -4128,10 +4225,13 @@ class SqliteStore:
                 "position_ai_endpoint_name": str(position_ai_endpoint.get("name") or "") if position_ai_endpoint else "",
                 "position_ai_base_url": str(config.get("position_ai_base_url") or ""),
                 "position_ai_key_configured": bool(str(config.get("position_ai_key") or "").strip()),
+                "position_ai_vision_verified": bool(config.get("position_ai_vision_verified", False)),
                 "open_data_type": str(config.get("open_data_type") or "kline"),
                 "open_kline_count": int(config.get("open_kline_count") or 100),
+                "open_requested_kline_count": int(config.get("open_requested_kline_count") or config.get("open_kline_count") or 100),
                 "position_data_type": str(config.get("position_data_type") or "kline"),
                 "position_kline_count": int(config.get("position_kline_count") or 100),
+                "position_requested_kline_count": int(config.get("position_requested_kline_count") or config.get("position_kline_count") or 100),
                 "call_mode": str(config.get("call_mode") or "bar"),
                 "call_val": float(config.get("call_val") or 1),
                 "position_size_mode": str(config.get("position_size_mode") or "fixed"),
@@ -5688,6 +5788,7 @@ class SqliteStore:
         data["is_default"] = bool(data["is_default"])
         data["selectable_by_user"] = bool(data["selectable_by_user"])
         data["strict_json"] = bool(data.get("strict_json", 1))
+        data["supports_vision"] = bool(data.get("supports_vision", 0))
         data["input_price_per_million"] = decimal_string(data.get("input_price_per_million"))
         data["output_price_per_million"] = decimal_string(data.get("output_price_per_million"))
         data["provider_id"] = str(data.get("id") or "")
@@ -6370,6 +6471,10 @@ class MySQLStore(SqliteStore):
             "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier DOUBLE NOT NULL DEFAULT 1",
             "input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN input_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER billing_multiplier",
             "output_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN output_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER input_price_per_million",
+            "supports_vision": "ALTER TABLE ai_endpoints ADD COLUMN supports_vision TINYINT NOT NULL DEFAULT 0",
+            "vision_test_status": "ALTER TABLE ai_endpoints ADD COLUMN vision_test_status VARCHAR(16) NOT NULL DEFAULT 'untested'",
+            "vision_tested_at": "ALTER TABLE ai_endpoints ADD COLUMN vision_tested_at VARCHAR(40) NOT NULL DEFAULT ''",
+            "vision_test_error": "ALTER TABLE ai_endpoints ADD COLUMN vision_test_error VARCHAR(500) NOT NULL DEFAULT ''",
             "is_default": "ALTER TABLE ai_endpoints ADD COLUMN is_default TINYINT NOT NULL DEFAULT 0",
             "enabled": "ALTER TABLE ai_endpoints ADD COLUMN enabled TINYINT NOT NULL DEFAULT 1",
             "selectable_by_user": "ALTER TABLE ai_endpoints ADD COLUMN selectable_by_user TINYINT NOT NULL DEFAULT 0",

@@ -152,6 +152,62 @@ def test_unsaved_custom_ai_connection_test_has_no_side_effects(tmp_path: Path, m
     assert store.list_ai_usage_logs(page=1, size=10)["total"] == 0
 
 
+def test_vision_test_sends_image_and_persists_capability(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "vision-test.db")
+    store.initialize()
+    store.save_ai_endpoint({
+        "id": "aie_vision_test",
+        "owner_type": "gl",
+        "name": "Vision test",
+        "base_url": "https://example.com/v1",
+        "model": "vision-model",
+        "api_key": "sk-vision-test",
+    })
+    client = AiDecisionClient(store)
+    provider_args = {}
+
+    def fake_provider(**kwargs):
+        provider_args.update(kwargs)
+        return json.dumps({
+            "choices": [{"message": {"content": "8264"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        })
+
+    monkeypatch.setattr(client, "_post_chat_completion", fake_provider)
+    result = client.test_vision_endpoint("aie_vision_test")
+    saved = store.get_ai_endpoint("aie_vision_test")
+
+    assert result["supports_vision"] is True
+    assert provider_args["user_image_url"].startswith("data:image/png;base64,")
+    assert saved is not None
+    assert saved["supports_vision"] is True
+    assert saved["vision_test_status"] == "passed"
+    assert saved["vision_tested_at"]
+    assert store.list_ai_usage_logs(page=1, size=10)["total"] == 0
+
+
+def test_editing_model_resets_vision_verification(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "vision-reset.db")
+    store.initialize()
+    payload = {
+        "id": "aie_vision_reset",
+        "owner_type": "gl",
+        "name": "Vision reset",
+        "base_url": "https://example.com/v1",
+        "model": "vision-model",
+        "api_key": "sk-vision-test",
+    }
+    store.save_ai_endpoint(payload)
+    store.save_ai_endpoint_vision_test("aie_vision_reset", passed=True)
+    store.save_ai_endpoint({**payload, "model": "different-model", "api_key": ""})
+    saved = store.get_ai_endpoint("aie_vision_reset")
+
+    assert saved is not None
+    assert saved["supports_vision"] is False
+    assert saved["vision_test_status"] == "untested"
+    assert saved["vision_tested_at"] == ""
+
+
 def test_ai_endpoint_prices_are_saved_per_model(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "pricing.db")
     store.initialize()

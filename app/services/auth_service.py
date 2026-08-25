@@ -22,10 +22,18 @@ class AuthError(RuntimeError):
 
 
 class UserAuthService:
-    def __init__(self, store: SqliteStore, settings: Settings, email_service: EmailService) -> None:
+    def __init__(
+        self,
+        store: SqliteStore,
+        settings: Settings,
+        email_service: EmailService,
+        *,
+        ai_client: Any | None = None,
+    ) -> None:
         self.store = store
         self.settings = settings
         self.email_service = email_service
+        self.ai_client = ai_client
 
     def register(self, *, email: str, password: str, invite_code: str = "") -> dict[str, Any]:
         normalized = self._email(email)
@@ -148,6 +156,10 @@ class UserAuthService:
 
     def update_strategy_settings(self, token: str, *, deployment_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         user = self.me(token)
+        previous = next(
+            (item for item in self.store.list_web_deployments(str(user["id"])) if item["id"] == deployment_id),
+            None,
+        )
         try:
             deployment = self.store.update_user_deployment_settings(
                 user_id=int(user["id"]),
@@ -156,6 +168,49 @@ class UserAuthService:
             )
         except RuntimeError as exc:
             self._raise_store_error(exc)
+        if deployment.get("strategy_code") == "CUSTOM_AI_V1" and self.ai_client is not None:
+            config = dict(deployment.get("config") or {})
+            open_logic = str(config.get("open_logic") or "").strip()
+            position_logic = str(config.get("position_logic") or "").strip()
+            if len(open_logic) < 5 or len(position_logic) < 5:
+                raise AuthError("custom_strategy_logic_required")
+            previous_config = dict(previous.get("config") or {}) if previous else {}
+            logic_changed = (
+                open_logic != str(previous_config.get("open_logic") or "")
+                or position_logic != str(previous_config.get("position_logic") or "")
+            )
+            if logic_changed:
+                selected_data = {
+                    f"{prefix}_{field}": config.get(f"{prefix}_{field}")
+                    for prefix in ("open", "position")
+                    for field in ("data_type", "kline_count", "requested_kline_count")
+                }
+                compiled = self.ai_client.compile_custom_strategy(deployment)
+                config.update(compiled)
+                for prefix in ("open", "position"):
+                    selected_type = str(selected_data.get(f"{prefix}_data_type") or "kline")
+                    selected_count = int(
+                        selected_data.get(f"{prefix}_requested_kline_count")
+                        or selected_data.get(f"{prefix}_kline_count")
+                        or 100
+                    )
+                    required_count = int(compiled.get(f"{prefix}_kline_count") or 100)
+                    config[f"{prefix}_data_type"] = selected_type
+                    config[f"{prefix}_requested_kline_count"] = selected_count
+                    config[f"{prefix}_indicator_kline_count"] = required_count
+                    config[f"{prefix}_kline_count"] = (
+                        max(selected_count, required_count) if selected_type in {"kline", "both"} else 1
+                    )
+                deployment = self.store.upsert_web_deployment(
+                    str(config.get("deployment_key") or ""),
+                    user_id=str(user["id"]),
+                    strategy_code="CUSTOM_AI_V1",
+                    strategy_name=str(deployment.get("strategy_name") or "自定义策略"),
+                    status=str(deployment.get("status") or "active"),
+                    symbol=str(deployment.get("symbol") or "*"),
+                    timeframe=str(deployment.get("timeframe") or "*"),
+                    config=config,
+                )
         return {"id": deployment["id"], "updated_at": deployment["updated_at"]}
 
     def create_strategy(self, token: str, *, payload: dict[str, Any]) -> dict[str, Any]:
@@ -168,26 +223,53 @@ class UserAuthService:
         if int(user.get("strategy_count") or 0) >= int(user.get("max_strategy_keys") or 0):
             raise AuthError("strategy_key_limit_reached", 409)
         strategy_code = str(payload.get("strategy_code") or "PA_AGENT_V1").strip()
-        strategy = self.store.get_official_ai_strategy(strategy_code)
-        if strategy is None or not bool(strategy.get("enabled")):
+        is_custom_strategy = strategy_code == "CUSTOM_AI_V1"
+        strategy = None if is_custom_strategy else self.store.get_official_ai_strategy(strategy_code)
+        if not is_custom_strategy and (strategy is None or not bool(strategy.get("enabled"))):
             raise AuthError("official_strategy_not_found", 404)
-        default_config = dict(strategy.get("default_config") or {})
+        open_logic = str(payload.get("open_logic") or "").strip()
+        position_logic = str(payload.get("position_logic") or "").strip()
+        if is_custom_strategy and (len(open_logic) < 5 or len(position_logic) < 5):
+            raise AuthError("custom_strategy_logic_required")
+        custom_data: dict[str, Any] = {}
+        if is_custom_strategy:
+            for prefix in ("open", "position"):
+                data_type = str(payload.get(f"{prefix}_data_type") or "kline").strip().lower()
+                try:
+                    kline_count = int(payload.get(f"{prefix}_kline_count") or 100)
+                except (TypeError, ValueError) as exc:
+                    raise AuthError("invalid_strategy_data_settings") from exc
+                if data_type not in {"kline", "screenshot", "both"} or not 10 <= kline_count <= 1000:
+                    raise AuthError("invalid_strategy_data_settings")
+                custom_data[f"{prefix}_data_type"] = data_type
+                custom_data[f"{prefix}_kline_count"] = kline_count
+        default_config = dict(strategy.get("default_config") or {}) if strategy else {}
         allowed_options = {item["id"]: item for item in self.store.list_public_ai_model_options()["list"]}
         config: dict[str, Any] = {
-            "open_data_type": strategy.get("open_data_type") or "kline",
-            "open_kline_count": int(strategy.get("open_kline_count") or 100),
-            "position_data_type": strategy.get("position_data_type") or "kline",
-            "position_kline_count": int(strategy.get("position_kline_count") or 100),
-            "call_mode": strategy.get("call_mode") or "bar",
-            "call_val": float(strategy.get("call_value") or 1),
+            "strategy_type": "custom" if is_custom_strategy else "official",
+            "open_data_type": (strategy.get("open_data_type") or "kline") if strategy else "kline",
+            "open_kline_count": int(strategy.get("open_kline_count") or 100) if strategy else 100,
+            "position_data_type": (strategy.get("position_data_type") or "kline") if strategy else "kline",
+            "position_kline_count": int(strategy.get("position_kline_count") or 100) if strategy else 100,
+            "call_mode": (strategy.get("call_mode") or "bar") if strategy else "bar",
+            "call_val": float(strategy.get("call_value") or 1) if strategy else 1.0,
         }
+        if is_custom_strategy:
+            config.update({
+                "open_logic": open_logic,
+                "position_logic": position_logic,
+                "indicator_output_count": 100,
+                "prompt_version": 1,
+                "compile_status": "pending",
+                **custom_data,
+            })
         for prefix in ("open", "position"):
             mode = str(payload.get(f"{prefix}_ai_mode") or "official")
             if mode not in {"official", "custom"}:
                 raise AuthError("invalid_ai_mode")
             config[f"{prefix}_ai_mode"] = mode
             if mode == "official":
-                endpoint_id = str(payload.get(f"{prefix}_ai_endpoint_id") or strategy.get(f"{prefix}_ai_endpoint_id") or "")
+                endpoint_id = str(payload.get(f"{prefix}_ai_endpoint_id") or (strategy.get(f"{prefix}_ai_endpoint_id") if strategy else "") or "")
                 option = allowed_options.get(endpoint_id)
                 if option is None:
                     raise AuthError("invalid_ai_endpoint")
@@ -195,6 +277,7 @@ class UserAuthService:
                 config[f"{prefix}_ai_model"] = str(option.get("model") or "")
                 config[f"{prefix}_ai_base_url"] = ""
                 config[f"{prefix}_ai_key"] = ""
+                config[f"{prefix}_ai_vision_verified"] = bool(option.get("supports_vision"))
             else:
                 base_url = str(payload.get(f"{prefix}_ai_base_url") or "").strip().rstrip("/")
                 model = str(payload.get(f"{prefix}_ai_model") or "").strip()
@@ -205,6 +288,10 @@ class UserAuthService:
                 config[f"{prefix}_ai_model"] = model
                 config[f"{prefix}_ai_base_url"] = base_url
                 config[f"{prefix}_ai_key"] = api_key
+                config[f"{prefix}_ai_vision_verified"] = bool(payload.get(f"{prefix}_ai_vision_verified", False))
+            if is_custom_strategy and custom_data.get(f"{prefix}_data_type") in {"screenshot", "both"}:
+                if not bool(config.get(f"{prefix}_ai_vision_verified")):
+                    raise AuthError("ai_vision_test_required")
         size_mode = str(payload.get("position_size_mode") or default_config.get("position_sizing_mode") or "fixed")
         raw_risk_mode = str(payload.get("risk_base_mode") or default_config.get("risk_mode") or "fixed_stop_amount")
         risk_mode = "balance_percent" if raw_risk_mode == "balance_percent" else "fixed_loss"
@@ -234,12 +321,35 @@ class UserAuthService:
             raw_key,
             user_id=str(user["id"]),
             strategy_code=strategy_code,
-            strategy_name=str(payload.get("name") or strategy.get("name") or "").strip(),
+            strategy_name=str(payload.get("name") or (strategy.get("name") if strategy else "自定义策略") or "").strip(),
             status="active" if str(payload.get("status") or "active") == "active" else "paused",
             symbol="*",
             timeframe="*",
             config=config,
         )
+        if is_custom_strategy and self.ai_client is not None:
+            compiled = self.ai_client.compile_custom_strategy(deployment)
+            config.update(compiled)
+            for prefix in ("open", "position"):
+                selected_type = str(custom_data[f"{prefix}_data_type"])
+                selected_count = int(custom_data[f"{prefix}_kline_count"])
+                required_count = int(compiled.get(f"{prefix}_kline_count") or 100)
+                config[f"{prefix}_data_type"] = selected_type
+                config[f"{prefix}_requested_kline_count"] = selected_count
+                config[f"{prefix}_indicator_kline_count"] = required_count
+                config[f"{prefix}_kline_count"] = (
+                    max(selected_count, required_count) if selected_type in {"kline", "both"} else 1
+                )
+            deployment = self.store.upsert_web_deployment(
+                raw_key,
+                user_id=str(user["id"]),
+                strategy_code=strategy_code,
+                strategy_name=str(payload.get("name") or "自定义策略").strip(),
+                status="active" if str(payload.get("status") or "active") == "active" else "paused",
+                symbol="*",
+                timeframe="*",
+                config=config,
+            )
         mt_login = str(payload.get("mt_login") or "").strip()
         if mt_login:
             deployment = self.store.set_deployment_login(raw_key, mt_login) or deployment
@@ -502,7 +612,10 @@ class UserAuthService:
             "invalid_ai_mode": 400,
             "invalid_ai_endpoint": 400,
             "custom_ai_config_required": 400,
+            "ai_vision_test_required": 400,
             "invalid_strategy_settings": 400,
+            "custom_strategy_logic_required": 400,
+            "invalid_strategy_data_settings": 400,
             "official_strategy_not_found": 404,
             "vip_required": 403,
             "strategy_key_limit_reached": 409,

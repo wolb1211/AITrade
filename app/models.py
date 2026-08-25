@@ -129,6 +129,7 @@ class TradeDecision(StrictModel):
     sl: float | None = None
     tp: float | None = None
     position_ticket: str | None = None
+    volume: float | None = None
     usage: UsageSummary = Field(default_factory=UsageSummary)
     idempotent: bool = False
 

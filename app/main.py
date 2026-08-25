@@ -27,6 +27,7 @@ from app.services.email_service import EmailService
 from app.store import MySQLStore, SqliteStore
 from app.strategies.pa_agent_lite import PaAgentLiteStrategy
 from app.strategies.pa_mock import PaMockStrategy
+from app.strategies.custom_ai import CustomAiStrategy
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -56,9 +57,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     strategies = [
         PaMockStrategy(),
         PaAgentLiteStrategy(ai_client),
+        CustomAiStrategy(ai_client),
     ]
     service = DecisionService(store, {strategy.code: strategy for strategy in strategies})
-    auth_service = UserAuthService(store, resolved, EmailService(resolved))
+    auth_service = UserAuthService(store, resolved, EmailService(resolved), ai_client=ai_client)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
