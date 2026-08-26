@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -29,13 +30,31 @@ class CustomAiStrategy:
         if not should_open:
             return self._hold(request, reason, confidence=confidence, usage=result.usage)
 
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        open_logic = str(config.get("open_logic") or config.get("open_prompt_template") or "")
         entry = request.ask if direction == "buy" else request.bid
         sl = _optional_price(content.get("sl"))
         tp = _optional_price(content.get("tp"))
-        if sl is None:
+        rule_based_sl = _recent_candle_extreme_stop(open_logic, direction, request.candles)
+        if rule_based_sl is not None:
+            # This value is deterministic from the user's rule and submitted candles.
+            # Always prefer it over an AI-calculated absolute price.
+            sl = rule_based_sl
+            reason = (
+                f"{str(content.get('reason') or '满足用户开仓条件').strip()}；"
+                f"止损已按用户规则和K线数据重算为{sl:g}"
+            )
+        elif sl is None:
             distance = _positive_float(content.get("sl_distance_price"))
             if distance:
                 sl = entry - distance if direction == "buy" else entry + distance
+        if sl is None and _rule_requires_stop(open_logic):
+            return self._hold(
+                request,
+                "策略要求设置止损，但AI未返回可计算的有效止损价，已阻止无止损开仓",
+                confidence=0.2,
+                usage=result.usage,
+            )
         if tp is None:
             distance = _positive_float(content.get("tp_distance_price"))
             if distance:
@@ -44,7 +63,6 @@ class CustomAiStrategy:
             return self._hold(request, "AI返回的止损价方向无效，已阻止开仓", confidence=0.2, usage=result.usage)
         if tp is not None and not _valid_target(direction, entry, tp):
             tp = None
-        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
         lot = _position_size_lot(config, request, entry=entry, sl=sl)
         return TradeDecision(
             decision_id=_decision_id(), request_id=request.request_id, status="APPROVED",
@@ -181,6 +199,38 @@ def _valid_stop(direction: str, entry: float, price: float) -> bool:
 
 def _valid_target(direction: str, entry: float, price: float) -> bool:
     return price > entry if direction == "buy" else price < entry
+
+
+def _recent_candle_extreme_stop(
+    rule: str,
+    direction: str,
+    candles: list[Any],
+) -> float | None:
+    if not rule or not candles:
+        return None
+    target_words = r"(?:最低(?:价|点)?|低点)" if direction == "buy" else r"(?:最高(?:价|点)?|高点)"
+    pattern = re.compile(
+        rf"(\d{{1,4}})\s*根\s*[kKＫｋ]\s*线[^。；;\n]{{0,40}}?{target_words}",
+        re.IGNORECASE,
+    )
+    count = None
+    for segment in re.split(r"[。；;\n]", rule):
+        if "止损" not in segment and not re.search(r"\b(?:stop\s*loss|sl)\b", segment, re.IGNORECASE):
+            continue
+        match = pattern.search(segment)
+        if match:
+            count = int(match.group(1))
+            break
+    if count is None or count < 1 or len(candles) < count:
+        return None
+    recent = sorted(candles, key=lambda candle: candle.timestamp)[-count:]
+    if direction == "buy":
+        return min(float(candle.low) for candle in recent)
+    return max(float(candle.high) for candle in recent)
+
+
+def _rule_requires_stop(rule: str) -> bool:
+    return bool(re.search(r"止损|\b(?:stop\s*loss|sl)\b", rule or "", re.IGNORECASE))
 
 
 def _truthy_bool(value: Any) -> bool:

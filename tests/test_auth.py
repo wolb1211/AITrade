@@ -82,6 +82,35 @@ def test_register_password_and_code_login(tmp_path: Path) -> None:
         assert str(exc) == "invalid_session"
 
 
+def test_user_remark_is_admin_only(tmp_path: Path) -> None:
+    service, email = create_service(tmp_path)
+    address = "remark@example.com"
+    service.register(email=address, password="Password123")
+    session = service.verify_registration(
+        email=address,
+        code=email.codes[(address, "register")],
+    )
+
+    saved = service.store.save_user({
+        **session["user"],
+        "remark": "仅供后台查看的客户备注",
+    })
+    assert "remark" not in saved
+    assert "remark" not in service.me(session["token"])
+
+    admin_users = service.store.list_users(
+        page=1,
+        size=20,
+        keyword="客户备注",
+    )
+    assert admin_users["total"] == 1
+    assert admin_users["list"][0]["remark"] == "仅供后台查看的客户备注"
+
+    # 其他保存逻辑不携带备注时，后台备注仍应保留。
+    service.store.save_user({**saved, "nickname": "新昵称"})
+    assert service.store.list_users(page=1, size=20)["list"][0]["remark"] == "仅供后台查看的客户备注"
+
+
 def test_reset_password(tmp_path: Path) -> None:
     service, email = create_service(tmp_path)
     address = "reset@example.com"

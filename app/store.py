@@ -541,6 +541,7 @@ class SqliteStore:
                     response_source TEXT NOT NULL DEFAULT 'provider',
                     cache_id TEXT,
                     error_message TEXT NOT NULL DEFAULT '',
+                    request_snapshot TEXT NOT NULL DEFAULT '',
                     response_preview TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
@@ -750,6 +751,7 @@ class SqliteStore:
             "invite_code": "ALTER TABLE users ADD COLUMN invite_code TEXT",
             "referrer_user_id": "ALTER TABLE users ADD COLUMN referrer_user_id INTEGER",
             "referred_at": "ALTER TABLE users ADD COLUMN referred_at TEXT NOT NULL DEFAULT ''",
+            "remark": "ALTER TABLE users ADD COLUMN remark TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -974,7 +976,7 @@ class SqliteStore:
                         last_login_at, remark, created_at, updated_at
                     ) VALUES (?, NULL, NULL, '', 'pending_activation', 0, '', 10, '', '', ?, ?, ?)
                     """,
-                    (int(raw_user_id), "由现有策略数据自动补充", now, now),
+                    (int(raw_user_id), "", now, now),
                 )
 
     def _ensure_mt5_history_columns(self, connection: sqlite3.Connection) -> None:
@@ -1028,6 +1030,7 @@ class SqliteStore:
             "provider_called": "ALTER TABLE ai_usage_logs ADD COLUMN provider_called INTEGER NOT NULL DEFAULT 1",
             "response_source": "ALTER TABLE ai_usage_logs ADD COLUMN response_source TEXT NOT NULL DEFAULT 'provider'",
             "cache_id": "ALTER TABLE ai_usage_logs ADD COLUMN cache_id TEXT",
+            "request_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN request_snapshot TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -2181,6 +2184,38 @@ class SqliteStore:
             page=page,
             size=size,
             mapper=self._official_strategy_row,
+        )
+
+    def list_admin_custom_strategies(self, *, page: int, size: int, keyword: str = "") -> dict[str, Any]:
+        clauses = ["d.strategy_code = 'CUSTOM_AI_V1'", "d.status <> 'deleted'"]
+        params: list[Any] = []
+        if keyword:
+            like = f"%{keyword}%"
+            clauses.append(
+                "(d.strategy_name LIKE ? OR d.user_id LIKE ? OR d.mt_login LIKE ? "
+                "OR d.config_json LIKE ? OR u.email LIKE ? OR u.nickname LIKE ?)"
+            )
+            params.extend([like, like, like, like, like, like])
+        where = f"WHERE {' AND '.join(clauses)}"
+        return self._paged_query_sql(
+            count_sql=f"""
+                SELECT COUNT(*)
+                FROM deployments d
+                LEFT JOIN users u ON u.id = d.user_id
+                {where}
+            """,
+            list_sql=f"""
+                SELECT d.*, u.email, u.nickname
+                FROM deployments d
+                LEFT JOIN users u ON u.id = d.user_id
+                {where}
+                ORDER BY d.updated_at DESC, d.id DESC
+                LIMIT ? OFFSET ?
+            """,
+            params=params,
+            page=page,
+            size=size,
+            mapper=self._admin_custom_strategy_row,
         )
 
     def get_official_ai_strategy(self, strategy_id: str) -> dict[str, Any] | None:
@@ -4628,8 +4663,8 @@ class SqliteStore:
         params: list[Any] = []
         if keyword:
             like = f"%{keyword}%"
-            keyword_clauses = ["u.email LIKE ?", "u.nickname LIKE ?"]
-            params.extend([like, like])
+            keyword_clauses = ["u.email LIKE ?", "u.nickname LIKE ?", "u.remark LIKE ?"]
+            params.extend([like, like, like])
             if keyword.isdigit():
                 keyword_clauses.append("u.id = ?")
                 params.append(int(keyword))
@@ -4660,7 +4695,7 @@ class SqliteStore:
             params=params,
             page=page,
             size=size,
-            mapper=self._user_row,
+            mapper=self._admin_user_row,
         )
 
     def get_user(self, user_id: int | str) -> dict[str, Any] | None:
@@ -4703,11 +4738,15 @@ class SqliteStore:
                 existing = None
                 if user_id is not None:
                     existing = connection.execute(
-                        "SELECT id, email_verified_at, agent_level, invite_code FROM users WHERE id = ?",
+                        "SELECT id, email_verified_at, agent_level, invite_code, remark FROM users WHERE id = ?",
                         (user_id,),
                     ).fetchone()
                 if existing and "agent_level" not in payload:
                     agent_level = int(existing["agent_level"] or 0)
+                if "remark" in payload:
+                    remark = str(payload.get("remark") or "")
+                else:
+                    remark = str(existing["remark"] or "") if existing else ""
                 invite_code = str(existing["invite_code"] or "") if existing else ""
                 if agent_level > 0 and not invite_code:
                     invite_code = self._generate_invite_code(connection)
@@ -4735,7 +4774,7 @@ class SqliteStore:
                             agent_level,
                             invite_code,
                             verified_at,
-                            str(payload.get("remark") or ""),
+                            remark,
                             now,
                             user_id,
                         ),
@@ -4744,7 +4783,7 @@ class SqliteStore:
                     columns = "email, password_hash, nickname, status, vip_level, vip_expires_at, max_strategy_keys, agent_level, invite_code, email_verified_at, last_login_at, remark, created_at, updated_at"
                     values: list[Any] = [
                         email, None, nickname, status, vip_level, vip_expires_at,
-                        max_strategy_keys, agent_level, invite_code or None, verified_at, "", str(payload.get("remark") or ""), now, now,
+                        max_strategy_keys, agent_level, invite_code or None, verified_at, "", remark, now, now,
                     ]
                     if user_id is not None:
                         columns = f"id, {columns}"
@@ -5499,8 +5538,8 @@ class SqliteStore:
                     official_tokens, custom_tokens, billing_source,
                     input_price_snapshot, output_price_snapshot, charged_amount, balance_after,
                     success, provider_called, response_source, cache_id,
-                    error_message, response_preview, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_message, request_snapshot, response_preview, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     log_id,
@@ -5529,6 +5568,7 @@ class SqliteStore:
                     response_source,
                     cache_id or None,
                     str(payload.get("error_message") or ""),
+                    str(payload.get("request_snapshot") or ""),
                     str(payload.get("response_preview") or ""),
                     now,
                 ),
@@ -5875,6 +5915,14 @@ class SqliteStore:
         data["email_verified"] = bool(data.get("email_verified_at"))
         data["password_configured"] = bool(data.get("password_hash"))
         data.pop("password_hash", None)
+        data.pop("remark", None)
+        return data
+
+    @staticmethod
+    def _admin_user_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        remark = str(dict(row).get("remark") or "")
+        data = SqliteStore._user_row(row)
+        data["remark"] = remark
         return data
 
     @staticmethod
@@ -5923,6 +5971,62 @@ class SqliteStore:
         data = dict(row)
         data["config"] = json.loads(data.pop("config_json"))
         return data
+
+    @staticmethod
+    def _admin_custom_strategy_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            config = json.loads(str(data.pop("config_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            config = {}
+
+        def list_value(key: str) -> list[Any]:
+            value = config.get(key)
+            return value if isinstance(value, list) else []
+
+        return {
+            "id": str(data.get("id") or ""),
+            "user_id": str(data.get("user_id") or ""),
+            "email": str(data.get("email") or ""),
+            "nickname": str(data.get("nickname") or ""),
+            "name": str(data.get("strategy_name") or ""),
+            "status": str(data.get("status") or ""),
+            "deployment_key": str(config.get("deployment_key") or ""),
+            "mt_login": str(data.get("mt_login") or ""),
+            "symbol": str(data.get("symbol") or ""),
+            "timeframe": str(data.get("timeframe") or ""),
+            "ea_description": str(config.get("ea_description") or ""),
+            "summary": str(config.get("summary") or ""),
+            "open_logic": str(config.get("open_logic") or ""),
+            "position_logic": str(config.get("position_logic") or ""),
+            "open_prompt_template": str(config.get("open_prompt_template") or ""),
+            "position_prompt_template": str(config.get("position_prompt_template") or ""),
+            "open_indicators": list_value("open_indicators"),
+            "position_indicators": list_value("position_indicators"),
+            "unsupported_indicators": list_value("unsupported_indicators"),
+            "warnings": list_value("warnings"),
+            "compile_status": str(config.get("compile_status") or ""),
+            "prompt_version": str(config.get("prompt_version") or ""),
+            "open_data_type": str(config.get("open_data_type") or "kline"),
+            "open_kline_count": int(config.get("open_kline_count") or 0),
+            "open_requested_kline_count": int(config.get("open_requested_kline_count") or 0),
+            "position_data_type": str(config.get("position_data_type") or "kline"),
+            "position_kline_count": int(config.get("position_kline_count") or 0),
+            "position_requested_kline_count": int(config.get("position_requested_kline_count") or 0),
+            "open_ai_mode": str(config.get("open_ai_mode") or "official"),
+            "open_ai_model": str(config.get("open_ai_model") or ""),
+            "position_ai_mode": str(config.get("position_ai_mode") or "official"),
+            "position_ai_model": str(config.get("position_ai_model") or ""),
+            "position_size_mode": str(config.get("position_size_mode") or "fixed"),
+            "fixed_volume": float(config.get("fixed_volume") or config.get("lot") or 0),
+            "risk_base_mode": str(config.get("risk_base_mode") or "fixed_loss"),
+            "risk_amount": float(config.get("risk_amount") or 0),
+            "risk_percent": float(config.get("risk_percent") or 0),
+            "max_positions": int(config.get("max_positions") or 1),
+            "allow_add": bool(config.get("allow_add", False)),
+            "created_at": str(data.get("created_at") or ""),
+            "updated_at": str(data.get("updated_at") or ""),
+        }
 
 
 class MySQLStore(SqliteStore):
@@ -6157,6 +6261,7 @@ class MySQLStore(SqliteStore):
                 "invite_code": "ALTER TABLE users ADD COLUMN invite_code VARCHAR(32) NULL AFTER agent_level",
                 "referrer_user_id": "ALTER TABLE users ADD COLUMN referrer_user_id BIGINT NULL AFTER invite_code",
                 "referred_at": "ALTER TABLE users ADD COLUMN referred_at VARCHAR(40) NOT NULL DEFAULT '' AFTER referrer_user_id",
+                "remark": "ALTER TABLE users ADD COLUMN remark TEXT NULL AFTER last_login_at",
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -6414,6 +6519,7 @@ class MySQLStore(SqliteStore):
             "provider_called": "ALTER TABLE ai_usage_logs ADD COLUMN provider_called TINYINT(1) NOT NULL DEFAULT 1 AFTER success",
             "response_source": "ALTER TABLE ai_usage_logs ADD COLUMN response_source VARCHAR(16) NOT NULL DEFAULT 'provider' AFTER provider_called",
             "cache_id": "ALTER TABLE ai_usage_logs ADD COLUMN cache_id VARCHAR(64) NULL AFTER response_source",
+            "request_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN request_snapshot MEDIUMTEXT NULL AFTER error_message",
         }
         with self._connect() as connection:
             rows = connection.execute(

@@ -845,6 +845,15 @@ def create_admin_ai_router(
         )
         return ok(data)
 
+    @router.post("/custom-strategy/list")
+    def custom_strategy_list(payload: dict[str, object] | None = None) -> dict[str, object]:
+        payload = payload or {}
+        return ok(store.list_admin_custom_strategies(
+            page=int(payload.get("page") or 1),
+            size=int(payload.get("size") or 20),
+            keyword=str(payload.get("keyword") or "").strip(),
+        ))
+
     @router.post("/official-strategy/detail")
     def official_strategy_detail(payload: dict[str, object]) -> dict[str, object]:
         strategy_id = str(payload.get("id") or payload.get("code") or "").strip()

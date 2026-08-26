@@ -332,6 +332,11 @@ def test_ai_client_uses_model_prices_for_realtime_charge(tmp_path: Path, monkeyp
     assert Decimal(usage["input_price_snapshot"]) == Decimal("2")
     assert Decimal(usage["output_price_snapshot"]) == Decimal("8")
     assert Decimal(usage["charged_amount"]) == Decimal("0.006")
+    request_snapshot = json.loads(usage["request_snapshot"])
+    assert request_snapshot["model"] == "example-model"
+    assert request_snapshot["messages"][0]["role"] == "system"
+    assert json.loads(request_snapshot["messages"][1]["content"])["symbol"] == "XAUUSD"
+    assert "sk-realtime-price" not in usage["request_snapshot"]
 
 
 def test_ai_client_reuses_cached_result_but_records_and_charges_each_request(tmp_path: Path, monkeypatch) -> None:

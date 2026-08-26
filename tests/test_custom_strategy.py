@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.models import (
     AccountIdentity,
     Candle,
@@ -13,6 +15,7 @@ from app.models import (
     UsageSummary,
 )
 from app.services.ai_service import AiCallResult, AiDecisionClient
+from app.services.ai_service import _custom_runtime_prompt, _json_api_system_prompt
 from app.services.custom_indicators import (
     INDICATOR_DEFINITIONS,
     calculate_indicator_payload,
@@ -112,6 +115,26 @@ def test_indicator_payload_marks_latest_closed_bar_crossover() -> None:
     }]
 
 
+def test_custom_open_runtime_prompt_forbids_invented_entry_filters() -> None:
+    prompt = _custom_runtime_prompt("open")
+
+    assert "Use only conditions explicitly written by the user" in prompt
+    assert "Never add confirmation, breakout, trend" in prompt
+    assert "should_open must be true" in prompt
+    assert "indicators.crossovers event matches it" in prompt
+    assert "return the resulting absolute sl price" in prompt
+
+
+def test_custom_json_prompt_contains_no_generic_market_analysis_requirements() -> None:
+    prompt = _json_api_system_prompt("open", _custom_runtime_prompt("open"), literal_user_rules=True)
+
+    assert "sole source of trading logic" in prompt
+    assert "only the supplied user rule" in prompt
+    assert "include market structure" not in prompt
+    assert "setup_score" not in prompt
+    assert "price/risk context" not in prompt
+
+
 def test_single_series_indicators_support_derived_price_sources() -> None:
     specs, unsupported = normalize_indicator_specs([
         {"name": "ema", "source": "open", "params": {"length": 10}},
@@ -179,6 +202,63 @@ class _PositionResultAiClient:
         return AiCallResult(content=self.content, usage=UsageSummary(ai_called=True))
 
 
+class _OpenResultAiClient:
+    def __init__(self, content: dict[str, Any]) -> None:
+        self.content = content
+
+    def custom_open_decision(self, **_: Any) -> AiCallResult:
+        return AiCallResult(content=self.content, usage=UsageSummary(ai_called=True))
+
+
+def test_recent_candle_stop_overrides_incorrect_ai_price_with_reversed_input() -> None:
+    request = _open_request()
+    request.candles = list(reversed(request.candles))
+    strategy = CustomAiStrategy(_OpenResultAiClient({
+        "should_open": True,
+        "direction": "buy",
+        "confidence": 0.9,
+        "sl": 9999,
+        "reason": "EMA5上穿EMA30",
+    }))  # type: ignore[arg-type]
+    deployment = {
+        "strategy_name": "EMA交叉策略",
+        "config": {
+            "fixed_volume": 0.1,
+            "position_size_mode": "fixed",
+            "open_logic": "EMA5上穿EMA30开多，止损在最近5根K线的低点",
+        },
+    }
+
+    decision = strategy.evaluate_open(request, deployment)
+
+    expected_sl = min(item.low for item in sorted(request.candles, key=lambda item: item.timestamp)[-5:])
+    assert decision.action == "BUY"
+    assert decision.sl == pytest.approx(expected_sl)
+
+
+def test_required_stop_without_valid_price_blocks_unprotected_open() -> None:
+    strategy = CustomAiStrategy(_OpenResultAiClient({
+        "should_open": True,
+        "direction": "buy",
+        "confidence": 0.9,
+        "sl": None,
+        "reason": "满足开仓条件",
+    }))  # type: ignore[arg-type]
+    deployment = {
+        "strategy_name": "复杂止损策略",
+        "config": {
+            "fixed_volume": 0.1,
+            "position_size_mode": "fixed",
+            "open_logic": "满足形态时开多，止损使用外部指标确认价",
+        },
+    }
+
+    decision = strategy.evaluate_open(_open_request(), deployment)
+
+    assert decision.action == "HOLD"
+    assert "阻止无止损开仓" in decision.reason
+
+
 def test_add_uses_user_lot_or_open_sizing_default_and_partial_close_never_guesses() -> None:
     deployment = {
         "strategy_name": "加减仓测试",
@@ -235,6 +315,8 @@ def test_runtime_payload_contains_closed_candles_and_calculated_indicators(tmp_p
     )
     payload = captured["user_payload"]
     assert len(payload["candles"]) == 100
+    assert [item["t"] for item in payload["candles"]] == sorted(item["t"] for item in payload["candles"])
+    assert payload["candles"][-1]["t"] == max(item.timestamp for item in _open_request().candles)
     assert len(payload["indicators"]["timestamps"]) == 100
     assert payload["data_convention"]["last_item"] == "latest_closed_candle"
 
@@ -366,5 +448,6 @@ def test_position_template_normalizes_atr_units_and_filters_internal_notes(tmp_p
     assert "atr14[-1]" in template
     assert "favorable_price_move > 0.5 * atr14[-1]" in template
     assert "ATR是由最高价、最低价和收盘价计算的价格距离" in template
-    assert "移动止损只能收紧" in template
+    assert "移动止损只能收紧" not in template
+    assert "优先执行平仓" not in template
     assert normalized["warnings"] == []

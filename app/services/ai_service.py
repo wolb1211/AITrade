@@ -296,7 +296,7 @@ class AiDecisionClient:
                 "task": "custom_strategy_open_decision",
                 "strategy_name": deployment.get("strategy_name", ""),
                 "user_rule": config.get("open_logic", ""),
-                "prompt_template": config.get("open_prompt_template", ""),
+                "prompt_template": _custom_runtime_template(config.get("open_prompt_template", "")),
                 "data_convention": {
                     "order": "oldest_to_latest",
                     "last_item": "latest_closed_candle",
@@ -347,7 +347,7 @@ class AiDecisionClient:
                 "task": "custom_strategy_position_decision",
                 "strategy_name": deployment.get("strategy_name", ""),
                 "user_rule": config.get("position_logic", ""),
-                "prompt_template": config.get("position_prompt_template", ""),
+                "prompt_template": _custom_runtime_template(config.get("position_prompt_template", "")),
                 "data_convention": {
                     "order": "oldest_to_latest",
                     "last_item": "latest_closed_candle",
@@ -644,6 +644,7 @@ class AiDecisionClient:
             return self._cached_result(
                 deployment=deployment,
                 endpoint=endpoint,
+                system_prompt=system_prompt,
                 user_payload=user_payload,
                 model=model,
                 cached=cached,
@@ -656,6 +657,7 @@ class AiDecisionClient:
                 return self._cached_result(
                     deployment=deployment,
                     endpoint=endpoint,
+                    system_prompt=system_prompt,
                     user_payload=user_payload,
                     model=model,
                     cached=cached,
@@ -686,6 +688,17 @@ class AiDecisionClient:
         model_id = self._usage_model_id(model)
         is_custom = bool(model.get("is_custom"))
         prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
+        final_system_prompt = _json_api_system_prompt(
+            endpoint,
+            system_prompt,
+            literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
+        )
+        request_snapshot = _format_request_snapshot(
+            model=model,
+            endpoint=endpoint,
+            system_prompt=final_system_prompt,
+            user_prompt=prompt,
+        )
         response_content = ""
         raw_response = ""
         usage = UsageSummary(ai_called=True)
@@ -695,7 +708,7 @@ class AiDecisionClient:
                 base_url=str(model["provider_base_url"]),
                 api_key=str(model["provider_api_key"]),
                 model=str(model.get("model") or model.get("name") or ""),
-                system_prompt=_json_api_system_prompt(endpoint, system_prompt),
+                system_prompt=final_system_prompt,
                 user_prompt=prompt,
                 max_tokens=_max_tokens_for_endpoint(endpoint),
                 strict_json=bool(model.get("strict_json", True)),
@@ -752,6 +765,7 @@ class AiDecisionClient:
                         model_id,
                         usage,
                         request_payload=user_payload,
+                        request_snapshot=request_snapshot,
                         success=True,
                         is_custom=is_custom,
                         response_preview=response_preview,
@@ -783,6 +797,7 @@ class AiDecisionClient:
                         model_id,
                         usage,
                         request_payload=user_payload,
+                        request_snapshot=request_snapshot,
                         success=False,
                         is_custom=is_custom,
                         error_message=message[:1000],
@@ -810,6 +825,7 @@ class AiDecisionClient:
                 model_id,
                 usage,
                 request_payload=user_payload,
+                request_snapshot=request_snapshot,
                 success=True,
                 is_custom=is_custom,
                 response_preview=response_preview,
@@ -833,6 +849,7 @@ class AiDecisionClient:
                 model_id,
                 usage,
                 request_payload=user_payload,
+                request_snapshot=request_snapshot,
                 success=False,
                 is_custom=is_custom,
                 error_message=message[:1000],
@@ -861,7 +878,11 @@ class AiDecisionClient:
             "provider_id": str(model.get("provider_id") or ""),
             "provider_base_url": str(model.get("provider_base_url") or "").rstrip("/"),
             "model": str(model.get("model") or model.get("name") or ""),
-            "system_prompt": _json_api_system_prompt(endpoint, system_prompt),
+            "system_prompt": _json_api_system_prompt(
+                endpoint,
+                system_prompt,
+                literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
+            ),
             "user_payload": user_payload,
             "temperature": 0,
             "max_tokens": _max_tokens_for_endpoint(endpoint),
@@ -875,6 +896,7 @@ class AiDecisionClient:
         *,
         deployment: dict[str, Any],
         endpoint: str,
+        system_prompt: str,
         user_payload: dict[str, Any],
         model: dict[str, Any],
         cached: dict[str, Any],
@@ -885,6 +907,17 @@ class AiDecisionClient:
             output_tokens=int(cached.get("output_tokens") or 0),
             charged_points=int(cached.get("total_tokens") or 0),
         )
+        prompt = json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
+        request_snapshot = _format_request_snapshot(
+            model=model,
+            endpoint=endpoint,
+            system_prompt=_json_api_system_prompt(
+                endpoint,
+                system_prompt,
+                literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
+            ),
+            user_prompt=prompt,
+        )
         self._save_usage(
             deployment,
             endpoint,
@@ -892,6 +925,7 @@ class AiDecisionClient:
             self._usage_model_id(model),
             usage,
             request_payload=user_payload,
+            request_snapshot=request_snapshot,
             success=True,
             is_custom=bool(model.get("is_custom")),
             response_preview=str(cached.get("response_preview") or ""),
@@ -1094,6 +1128,7 @@ class AiDecisionClient:
                     "如果内容里没有可恢复的明确交易结论，返回安全的不开仓或继续持有对象。"
                     f"必须使用这个结构: {schema}"
                 ),
+                literal_user_rules=True,
             ),
             user_prompt=response_content[:6000],
             max_tokens=700,
@@ -1120,6 +1155,7 @@ class AiDecisionClient:
         usage: UsageSummary,
         *,
         request_payload: dict[str, Any] | None = None,
+        request_snapshot: str = "",
         success: bool,
         is_custom: bool = False,
         error_message: str = "",
@@ -1155,6 +1191,7 @@ class AiDecisionClient:
                 "response_source": response_source or ("provider" if success else "fallback"),
                 "cache_id": cache_id,
                 "error_message": error_message,
+                "request_snapshot": request_snapshot,
                 "response_preview": response_preview,
             },
         )
@@ -1186,7 +1223,9 @@ def _pa_system_prompt() -> str:
 def _custom_strategy_stage_compile_prompt(stage: str) -> str:
     common = (
         "You compile one stage of a user's natural-language trading strategy into a reusable prompt template. "
-        "Analyze only the supplied stage. Preserve every condition and do not add conditions the user did not request. "
+        "Analyze only the supplied stage. The user's original rule is the sole source of trading logic. "
+        "Preserve every condition exactly and do not add, optimize, recommend or infer any condition the user did not write. "
+        "Do not add trend, confirmation, score, market-structure, volatility, risk-reward or safety filters. "
         "Extract every explicitly referenced built-in indicator and period. Candlestick sequences, engulfing, pin bars, "
         "support, resistance, recent highs and recent lows are inferred directly from OHLCV and are not indicators. "
         "The template must apply the rule strictly to supplied closed candles and calculated indicator arrays. "
@@ -1209,24 +1248,39 @@ def _custom_runtime_prompt(endpoint: str) -> str:
     if endpoint == "open":
         return (
             "You execute a user-defined trading strategy. Apply the supplied user_rule and prompt_template "
-            "strictly to closed OHLCV candles and indicator arrays. Candles are oldest to newest and the last "
+            "strictly and literally to closed OHLCV candles and indicator arrays. user_rule is the sole authoritative "
+            "source of trading logic; prompt_template may only clarify it and must never extend or override it. Use only "
+            "conditions explicitly written by the user. Never add confirmation, breakout, trend, volatility, "
+            "market-structure, score, risk-reward, safety or subjective suitability filters. Do not evaluate whether the "
+            "strategy is sensible; only determine whether the user's stated conditions are satisfied. "
+            "If all explicit user conditions are satisfied, should_open must be true even if you personally consider "
+            "the setup weak or risky. In particular, when the user's only trigger is an indicator crossover and the "
+            "authoritative indicators.crossovers event matches it, execute the corresponding buy or sell action; do "
+            "not require an additional price breakout or trend confirmation. A stop-loss formula based on recent candle "
+            "highs/lows, ATR, indicators or another supplied value is a complete stop definition even when it contains "
+            "no literal price. When opening, calculate that formula and return the resulting absolute sl price; never "
+            "return sl as null merely because the user did not write a numeric price. Candles are oldest to newest and the last "
             "item is the latest closed candle. Infer candlestick patterns directly from OHLCV. Do not invent "
             "missing facts or prices. For crossover rules, indicators.crossovers is the authoritative server-calculated "
-            "result; do not contradict it. In analysis, cite the relevant previous/latest values and crossover event. "
+            "result; do not contradict it. event=none means no crossover and must never be described as an upward or "
+            "downward crossover. In analysis, cite only facts relevant to the user's conditions and the final action. "
             "If every requested condition is not clearly satisfied, do not open. "
             "Return absolute sl and tp prices when the rule defines them."
         )
     return (
         "You execute the position-management part of a user-defined trading strategy. Apply only the supplied "
-        "user_rule and prompt_template to the closed candles, indicators and current positions. If no explicit "
+        "user_rule and prompt_template to the closed candles, indicators and current positions. user_rule is the sole "
+        "authoritative source of trading logic; prompt_template may only clarify it and must never extend or override it. "
+        "Do not add trend, confirmation, market-structure, score, risk-reward or safety conditions. Do not evaluate or "
+        "optimize the strategy. If no explicit "
         "risk condition is met, hold. Use only hold, close, add or modify. Never close or add without a clear rule. "
         "Indicator arrays are in indicators.values keyed by aliases such as atr14 and ema5, oldest to newest; [-1] "
         "is the latest closed candle. For crossover rules, indicators.crossovers is the authoritative server-calculated "
-        "result; do not contradict it. In analysis, cite the relevant previous/latest values and crossover event. "
+        "result; do not contradict it. event=none means no crossover and must never be described as an upward or "
+        "downward crossover. In analysis, cite only facts relevant to the user's conditions and the final action. "
         "ATR is a price distance, while position.profit is account-currency P/L: never "
         "compare them directly. For ATR-based favorable movement use BUY current_price-open_price and SELL "
-        "open_price-current_price. A BUY stop can only move up and a SELL stop can only move down; never loosen a stop. "
-        "If close and modify conditions both trigger, close has priority. "
+        "open_price-current_price. "
         "For add, return lot calculated strictly from an explicit user formula; if the user gave no lot formula, return "
         "lot as null and let the server use opening sizing. For close, return close_scope as full or partial. A partial "
         "close must include a positive volume calculated from the target position; otherwise hold instead of guessing."
@@ -1354,10 +1408,11 @@ def _reconcile_compilation_warnings(position_logic: str, raw_warnings: list[Any]
 
 
 def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any]]) -> str:
-    marker = "【系统运行约束】"
+    marker = "【系统数据说明】"
     cleaned = str(template or "").strip()
-    if marker in cleaned:
-        cleaned = cleaned.split(marker, 1)[0].rstrip()
+    for generated_marker in ("【系统运行约束】", marker):
+        if generated_marker in cleaned:
+            cleaned = cleaned.split(generated_marker, 1)[0].rstrip()
     cleaned = re.sub(r"\b([a-z][a-z0-9_]*)\s*\[\s*(\d+)\s*\]", r"\1\2", cleaned, flags=re.IGNORECASE)
     if any(str(spec.get("name") or "") in {"atr", "natr"} for spec in specs):
         lines = []
@@ -1372,13 +1427,28 @@ def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any
         f"1. 指标数组别名：{aliases}；数组按时间从旧到新排列，[-1] 是最新已收盘K线，[-2] 是上一根已收盘K线。\n"
         "2. ATR是由最高价、最低价和收盘价计算的价格距离，不能与账户货币盈亏profit直接比较。"
         "多单有利价格移动=current_price-open_price，空单有利价格移动=open_price-current_price。\n"
-        "3. 移动止损只能收紧：多单止损只能上移，空单止损只能下移，不得放宽已有止损。\n"
-        "4. 同时满足平仓和修改止损条件时，优先执行平仓；未明确触发任何条件时继续持有。"
     )
     return f"{cleaned}\n\n{guardrails}".strip()
 
 
-def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
+def _custom_runtime_template(value: Any) -> str:
+    template = str(value or "").strip()
+    for marker in ("【系统运行约束】", "【系统数据说明】"):
+        if marker in template:
+            template = template.split(marker, 1)[0].rstrip()
+    return template
+
+
+def _uses_literal_user_rules(deployment: dict[str, Any], endpoint: str) -> bool:
+    return endpoint.startswith("compile") or str(deployment.get("strategy_code") or "") == "CUSTOM_AI_V1"
+
+
+def _json_api_system_prompt(
+    endpoint: str,
+    task_prompt: str,
+    *,
+    literal_user_rules: bool = False,
+) -> str:
     if endpoint.startswith("compile"):
         return (
             "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
@@ -1395,6 +1465,19 @@ def _json_api_system_prompt(endpoint: str, task_prompt: str) -> str:
         '"lot":null,"close_scope":null,"volume":null,"sl":null,"tp":null,'
         '"reason":"short Chinese reason","analysis":"detailed Chinese position and risk explanation"}'
     )
+    if literal_user_rules:
+        return (
+            "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
+            "Start with { and end with }. No markdown, code fences, prefix, suffix or prose outside JSON. "
+            f"Required JSON shape: {schema}. "
+            "The user's original rule is the sole source of trading logic. Do not add, optimize, recommend or infer "
+            "any trading condition. reason and analysis must explain only the supplied user rule, relevant supplied "
+            "data and the resulting action. Do not add market structure, setup score, trend, confirmation, risk-reward "
+            "or safety analysis unless the user explicitly wrote it. Never invent missing facts or prices. If required "
+            "data is missing, state that fact without replacing it with another condition. "
+            "Never copy placeholder text from the schema. "
+            f"Task: {task_prompt}"
+        )
     return (
         "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
         "Start with { and end with }. No markdown, no code fences, no prefix, no suffix, no prose outside JSON. "
@@ -1419,6 +1502,7 @@ def _max_tokens_for_endpoint(endpoint: str) -> int:
     return 500
 
 def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any]]:
+    ordered = sorted(candles, key=lambda candle: candle.timestamp)[-limit:]
     return [
         {
             "t": candle.timestamp,
@@ -1428,7 +1512,7 @@ def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any
             "c": candle.close,
             "v": candle.volume,
         }
-        for candle in candles[-limit:]
+        for candle in ordered
     ]
 
 
@@ -1614,6 +1698,27 @@ def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = N
     if parsed is not None:
         parts.append(f"解析结果:\n{_preview_text(json.dumps(parsed, ensure_ascii=False), 1600)}")
     return "\n\n".join(parts)[:3200]
+
+
+def _format_request_snapshot(
+    *,
+    model: dict[str, Any],
+    endpoint: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    body: dict[str, Any] = {
+        "model": str(model.get("model") or model.get("name") or ""),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": _max_tokens_for_endpoint(endpoint),
+    }
+    if bool(model.get("strict_json", True)):
+        body["response_format"] = {"type": "json_object"}
+    return json.dumps(body, ensure_ascii=False, indent=2)
 
 
 def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) -> str:
