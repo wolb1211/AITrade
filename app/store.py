@@ -978,6 +978,10 @@ class SqliteStore:
                     """,
                     (int(raw_user_id), "", now, now),
                 )
+            connection.execute(
+                "UPDATE users SET remark = '' WHERE remark = ?",
+                ("由现有策略数据自动补充",),
+            )
 
     def _ensure_mt5_history_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
