@@ -102,10 +102,28 @@ class CustomAiStrategy:
                 volume=volume, usage=result.usage,
             )
         if action == "modify":
-            sl = _optional_price(content.get("sl"))
-            tp = _optional_price(content.get("tp"))
-            if sl is None and tp is None:
+            requested_sl = _optional_price(content.get("sl"))
+            requested_tp = _optional_price(content.get("tp"))
+            sl_rejected_reason = _invalid_modified_stop_reason(request, target, requested_sl)
+            if sl_rejected_reason:
+                requested_sl = None
+            if requested_sl is None and requested_tp is None:
+                if sl_rejected_reason:
+                    return self._position_hold(
+                        request,
+                        target.ticket,
+                        sl_rejected_reason,
+                        confidence=confidence,
+                        usage=result.usage,
+                    )
                 return self._position_hold(request, target.ticket, "未返回有效止盈止损价，继续持有", usage=result.usage)
+            # MT5 modifies SL and TP together. Preserve any side that the AI did
+            # not validly change so a null/invalid field can never clear or
+            # loosen an existing protection level.
+            sl = requested_sl if requested_sl is not None else target.sl
+            tp = requested_tp if requested_tp is not None else target.tp
+            if sl_rejected_reason:
+                reason = f"{reason}；{sl_rejected_reason}，仅处理其他有效修改"
             return TradeDecision(
                 decision_id=_decision_id(), request_id=request.request_id, status="APPROVED",
                 action="MODIFY_SL", symbol=request.symbol, confidence=confidence, reason=reason,
@@ -199,6 +217,29 @@ def _valid_stop(direction: str, entry: float, price: float) -> bool:
 
 def _valid_target(direction: str, entry: float, price: float) -> bool:
     return price > entry if direction == "buy" else price < entry
+
+
+def _invalid_modified_stop_reason(
+    request: PositionEvaluateRequest,
+    position: Any,
+    requested_sl: float | None,
+) -> str:
+    if requested_sl is None:
+        return ""
+    side = str(position.side or "").upper()
+    current_sl = _optional_price(position.sl)
+    tolerance = max(1e-9, abs(position.open_price) * 1e-10)
+    if side == "BUY":
+        if current_sl is not None and requested_sl <= current_sl + tolerance:
+            return f"AI返回的多单止损{requested_sl:g}未高于当前止损{current_sl:g}，已拒绝回退止损"
+        if requested_sl >= request.bid - tolerance:
+            return f"AI返回的多单止损{requested_sl:g}不低于当前Bid {request.bid:g}，已拒绝无效止损"
+    elif side == "SELL":
+        if current_sl is not None and requested_sl >= current_sl - tolerance:
+            return f"AI返回的空单止损{requested_sl:g}未低于当前止损{current_sl:g}，已拒绝回退止损"
+        if requested_sl <= request.ask + tolerance:
+            return f"AI返回的空单止损{requested_sl:g}不高于当前Ask {request.ask:g}，已拒绝无效止损"
+    return ""
 
 
 def _recent_candle_extreme_stop(

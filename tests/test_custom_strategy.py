@@ -178,6 +178,70 @@ class _FakeAiClient:
         )
 
 
+class _PositionModifyAi:
+    def __init__(self, sl: float, tp: float | None = None) -> None:
+        self.sl = sl
+        self.tp = tp
+
+    def custom_position_decision(self, **_: Any) -> AiCallResult:
+        return AiCallResult(
+            content={
+                "action": "modify",
+                "ticket": "123",
+                "sl": self.sl,
+                "tp": self.tp,
+                "confidence": 0.8,
+                "reason": "移动止损",
+                "analysis": "分析文字可能与结构化止损字段不一致",
+            },
+            usage=UsageSummary(ai_called=True),
+        )
+
+
+@pytest.mark.parametrize(
+    ("side", "current_sl", "requested_sl", "expected_action"),
+    [
+        ("BUY", 1932.0, 1925.0, "HOLD"),
+        ("BUY", 1932.0, 1934.0, "MODIFY_SL"),
+        ("BUY", 1932.0, 1936.5, "HOLD"),
+        ("SELL", 1940.0, 1945.0, "HOLD"),
+        ("SELL", 1940.0, 1938.0, "MODIFY_SL"),
+        ("SELL", 1940.0, 1935.0, "HOLD"),
+    ],
+)
+def test_custom_position_stop_can_only_tighten(
+    side: str,
+    current_sl: float,
+    requested_sl: float,
+    expected_action: str,
+) -> None:
+    request = _position_request()
+    request.positions[0].side = side
+    request.positions[0].sl = current_sl
+    strategy = CustomAiStrategy(_PositionModifyAi(requested_sl))
+
+    decision = strategy.evaluate_position(request, {"config": {}})
+
+    assert decision.action == expected_action
+    if expected_action == "MODIFY_SL":
+        assert decision.sl == requested_sl
+    else:
+        assert "已拒绝" in decision.reason
+
+
+def test_custom_position_modify_preserves_existing_tp() -> None:
+    request = _position_request()
+    request.positions[0].sl = 1932.0
+    request.positions[0].tp = 1950.0
+    strategy = CustomAiStrategy(_PositionModifyAi(1934.0))
+
+    decision = strategy.evaluate_position(request, {"config": {}})
+
+    assert decision.action == "MODIFY_SL"
+    assert decision.sl == 1934.0
+    assert decision.tp == 1950.0
+
+
 def test_custom_strategy_can_open_from_candlestick_rule_and_partial_close() -> None:
     strategy = CustomAiStrategy(_FakeAiClient())  # type: ignore[arg-type]
     deployment = {
