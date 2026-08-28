@@ -654,10 +654,7 @@ class AiDecisionClient:
         choice = (parsed.get("choices") or [{}])[0] if isinstance(parsed, dict) else {}
         message_payload = choice.get("message") if isinstance(choice, dict) else {}
         content = str(message_payload.get("content") or "").strip() if isinstance(message_payload, dict) else ""
-        normalized_content = re.sub(r"[^A-Z\u4e00-\u9fff]", "", content.upper())
-        english_correct = "REDCIRCLE" in normalized_content and "BLUESQUARE" in normalized_content
-        chinese_correct = "红色圆" in normalized_content and "蓝色方" in normalized_content
-        if not (english_correct or chinese_correct):
+        if not _vision_test_answer_is_correct(content):
             raise RuntimeError(
                 f"模型未能正确识别测试图片（期望：红色圆形、蓝色方形；返回：{_preview_text(content or raw_response)}）"
             )
@@ -2130,6 +2127,23 @@ def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
         "reason": reason,
         "analysis": reason,
     }
+
+def _vision_test_answer_is_correct(value: str) -> bool:
+    text = str(value or "")
+    normalized_english = re.sub(r"[^A-Z]+", " ", text.upper()).strip()
+    red_circle = bool(re.search(r"\b(?:RED CIRCLE|CIRCLE RED)\b", normalized_english))
+    blue_shape = bool(re.search(
+        r"\b(?:BLUE (?:SQUARE|RECTANGLE)|(?:SQUARE|RECTANGLE) BLUE)\b",
+        normalized_english,
+    ))
+    english_correct = red_circle and blue_shape
+    normalized_chinese = re.sub(r"[^\u4e00-\u9fff]", "", text)
+    chinese_correct = (
+        any(pair in normalized_chinese for pair in ("红色圆", "红圆", "圆形为红", "圆是红"))
+        and any(pair in normalized_chinese for pair in ("蓝色方", "蓝方", "蓝色矩", "蓝矩", "蓝色长方", "方形为蓝", "矩形为蓝"))
+    )
+    return english_correct or chinese_correct
+
 
 def _preview_text(value: str, limit: int = 500) -> str:
     return value.replace("\r", " ").replace("\n", " ").strip()[:limit]

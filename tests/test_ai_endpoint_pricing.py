@@ -6,8 +6,17 @@ from io import BytesIO
 from pathlib import Path
 from urllib import error, request
 
-from app.services.ai_service import AiDecisionClient
+from app.services.ai_service import AiDecisionClient, _vision_test_answer_is_correct
 from app.store import SqliteStore
+
+
+def test_vision_answer_accepts_equivalent_english_and_chinese_shape_names() -> None:
+    assert _vision_test_answer_is_correct("RED CIRCLE, BLUE SQUARE") is True
+    assert _vision_test_answer_is_correct("RED CIRCLE, BLUE RECTANGLE") is True
+    assert _vision_test_answer_is_correct("The image contains a blue rectangle and a red circle.") is True
+    assert _vision_test_answer_is_correct("红色圆形、蓝色方形") is True
+    assert _vision_test_answer_is_correct("蓝色矩形和红色圆形") is True
+    assert _vision_test_answer_is_correct("RED SQUARE, BLUE CIRCLE") is False
 
 
 def test_full_chat_completions_url_and_bearer_header_are_supported(tmp_path: Path, monkeypatch) -> None:
