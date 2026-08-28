@@ -413,32 +413,6 @@ def create_mt5_router(
         provider: str = "",
     ) -> Mt5StrategyInitResponse:
         deployment = store.find_deployment_by_key(raw_key)
-        if deployment is None and raw_key.strip().startswith("gl_"):
-            deployment = store.upsert_web_deployment(
-                raw_key,
-                user_id="mt5_runtime",
-                strategy_code="PA_MOCK_V1",
-                strategy_name="MT5 Runtime PA Mock",
-                status="active",
-                symbol="XAUUSD",
-                timeframe="M15",
-                config={
-                    "lot": 0.01,
-                    "sl_distance": 5.0,
-                    "tp_distance": 8.0,
-                    "max_loss_per_position": 100.0,
-                    "take_profit_per_position": 150.0,
-                    "open_data_type": "kline",
-                    "open_kline_count": 100,
-                    "position_data_type": "kline",
-                    "position_kline_count": 100,
-                    "call_mode": "bar",
-                    "call_val": 1,
-                    "summary": "Auto-created by MT5 init for local development.",
-                    "open_logic": "",
-                    "position_logic": "",
-                },
-            )
         if deployment is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -446,6 +420,11 @@ def create_mt5_router(
             )
 
         access_error = decision_service.deployment_access_error(deployment)
+        if access_error == "invalid_deployment_key":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=access_error,
+            )
 
         if access_error is None and account is not None:
             try:

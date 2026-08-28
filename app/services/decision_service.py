@@ -41,11 +41,23 @@ class DecisionService:
         access_error = self.deployment_access_error(deployment)
         if access_error is not None:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
+                status_code=(
+                    status.HTTP_401_UNAUTHORIZED
+                    if access_error == "invalid_deployment_key"
+                    else status.HTTP_403_FORBIDDEN
+                ),
                 detail=access_error,
             )
 
     def deployment_access_error(self, deployment: dict[str, Any]) -> str | None:
+        # Older builds auto-created an active PA mock deployment for every unknown
+        # gl_* key received by MT init. Never allow those development-only records
+        # to authenticate or reach a trading decision, even if they remain stored.
+        if (
+            str(deployment.get("user_id") or "").strip() == "mt5_runtime"
+            and str(deployment.get("strategy_code") or "").strip() == "PA_MOCK_V1"
+        ):
+            return "invalid_deployment_key"
         if deployment["status"] != "active":
             return "deployment_not_active"
         raw_user_id = str(deployment.get("user_id") or "").strip()
