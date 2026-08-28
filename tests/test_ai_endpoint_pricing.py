@@ -225,6 +225,8 @@ def test_vision_test_sends_image_and_persists_capability(tmp_path: Path, monkeyp
 
     assert result["supports_vision"] is True
     assert provider_args["user_image_url"].startswith("data:image/jpeg;base64,")
+    assert "RED CIRCLE" not in provider_args["user_prompt"]
+    assert "BLUE SQUARE" not in provider_args["user_prompt"]
     assert saved is not None
     assert saved["supports_vision"] is True
     assert saved["vision_test_status"] == "passed"

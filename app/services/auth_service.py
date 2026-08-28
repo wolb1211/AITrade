@@ -8,6 +8,7 @@ from typing import Any
 from app.config import Settings
 from app.security import hash_auth_value, hash_password, verify_password
 from app.services.email_service import EmailService
+from app.services.screenshot_preview import ScreenshotError, load_preview
 from app.store import SqliteStore
 
 
@@ -382,11 +383,13 @@ class UserAuthService:
             self._apply_custom_compilation(config, compiled, custom_data)
             fields = (
                 "summary", "open_prompt_template", "position_prompt_template",
-                "open_indicators", "position_indicators", "open_kline_count",
+                "open_indicators", "position_indicators", "open_rule_plan", "position_rule_plan",
+                "rule_engine_version", "open_kline_count",
                 "position_kline_count", "open_requested_kline_count",
                 "position_requested_kline_count", "open_indicator_kline_count",
                 "position_indicator_kline_count", "open_data_type", "position_data_type",
-                "unsupported_indicators", "warnings", "prompt_version", "compile_status",
+                "unsupported_indicators", "unsupported_conditions", "unsupported_condition_count",
+                "visual_conditions", "warnings", "prompt_version", "compile_status",
             )
             return {key: config[key] for key in fields}
 
@@ -426,6 +429,12 @@ class UserAuthService:
         custom_data: dict[str, Any],
     ) -> None:
         config.update(compiled)
+        config.setdefault("open_rule_plan", {"version": 1, "mode": "ai", "rules": []})
+        config.setdefault("position_rule_plan", {"version": 1, "mode": "ai", "rules": []})
+        config.setdefault("rule_engine_version", 1)
+        config.setdefault("unsupported_conditions", [])
+        config["unsupported_condition_count"] = len(config["unsupported_conditions"])
+        config.setdefault("visual_conditions", [])
         for prefix in ("open", "position"):
             selected_type = str(custom_data[f"{prefix}_data_type"])
             selected_count = int(custom_data[f"{prefix}_kline_count"])
@@ -458,6 +467,19 @@ class UserAuthService:
             start_at=str(start_at or "").strip(),
             end_at=str(end_at or "").strip(),
         )
+
+    def usage_screenshot_preview(self, token: str, *, usage_id: str) -> dict[str, Any]:
+        user = self.me(token)
+        preview_id = self.store.get_user_ai_usage_screenshot_preview_id(
+            user_id=int(user["id"]),
+            usage_id=str(usage_id or "").strip(),
+        )
+        if not preview_id:
+            raise AuthError("screenshot_preview_not_found", 404)
+        try:
+            return load_preview(preview_id)
+        except ScreenshotError as exc:
+            raise AuthError(str(exc), 404) from exc
 
     def orders(
         self,

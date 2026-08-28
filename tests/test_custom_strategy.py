@@ -15,7 +15,11 @@ from app.models import (
     UsageSummary,
 )
 from app.services.ai_service import AiCallResult, AiDecisionClient
-from app.services.ai_service import _custom_runtime_prompt, _json_api_system_prompt
+from app.services.ai_service import (
+    _custom_runtime_prompt,
+    _custom_strategy_stage_compile_prompt,
+    _json_api_system_prompt,
+)
 from app.services.custom_indicators import (
     INDICATOR_DEFINITIONS,
     calculate_indicator_payload,
@@ -87,7 +91,7 @@ def test_indicator_arrays_are_aligned_and_keep_100_effective_values() -> None:
     assert all(len(values) == 3 for values in payload["recent_values"].values())
 
 
-def test_indicator_payload_marks_latest_closed_bar_crossover() -> None:
+def test_indicator_payload_exposes_recent_values_without_preclassified_crossover() -> None:
     candles = [
         Candle(
             timestamp=1_700_000_000 + index * 60,
@@ -106,13 +110,9 @@ def test_indicator_payload_marks_latest_closed_bar_crossover() -> None:
 
     payload = calculate_indicator_payload(candles, specs, output_count=100)
 
-    assert payload["crossovers"] == [{
-        "left": "ema5",
-        "right": "ema30",
-        "previous": {"left": 100.0, "right": 100.0},
-        "latest": {"left": payload["values"]["ema5"][-1], "right": payload["values"]["ema30"][-1]},
-        "event": "left_crossed_above",
-    }]
+    assert "crossovers" not in payload
+    assert payload["recent_values"]["ema5"] == payload["values"]["ema5"][-3:]
+    assert payload["recent_values"]["ema30"] == payload["values"]["ema30"][-3:]
 
 
 def test_custom_open_runtime_prompt_forbids_invented_entry_filters() -> None:
@@ -121,7 +121,7 @@ def test_custom_open_runtime_prompt_forbids_invented_entry_filters() -> None:
     assert "Use only conditions explicitly written by the user" in prompt
     assert "Never add confirmation, breakout, trend" in prompt
     assert "should_open must be true" in prompt
-    assert "indicators.crossovers event matches it" in prompt
+    assert "Evaluate crossovers directly from supplied indicator arrays" in prompt
     assert "return the resulting absolute sl price" in prompt
 
 
@@ -133,6 +133,30 @@ def test_custom_json_prompt_contains_no_generic_market_analysis_requirements() -
     assert "include market structure" not in prompt
     assert "setup_score" not in prompt
     assert "price/risk context" not in prompt
+    assert "Complete valid JSON has highest priority" in prompt
+    assert "never put step-by-step reasoning" in prompt
+    assert "analysis must be a clear, natural and compact Chinese strategy explanation" in prompt
+    assert "identify the exact unmet condition" in prompt
+
+
+def test_custom_position_compile_prompt_preserves_staged_stop_rules() -> None:
+    prompt = _custom_strategy_stage_compile_prompt("position")
+
+    assert "explicit stage conditions" in prompt
+    assert "earlier stage is completed" in prompt
+    assert "Never flatten a user-defined sequence" in prompt
+    assert "Do not invent a default priority" in prompt
+    assert "or any indicator, threshold, stage, trigger or risk rule" in prompt
+
+
+def test_custom_position_runtime_prompt_prevents_completed_stage_reentry() -> None:
+    prompt = _custom_runtime_prompt("position")
+
+    assert "determine whether a user-defined prior stage has completed" in prompt
+    assert "Apply a one-way stop restriction only if the user" in prompt
+    assert "otherwise a requested stop may tighten or loosen" in prompt
+    assert "structured sl value must exactly match" in prompt
+    assert "must not create a new trigger, filter, stage, priority or risk condition" in prompt
 
 
 def test_single_series_indicators_support_derived_price_sources() -> None:
@@ -199,21 +223,18 @@ class _PositionModifyAi:
 
 
 @pytest.mark.parametrize(
-    ("side", "current_sl", "requested_sl", "expected_action"),
+    ("side", "current_sl", "requested_sl"),
     [
-        ("BUY", 1932.0, 1925.0, "HOLD"),
-        ("BUY", 1932.0, 1934.0, "MODIFY_SL"),
-        ("BUY", 1932.0, 1936.5, "HOLD"),
-        ("SELL", 1940.0, 1945.0, "HOLD"),
-        ("SELL", 1940.0, 1938.0, "MODIFY_SL"),
-        ("SELL", 1940.0, 1935.0, "HOLD"),
+        ("BUY", 1932.0, 1925.0),
+        ("BUY", 1932.0, 1934.0),
+        ("SELL", 1940.0, 1945.0),
+        ("SELL", 1940.0, 1938.0),
     ],
 )
-def test_custom_position_stop_can_only_tighten(
+def test_custom_position_stop_follows_ai_rule_without_direction_override(
     side: str,
     current_sl: float,
     requested_sl: float,
-    expected_action: str,
 ) -> None:
     request = _position_request()
     request.positions[0].side = side
@@ -222,11 +243,9 @@ def test_custom_position_stop_can_only_tighten(
 
     decision = strategy.evaluate_position(request, {"config": {}})
 
-    assert decision.action == expected_action
-    if expected_action == "MODIFY_SL":
-        assert decision.sl == requested_sl
-    else:
-        assert "已拒绝" in decision.reason
+    assert decision.action == "MODIFY_SL"
+    assert decision.sl == requested_sl
+    assert decision.reason == "分析文字可能与结构化止损字段不一致"
 
 
 def test_custom_position_modify_preserves_existing_tp() -> None:
@@ -274,14 +293,14 @@ class _OpenResultAiClient:
         return AiCallResult(content=self.content, usage=UsageSummary(ai_called=True))
 
 
-def test_recent_candle_stop_overrides_incorrect_ai_price_with_reversed_input() -> None:
+def test_open_stop_uses_ai_result_without_local_natural_language_override() -> None:
     request = _open_request()
     request.candles = list(reversed(request.candles))
     strategy = CustomAiStrategy(_OpenResultAiClient({
         "should_open": True,
         "direction": "buy",
         "confidence": 0.9,
-        "sl": 9999,
+        "sl": 1899.25,
         "reason": "EMA5上穿EMA30",
     }))  # type: ignore[arg-type]
     deployment = {
@@ -295,12 +314,11 @@ def test_recent_candle_stop_overrides_incorrect_ai_price_with_reversed_input() -
 
     decision = strategy.evaluate_open(request, deployment)
 
-    expected_sl = min(item.low for item in sorted(request.candles, key=lambda item: item.timestamp)[-5:])
     assert decision.action == "BUY"
-    assert decision.sl == pytest.approx(expected_sl)
+    assert decision.sl == pytest.approx(1899.25)
 
 
-def test_required_stop_without_valid_price_blocks_unprotected_open() -> None:
+def test_server_does_not_parse_natural_language_to_override_missing_stop() -> None:
     strategy = CustomAiStrategy(_OpenResultAiClient({
         "should_open": True,
         "direction": "buy",
@@ -319,8 +337,8 @@ def test_required_stop_without_valid_price_blocks_unprotected_open() -> None:
 
     decision = strategy.evaluate_open(_open_request(), deployment)
 
-    assert decision.action == "HOLD"
-    assert "阻止无止损开仓" in decision.reason
+    assert decision.action == "BUY"
+    assert decision.sl is None
 
 
 def test_add_uses_user_lot_or_open_sizing_default_and_partial_close_never_guesses() -> None:
@@ -437,6 +455,60 @@ def test_compilation_adds_only_relevant_sizing_warnings(tmp_path: Path) -> None:
         position_logic="出现反向吞没时部分平仓",
     )
     assert any("未指定平仓比例或手数" in item for item in missing_partial_size["warnings"])
+
+
+def test_compilation_collects_unsupported_conditions_and_count(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "custom-unsupported-conditions.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    normalized = client.normalize_custom_strategy_compilation(
+        {
+            "summary": "主观形态策略",
+            "open_prompt_template": "出现强势形态时开仓。",
+            "position_prompt_template": "没有条件时继续持有。",
+            "open_rule_plan": {"version": 1, "mode": "ai", "rules": []},
+            "position_rule_plan": {"version": 1, "mode": "deterministic", "rules": [{
+                "when": "side == 'BUY' and current_price < open_price",
+                "action": {"type": "close", "close_scope": "full"},
+                "description": "多单价格低于开仓价时平仓",
+            }]},
+            "unsupported_conditions": [{
+                "stage": "open",
+                "code": "subjective_strength",
+                "text": "出现明显强势形态",
+                "reason": "强势程度属于主观判断",
+            }],
+        },
+        open_logic="出现明显强势形态时开多",
+        position_logic="多单价格低于开仓价时平仓",
+    )
+
+    assert normalized["unsupported_condition_count"] == 1
+    assert normalized["unsupported_conditions"][0]["code"] == "subjective_strength"
+
+
+def test_compilation_keeps_supported_visual_conditions_out_of_unsupported_count(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "custom-visual-conditions.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    normalized = client.normalize_custom_strategy_compilation(
+        {
+            "summary": "截图趋势线策略",
+            "open_prompt_template": "截图中突破手工趋势线时开多。",
+            "position_prompt_template": "截图中跌破手工趋势线时平仓。",
+            "open_rule_plan": {"version": 1, "mode": "ai", "rules": []},
+            "position_rule_plan": {"version": 1, "mode": "ai", "rules": []},
+            "visual_conditions": [
+                {"stage": "open", "code": "drawn_trendline_break", "text": "突破手工趋势线"},
+                {"stage": "position", "code": "drawn_trendline_break", "text": "跌破手工趋势线"},
+            ],
+        },
+        open_logic="截图中突破手工趋势线时开多",
+        position_logic="截图中跌破手工趋势线时平仓",
+    )
+
+    assert normalized["unsupported_condition_count"] == 0
+    assert len(normalized["visual_conditions"]) == 2
 
 
 def test_custom_strategy_compiles_open_and_position_with_separate_calls(tmp_path: Path) -> None:

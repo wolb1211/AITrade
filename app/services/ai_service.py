@@ -19,6 +19,7 @@ from app.services.custom_indicators import (
     public_indicator_catalog,
     required_candle_count,
 )
+from app.services.custom_rule_engine import RULE_ENGINE_VERSION, RulePlanError, normalize_rule_plan
 from app.store import SqliteStore
 
 logger = logging.getLogger(__name__)
@@ -167,8 +168,6 @@ class AiDecisionClient:
                         "to newest; [-1] is the latest closed candle and [-2] is the previous closed candle."
                     ),
                     "atr": "ATR is a price distance calculated from high, low and close; it is not account-currency profit.",
-                    "stop_safety": "A BUY stop may only move upward; a SELL stop may only move downward. Never loosen a stop.",
-                    "priority": "When a close condition and stop-modification condition trigger together, close takes priority.",
                 },
                 "rules": {
                     "candlestick_patterns": "Do not create indicators for candlestick patterns; runtime supplies OHLCV arrays.",
@@ -176,6 +175,12 @@ class AiDecisionClient:
                     "indicators": "Include every explicitly referenced built-in indicator and every period, even when also used for opening.",
                     "data_type": "Use kline unless the rule explicitly requires a chart image or an unsupported custom indicator.",
                     "execution": "Do not invent new action types. Position actions are hold, close, add, modify.",
+                    "staged_rules": (
+                        "Preserve temporal words such as first, once, then, after, thereafter, already and not-yet. "
+                        "Compile sequential stop rules into mutually exclusive stages. A completed earlier stage must "
+                        "not become eligible again when the user says so; determine completion from observable position "
+                        "fields referenced by the user's rule instead of inventing persistent state."
+                    ),
                     "add_volume": (
                         "If position rules request adding but do not define a lot calculation, preserve the add condition, "
                         "state in the position template that lot must be null so the server uses the opening sizing algorithm, "
@@ -209,11 +214,21 @@ class AiDecisionClient:
             "position_prompt_template": position_prompt,
             "open_indicators": open_content.get("indicators") or open_content.get("open_indicators") or [],
             "position_indicators": position_content.get("indicators") or position_content.get("position_indicators") or [],
-            "open_data_type": open_content.get("data_type") or open_content.get("open_data_type") or "kline",
-            "position_data_type": position_content.get("data_type") or position_content.get("position_data_type") or "kline",
+            "open_rule_plan": open_content.get("rule_plan") or open_content.get("open_rule_plan") or {},
+            "position_rule_plan": position_content.get("rule_plan") or position_content.get("position_rule_plan") or {},
+            "open_data_type": config.get("open_data_type") or open_content.get("data_type") or open_content.get("open_data_type") or "kline",
+            "position_data_type": config.get("position_data_type") or position_content.get("data_type") or position_content.get("position_data_type") or "kline",
             "unsupported_indicators": [
                 *_as_list(open_content.get("unsupported_indicators")),
                 *_as_list(position_content.get("unsupported_indicators")),
+            ],
+            "unsupported_conditions": [
+                *_stage_unsupported_conditions(open_content.get("unsupported_conditions"), "open"),
+                *_stage_unsupported_conditions(position_content.get("unsupported_conditions"), "position"),
+            ],
+            "visual_conditions": [
+                *_stage_unsupported_conditions(open_content.get("visual_conditions"), "open"),
+                *_stage_unsupported_conditions(position_content.get("visual_conditions"), "position"),
             ],
             "warnings": [*_as_list(open_content.get("warnings")), *_as_list(position_content.get("warnings"))],
         }
@@ -258,19 +273,80 @@ class AiDecisionClient:
         warning_items = raw_warnings if isinstance(raw_warnings, list) else [raw_warnings] if raw_warnings else []
         warnings = _reconcile_compilation_warnings(position_logic, warning_items)
         position_prompt = _apply_position_template_guardrails(position_prompt, position_specs)
+        open_plan_value = _rewrite_rule_plan_indicator_aliases(content.get("open_rule_plan"), open_specs)
+        position_plan_value = _rewrite_rule_plan_indicator_aliases(content.get("position_rule_plan"), position_specs)
+        try:
+            _validate_user_cross_rules(open_logic, open_plan_value)
+            open_rule_plan = normalize_rule_plan(
+                open_plan_value,
+                stage="open",
+                indicator_aliases={str(item.get("alias") or item.get("name") or "").lower() for item in open_specs},
+            )
+        except RulePlanError as exc:
+            logger.warning("Open rule plan validation failed: %s", exc)
+            open_rule_plan = {"version": RULE_ENGINE_VERSION, "mode": "ai", "rules": []}
+            warnings.append("开仓规则暂未能转换为精确执行规则，将继续使用 AI 判断。")
+        try:
+            _validate_user_stop_constraints(position_logic, position_plan_value)
+            _validate_user_cross_rules(position_logic, position_plan_value)
+            position_rule_plan = normalize_rule_plan(
+                position_plan_value,
+                stage="position",
+                indicator_aliases={str(item.get("alias") or item.get("name") or "").lower() for item in position_specs},
+            )
+        except RulePlanError as exc:
+            logger.warning("Position rule plan validation failed: %s", exc)
+            position_rule_plan = {"version": RULE_ENGINE_VERSION, "mode": "ai", "rules": []}
+            warnings.append("持仓风控规则暂未能转换为精确执行规则，将继续使用 AI 判断。")
+        unsupported_conditions = _normalize_unsupported_conditions(content.get("unsupported_conditions"))
+        visual_conditions = _normalize_visual_conditions(content.get("visual_conditions"))
+        open_data_type = _custom_data_type(content.get("open_data_type"), unsupported)
+        position_data_type = _custom_data_type(content.get("position_data_type"), unsupported)
+        if open_data_type in {"screenshot", "both"}:
+            open_rule_plan = {"version": RULE_ENGINE_VERSION, "mode": "ai", "rules": []}
+        if position_data_type in {"screenshot", "both"}:
+            position_rule_plan = {"version": RULE_ENGINE_VERSION, "mode": "ai", "rules": []}
+        stages_with_gaps = {str(item.get("stage") or "") for item in unsupported_conditions}
+        stages_with_visual = {str(item.get("stage") or "") for item in visual_conditions}
+        if (
+            open_logic.strip() and open_rule_plan.get("mode") != "deterministic"
+            and "open" not in stages_with_gaps and "open" not in stages_with_visual
+        ):
+            unsupported_conditions.append({
+                "stage": "open",
+                "code": "rule_plan_unavailable",
+                "text": open_logic.strip()[:1000],
+                "reason": "当前规则暂时无法完整转换为服务端精确执行条件",
+            })
+        if (
+            position_logic.strip() and position_rule_plan.get("mode") != "deterministic"
+            and "position" not in stages_with_gaps and "position" not in stages_with_visual
+        ):
+            unsupported_conditions.append({
+                "stage": "position",
+                "code": "rule_plan_unavailable",
+                "text": position_logic.strip()[:1000],
+                "reason": "当前规则暂时无法完整转换为服务端精确执行条件",
+            })
         return {
             "summary": str(content.get("summary") or "").strip()[:1000],
             "open_prompt_template": open_prompt[:8000],
             "position_prompt_template": position_prompt[:8000],
             "open_indicators": open_specs,
             "position_indicators": position_specs,
+            "open_rule_plan": open_rule_plan,
+            "position_rule_plan": position_rule_plan,
+            "rule_engine_version": RULE_ENGINE_VERSION,
             "open_kline_count": required_candle_count(open_specs),
             "position_kline_count": required_candle_count(position_specs),
-            "open_data_type": _custom_data_type(content.get("open_data_type"), unsupported),
-            "position_data_type": _custom_data_type(content.get("position_data_type"), unsupported),
+            "open_data_type": open_data_type,
+            "position_data_type": position_data_type,
             "unsupported_indicators": unsupported[:20],
+            "unsupported_conditions": unsupported_conditions[:30],
+            "unsupported_condition_count": len(unsupported_conditions[:30]),
+            "visual_conditions": visual_conditions[:30],
             "warnings": warnings[:10],
-            "prompt_version": 2,
+            "prompt_version": 3,
             "compile_status": "generated",
         }
 
@@ -301,7 +377,7 @@ class AiDecisionClient:
                     "order": "oldest_to_latest",
                     "last_item": "latest_closed_candle",
                     "prices": "absolute market prices",
-                    "crossover_source": "indicators.crossovers is calculated deterministically by the server from the last two closed candles",
+                    "rule_evaluation": "Evaluate requested periods, crossovers and candle patterns directly from candles and indicator arrays.",
                 },
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
@@ -313,6 +389,8 @@ class AiDecisionClient:
                 "equity": request_payload.equity,
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
+                "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
+                "visual_conditions": _runtime_visual_conditions(config, "open"),
                 "required_json_schema": {
                     "should_open": "boolean",
                     "direction": "buy|sell|null",
@@ -320,9 +398,10 @@ class AiDecisionClient:
                     "sl": "absolute stop-loss price or null",
                     "tp": "absolute take-profit price or null",
                     "reason": "short Chinese reason",
-                    "analysis": "detailed final Chinese explanation",
+                    "analysis": "short natural Chinese strategy explanation; describe rule results and action without raw values or calculations",
                 },
             },
+            user_image_url=request_payload.screenshot_data_url,
         )
 
     def custom_position_decision(
@@ -352,7 +431,7 @@ class AiDecisionClient:
                     "order": "oldest_to_latest",
                     "last_item": "latest_closed_candle",
                     "prices": "absolute market prices",
-                    "crossover_source": "indicators.crossovers is calculated deterministically by the server from the last two closed candles",
+                    "rule_evaluation": "Evaluate requested periods, crossovers and candle patterns directly from candles and indicator arrays.",
                 },
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
@@ -365,6 +444,8 @@ class AiDecisionClient:
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
+                "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
+                "visual_conditions": _runtime_visual_conditions(config, "position"),
                 "required_json_schema": {
                     "action": "hold|close|add|modify",
                     "ticket": "target ticket or null",
@@ -376,8 +457,65 @@ class AiDecisionClient:
                     "tp": "absolute take-profit price or null",
                     "confidence": "0..1 number",
                     "reason": "short Chinese reason",
-                    "analysis": "detailed final Chinese explanation",
+                    "analysis": "short natural Chinese strategy explanation; describe rule results and action without raw values or calculations",
                 },
+            },
+            user_image_url=request_payload.screenshot_data_url,
+        )
+
+    def custom_rule_explanation(
+        self,
+        *,
+        deployment: dict[str, Any],
+        endpoint: str,
+        calculated_result: dict[str, Any],
+    ) -> AiCallResult | None:
+        """Ask AI to explain an authoritative deterministic rule result.
+
+        The caller must execute the rule-engine result, never the model's copy
+        of the action fields. This keeps a real, billable AI analysis while
+        preventing a language model from changing exact comparisons or prices.
+        """
+        if endpoint not in {"open", "position"}:
+            raise ValueError("invalid_custom_rule_explanation_endpoint")
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        return self._chat_json(
+            deployment=deployment,
+            endpoint=endpoint,
+            system_prompt=_custom_rule_explanation_prompt(endpoint),
+            user_payload={
+                "task": f"explain_deterministic_{endpoint}_result",
+                "strategy_name": deployment.get("strategy_name", ""),
+                "user_rule": config.get("open_logic" if endpoint == "open" else "position_logic", ""),
+                "calculated_result": calculated_result,
+                "required_json_schema": (
+                    {
+                        "should_open": "copy authoritative result",
+                        "direction": "copy authoritative result",
+                        "confidence": 1,
+                        "lot": 0,
+                        "sl": "copy authoritative result",
+                        "tp": "copy authoritative result",
+                        "sl_distance_price": 0,
+                        "tp_distance_price": 0,
+                        "reason": "short Chinese conclusion",
+                        "analysis": "short natural Chinese explanation",
+                    }
+                    if endpoint == "open"
+                    else {
+                        "action": "copy authoritative result",
+                        "ticket": None,
+                        "direction": None,
+                        "confidence": 1,
+                        "lot": None,
+                        "close_scope": None,
+                        "volume": None,
+                        "sl": None,
+                        "tp": None,
+                        "reason": "short Chinese conclusion",
+                        "analysis": "short natural Chinese explanation",
+                    }
+                ),
             },
         )
 
@@ -499,7 +637,11 @@ class AiDecisionClient:
             api_key=api_key,
             model=model,
             system_prompt="You are an image recognition tester. Follow the output instruction exactly.",
-            user_prompt="Identify the two colored shapes from left to right. Reply exactly: RED CIRCLE, BLUE SQUARE",
+            user_prompt=(
+                "Identify the two colored shapes in the attached image from left to right. "
+                "Reply only in this format: COLOR SHAPE, COLOR SHAPE. "
+                "Do not guess when no image is visible."
+            ),
             user_image_url=_VISION_TEST_IMAGE_DATA_URL,
             max_tokens=512,
             strict_json=False,
@@ -617,6 +759,7 @@ class AiDecisionClient:
         endpoint: str,
         system_prompt: str,
         user_payload: dict[str, Any],
+        user_image_url: str = "",
     ) -> AiCallResult | None:
         model = self._select_model(deployment, endpoint)
         if model is None:
@@ -630,6 +773,7 @@ class AiDecisionClient:
                 system_prompt=system_prompt,
                 user_payload=user_payload,
                 model=model,
+                user_image_url=user_image_url,
             )
 
         cache_key = self._cache_key(
@@ -668,6 +812,7 @@ class AiDecisionClient:
                 system_prompt=system_prompt,
                 user_payload=user_payload,
                 model=model,
+                user_image_url=user_image_url,
                 cache_key=cache_key,
                 cache_ttl_seconds=int(cache_settings.get("ttl_seconds") or 120),
             )
@@ -680,6 +825,7 @@ class AiDecisionClient:
         system_prompt: str,
         user_payload: dict[str, Any],
         model: dict[str, Any],
+        user_image_url: str = "",
         cache_key: str = "",
         cache_ttl_seconds: int = 120,
     ) -> AiCallResult:
@@ -712,6 +858,7 @@ class AiDecisionClient:
                 user_prompt=prompt,
                 max_tokens=_max_tokens_for_endpoint(endpoint),
                 strict_json=bool(model.get("strict_json", True)),
+                user_image_url=user_image_url,
             )
             parsed = json.loads(raw_response)
             choice = (parsed.get("choices") or [{}])[0]
@@ -1229,6 +1376,31 @@ def _custom_strategy_stage_compile_prompt(stage: str) -> str:
         "Extract every explicitly referenced built-in indicator and period. Candlestick sequences, engulfing, pin bars, "
         "support, resistance, recent highs and recent lows are inferred directly from OHLCV and are not indicators. "
         "The template must apply the rule strictly to supplied closed candles and calculated indicator arrays. "
+        "Also produce rule_plan for deterministic execution when every condition and action in this stage can be represented "
+        "by the safe expression language below. rule_plan is {version:1,mode:'deterministic',rules:[...]}; each rule is "
+        "{when:'boolean expression',action:{...},description:'short Chinese rule'}. Preserve the user's rule order. "
+        "Allowed variables: bid, ask, side, open_price, current_price, sl, tp, volume, profit, favorable_move and indicator "
+        "aliases such as ema5, ema30 and atr14. Allowed functions: latest_cross('ema5','ema30',3), "
+        "cross_above('ema5','ema30',3), cross_below('ema5','ema30',3), indicator('ema5',-1), lowest_low(5), "
+        "highest_high(5), consecutive('up',10), pattern('bullish_engulfing',3), pattern('bearish_engulfing',3), "
+        "pattern('bullish_pinbar',3), pattern('bearish_pinbar',3), pattern('doji',3), min, max and abs. "
+        "Expressions may use and/or/not, parentheses, arithmetic and comparisons. String constants BUY and SELL must be quoted. "
+        "latest_cross returns 1 for the most recent upward cross, -1 for downward cross and 0 for none within the window. "
+        "Use exactly the listed variable names; use profit, never current_profit or another synonym. Every position rule that "
+        "mentions a long/BUY position must include side == 'BUY'; every rule that mentions a short/SELL position must include "
+        "side == 'SELL'. A crossover needs at least two values: use window 2 for only the latest crossover, never window 1. "
+        "Open-stage conditions cannot use side or position fields because no position exists before opening. Every open rule's "
+        "when expression must contain the actual user trigger; never replace an EMA crossover with a BUY/SELL side comparison. "
+        "Open action shape: {type:'open',direction:'buy|sell',sl:'expression or null',tp:'expression or null'}. "
+        "Position modify action is {type:'modify',sl:'expression or null',tp:'expression or null',"
+        "sl_constraint:'not_below_current|not_above_current|null'}. If the user says a new stop cannot be below the old "
+        "stop, use not_below_current; if it cannot be above the old stop, use not_above_current. "
+        "All absent optional values must be JSON null without quotation marks, never the strings 'null' or 'none'. "
+        "{type:'close',close_scope:'full|partial',volume:'expression or null'}, or "
+        "{type:'add',direction:'buy|sell',lot:'expression or null',sl:'expression or null',tp:'expression or null'}. "
+        "If any condition is screenshot-based, return rule_plan {version:1,mode:'ai',rules:[]} and list each screenshot "
+        "condition in visual_conditions. If a condition cannot be handled exactly by either the safe expression language "
+        "or the supplied screenshot, return AI mode and list it in unsupported_conditions instead of approximating it. "
     )
     if stage == "open":
         return common + (
@@ -1237,6 +1409,13 @@ def _custom_strategy_stage_compile_prompt(stage: str) -> str:
     return common + (
         "Preserve hold, close, add, partial-close and stop modification semantics. Preserve an explicit add-lot formula; "
         "when add has no sizing formula, declare that server opening sizing is used. Never invent a partial-close amount. "
+        "Preserve temporal and staged semantics expressed by words such as first, once, then, after, thereafter, already "
+        "and not-yet. Convert sequential rules into explicit stage conditions: once the observable current position state "
+        "shows an earlier stage is completed, that stage must not execute again only when this follows from the user's "
+        "wording. Never flatten a user-defined sequence into independent conditions that remain simultaneously eligible. "
+        "Preserve exactly any user-defined action priority and stop direction. Do not invent a default priority, a rule that "
+        "stops may only tighten, or any indicator, threshold, stage, trigger or risk rule. If simultaneous rules conflict "
+        "and give no priority, report that ambiguity in warnings instead of silently choosing a policy. "
         "Write the template as clear Chinese instructions, not executable code or pseudocode. Follow runtime_data_contract "
         "exactly. warnings must contain only user-actionable missing, ambiguous, unsupported or conflicting rules; never "
         "put implementation notes, default data sources, array indexes or normal calculation conventions in warnings. "
@@ -1254,17 +1433,23 @@ def _custom_runtime_prompt(endpoint: str) -> str:
             "market-structure, score, risk-reward, safety or subjective suitability filters. Do not evaluate whether the "
             "strategy is sensible; only determine whether the user's stated conditions are satisfied. "
             "If all explicit user conditions are satisfied, should_open must be true even if you personally consider "
-            "the setup weak or risky. In particular, when the user's only trigger is an indicator crossover and the "
-            "authoritative indicators.crossovers event matches it, execute the corresponding buy or sell action; do "
-            "not require an additional price breakout or trend confirmation. A stop-loss formula based on recent candle "
+            "the setup weak or risky. Evaluate crossovers directly from supplied indicator arrays over exactly the number "
+            "of closed candles requested by the user, and evaluate candlestick patterns directly from OHLCV. Do not reduce "
+            "a multi-candle rule to only the latest two values and do not require an additional price breakout or trend "
+            "confirmation. A stop-loss formula based on recent candle "
             "highs/lows, ATR, indicators or another supplied value is a complete stop definition even when it contains "
             "no literal price. When opening, calculate that formula and return the resulting absolute sl price; never "
             "return sl as null merely because the user did not write a numeric price. Candles are oldest to newest and the last "
-            "item is the latest closed candle. Infer candlestick patterns directly from OHLCV. Do not invent "
-            "missing facts or prices. For crossover rules, indicators.crossovers is the authoritative server-calculated "
-            "result; do not contradict it. event=none means no crossover and must never be described as an upward or "
-            "downward crossover. In analysis, cite only facts relevant to the user's conditions and the final action. "
+            "item is the latest closed candle. Do not invent missing facts or prices. In analysis, summarize every explicit "
+            "opening condition in short natural Chinese. State whether the requested crossover or pattern occurred within "
+            "the requested candle window, or identify the exact condition that failed. If the rule defines a stop or target, "
+            "say that it was set according to that rule without quoting its calculated price or calculation process. "
             "If every requested condition is not clearly satisfied, do not open. "
+            "When screenshot metadata and an image are attached, the image is an authoritative input for every screenshot-"
+            "dependent condition in user_rule, prompt_template and visual_conditions. Evaluate those conditions directly "
+            "from the image; never search for a custom "
+            "visual indicator such as HG in indicators.values and never report its numeric array as missing. Combine only "
+            "the observed visual result with the supplied user rule; do not invent visual conditions the user did not request. "
             "Return absolute sl and tp prices when the rule defines them."
         )
     return (
@@ -1275,15 +1460,40 @@ def _custom_runtime_prompt(endpoint: str) -> str:
         "optimize the strategy. If no explicit "
         "risk condition is met, hold. Use only hold, close, add or modify. Never close or add without a clear rule. "
         "Indicator arrays are in indicators.values keyed by aliases such as atr14 and ema5, oldest to newest; [-1] "
-        "is the latest closed candle. For crossover rules, indicators.crossovers is the authoritative server-calculated "
-        "result; do not contradict it. event=none means no crossover and must never be described as an upward or "
-        "downward crossover. In analysis, cite only facts relevant to the user's conditions and the final action. "
+        "is the latest closed candle. Evaluate crossovers over exactly the user-requested candle window directly from "
+        "those arrays, and infer requested candlestick patterns directly from OHLCV. In analysis, summarize each "
+        "applicable position rule in short natural Chinese, identify the current user-defined stage when relevant, and "
+        "state exactly why the selected action is hold, close, add or modify. Do not quote raw market values, action prices, "
+        "full arrays, formulas or intermediate calculation steps. "
         "ATR is a price distance, while position.profit is account-currency P/L: never "
         "compare them directly. For ATR-based favorable movement use BUY current_price-open_price and SELL "
         "open_price-current_price. "
+        "Preserve the sequence and priority explicitly written by the user. Use observable current position fields to "
+        "determine whether a user-defined prior stage has completed. Apply a one-way stop restriction only if the user "
+        "explicitly wrote one; otherwise a requested stop may tighten or loosen according to the user's rule. If multiple "
+        "user rules conflict and provide no priority, hold and clearly report the ambiguity rather than inventing a policy. "
+        "The structured sl value must exactly match the final stop calculated from the user's rule. "
+        "When screenshot metadata and an image are attached, the image is an authoritative input for every screenshot-"
+        "dependent condition in user_rule, prompt_template and visual_conditions. Evaluate those conditions directly "
+        "from the image; never search for a custom visual "
+        "indicator such as HG in indicators.values and never report its numeric array as missing. Do not invent visual "
+        "filters or override exact supplied indicator facts. "
+        "These instructions must not create a new trigger, filter, stage, priority or risk condition. "
         "For add, return lot calculated strictly from an explicit user formula; if the user gave no lot formula, return "
         "lot as null and let the server use opening sizing. For close, return close_scope as full or partial. A partial "
         "close must include a positive volume calculated from the target position; otherwise hold instead of guessing."
+    )
+
+
+def _custom_rule_explanation_prompt(endpoint: str) -> str:
+    action_key = "should_open, direction, sl and tp" if endpoint == "open" else "action and all supplied action fields"
+    return (
+        "You explain a deterministic user-defined strategy result in short natural Chinese. The calculated_result was "
+        "produced by the server from the user's confirmed rules and is authoritative. Copy its "
+        f"{action_key} into the required JSON shape and never change, recalculate, challenge or add conditions to it. "
+        "Write a concise explanation of which named rule passed or failed and the resulting action. Do not quote raw "
+        "prices, indicator arrays, formulas, intermediate calculations, token counts or implementation details. "
+        "Do not add market structure, trend, score, confirmation, risk-reward or advice unless the user's rule contains it."
     )
 
 
@@ -1303,12 +1513,82 @@ def _custom_strategy_fallback(open_logic: str, position_logic: str) -> dict[str,
         "open_data_type": "kline",
         "position_data_type": "kline",
         "unsupported_indicators": [],
+        "unsupported_conditions": [],
+        "unsupported_condition_count": 0,
+        "visual_conditions": [],
         "warnings": [],
         "prompt_version": 2,
         "compile_status": "fallback",
         "open_logic": open_logic,
         "position_logic": position_logic,
     }
+
+
+def _rewrite_rule_plan_indicator_aliases(value: Any, specs: list[dict[str, Any]]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    plan = json.loads(json.dumps(value, ensure_ascii=False))
+    grouped: dict[str, list[str]] = {}
+    for spec in specs:
+        name = str(spec.get("name") or "").strip().lower()
+        alias = str(spec.get("alias") or name).strip().lower()
+        if name and alias:
+            grouped.setdefault(name, []).append(alias)
+    replacements = {
+        name: aliases[0]
+        for name, aliases in grouped.items()
+        if len(set(aliases)) == 1 and aliases[0] != name
+    }
+    for rule in plan.get("rules") if isinstance(plan.get("rules"), list) else []:
+        if not isinstance(rule, dict):
+            continue
+        for container, keys in ((rule, ("when",)), (rule.get("action"), ("sl", "tp", "lot", "volume"))):
+            if not isinstance(container, dict):
+                continue
+            for key in keys:
+                expression = container.get(key)
+                if not isinstance(expression, str):
+                    continue
+                for source, target in replacements.items():
+                    expression = re.sub(rf"\b{re.escape(source)}\b", target, expression, flags=re.IGNORECASE)
+                container[key] = expression
+    return plan
+
+
+def _validate_user_stop_constraints(position_logic: str, plan: Any) -> None:
+    if not isinstance(plan, dict) or str(plan.get("mode") or "").lower() != "deterministic":
+        return
+    actions = [
+        rule.get("action")
+        for rule in (plan.get("rules") if isinstance(plan.get("rules"), list) else [])
+        if isinstance(rule, dict) and isinstance(rule.get("action"), dict)
+    ]
+    normalized_logic = re.sub(r"\s+", "", str(position_logic or ""))
+    requires_not_below = any(item in normalized_logic for item in ("不能低于原止损价", "不得低于原止损价"))
+    requires_not_above = any(item in normalized_logic for item in ("不能高于原止损价", "不得高于原止损价"))
+    if requires_not_below and not any(action.get("sl_constraint") == "not_below_current" for action in actions):
+        raise RulePlanError("missing_not_below_current_stop_constraint")
+    if requires_not_above and not any(action.get("sl_constraint") == "not_above_current" for action in actions):
+        raise RulePlanError("missing_not_above_current_stop_constraint")
+
+
+def _validate_user_cross_rules(user_logic: str, plan: Any) -> None:
+    if not isinstance(plan, dict) or str(plan.get("mode") or "").lower() != "deterministic":
+        return
+    rules = plan.get("rules") if isinstance(plan.get("rules"), list) else []
+    expressions = [str(rule.get("when") or "") for rule in rules if isinstance(rule, dict)]
+    joined = "\n".join(expressions)
+    logic = str(user_logic or "")
+    upward = bool(re.search(r"\bcross_above\s*\(", joined)) or bool(
+        re.search(r"\blatest_cross\s*\([^)]*\)\s*==\s*1\b", joined)
+    )
+    downward = bool(re.search(r"\bcross_below\s*\(", joined)) or bool(
+        re.search(r"\blatest_cross\s*\([^)]*\)\s*==\s*-1\b", joined)
+    )
+    if "上穿" in logic and not upward:
+        raise RulePlanError("missing_upward_cross_condition")
+    if ("下穿" in logic or "下破" in logic) and not downward:
+        raise RulePlanError("missing_downward_cross_condition")
 
 
 def _custom_data_type(value: Any, unsupported: list[str]) -> str:
@@ -1324,6 +1604,75 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return [] if value is None or value == "" else [value]
+
+
+def _stage_unsupported_conditions(value: Any, stage: str) -> list[dict[str, Any]]:
+    items = value if isinstance(value, list) else [value] if value else []
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            result.append({**item, "stage": stage})
+        elif str(item).strip():
+            result.append({"stage": stage, "text": str(item).strip()})
+    return result
+
+
+def _normalize_unsupported_conditions(value: Any) -> list[dict[str, str]]:
+    items = value if isinstance(value, list) else [value] if value else []
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        raw = item if isinstance(item, dict) else {"text": item}
+        stage = str(raw.get("stage") or "").strip().lower()
+        if stage not in {"open", "position"}:
+            stage = "open"
+        text = str(raw.get("text") or raw.get("condition") or "").strip()[:1000]
+        if not text:
+            continue
+        key = (stage, re.sub(r"\s+", "", text).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({
+            "stage": stage,
+            "code": str(raw.get("code") or "unsupported_condition").strip()[:80],
+            "text": text,
+            "reason": str(raw.get("reason") or "暂时无法转换为服务端精确执行条件").strip()[:500],
+        })
+    return result
+
+
+def _normalize_visual_conditions(value: Any) -> list[dict[str, str]]:
+    items = value if isinstance(value, list) else [value] if value else []
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        raw = item if isinstance(item, dict) else {"text": item}
+        stage = str(raw.get("stage") or "").strip().lower()
+        if stage not in {"open", "position"}:
+            stage = "open"
+        text = str(raw.get("text") or raw.get("condition") or "").strip()[:1000]
+        if not text:
+            continue
+        key = (stage, re.sub(r"\s+", "", text).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({
+            "stage": stage,
+            "code": str(raw.get("code") or "visual_condition").strip()[:80],
+            "text": text,
+        })
+    return result
+
+
+def _runtime_visual_conditions(config: dict[str, Any], stage: str) -> list[dict[str, str]]:
+    """Return only the screenshot conditions relevant to the current decision stage."""
+    return [
+        {"code": item["code"], "text": item["text"]}
+        for item in _normalize_visual_conditions(config.get("visual_conditions"))
+        if item["stage"] == stage
+    ]
 
 
 def _clean_stage_summary(value: Any) -> str:
@@ -1452,18 +1801,23 @@ def _json_api_system_prompt(
     if endpoint.startswith("compile"):
         return (
             "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
-            "Required keys: summary, prompt_template, indicators, data_type, unsupported_indicators, warnings. "
+            "Required keys: summary, prompt_template, indicators, rule_plan, data_type, unsupported_indicators, "
+            "visual_conditions, unsupported_conditions, warnings. visual_conditions is an array of "
+            "{text:'exact screenshot-dependent user condition',code:'short visual capability code'}. "
+            "unsupported_conditions is an array of "
+            "{text:'exact unsupported user condition',code:'short capability code',reason:'short Chinese reason'}. "
+            "Use an empty array when every user condition is represented exactly by rule_plan. "
             "Each indicator item uses {name,source,params,alias}. data_type is kline, screenshot, or both. "
             f"Task: {task_prompt}"
         )
     schema = (
         '{"should_open":false,"direction":null,"confidence":0,'
         '"lot":0,"sl":null,"tp":null,"sl_distance_price":0,"tp_distance_price":0,'
-        '"reason":"short Chinese reason","analysis":"detailed Chinese market and risk explanation"}'
+        '"reason":"short Chinese reason","analysis":"concise Chinese conclusion"}'
         if endpoint == "open"
         else '{"action":"hold","ticket":null,"direction":null,"confidence":0,'
         '"lot":null,"close_scope":null,"volume":null,"sl":null,"tp":null,'
-        '"reason":"short Chinese reason","analysis":"detailed Chinese position and risk explanation"}'
+        '"reason":"short Chinese reason","analysis":"concise Chinese conclusion"}'
     )
     if literal_user_rules:
         return (
@@ -1475,6 +1829,14 @@ def _json_api_system_prompt(
             "data and the resulting action. Do not add market structure, setup score, trend, confirmation, risk-reward "
             "or safety analysis unless the user explicitly wrote it. Never invent missing facts or prices. If required "
             "data is missing, state that fact without replacing it with another condition. "
+            "Complete valid JSON has highest priority. Analyze silently; never put step-by-step reasoning, repeated checks, "
+            "full arrays, candle lists or long timestamp lists in the response. reason must be a short Chinese conclusion "
+            "of at most 60 Chinese characters. analysis must be a clear, natural and compact Chinese strategy explanation, "
+            "normally 40-220 Chinese characters. Check the user's explicit conditions one by one, state which condition "
+            "passed or failed, and explain the final action. Do not quote raw prices, indicator values, calculated action "
+            "prices or volumes. Do not show formulas, substitutions, intermediate calculations or long decimal precision. "
+            "Mention indicator names, rule stages and qualitative comparisons only when they help explain the decision. "
+            "For hold/none, identify the exact unmet condition instead of only saying that conditions were not met. "
             "Never copy placeholder text from the schema. "
             f"Task: {task_prompt}"
         )
@@ -1494,7 +1856,7 @@ def _json_api_system_prompt(
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
     if endpoint.startswith("compile"):
-        return 1200
+        return 2400
     if endpoint == "open":
         return 1000
     if endpoint == "position":
@@ -1726,18 +2088,24 @@ def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) 
     if not isinstance(indicators, dict):
         return preview
     recent_values = indicators.get("recent_values")
-    crossovers = indicators.get("crossovers")
-    if not recent_values and not crossovers:
+    if not recent_values:
         return preview
     snapshot = json.dumps(
-        {
-            "recent_values": recent_values or {},
-            "crossovers": crossovers or [],
-        },
+        {"recent_values": recent_values or {}},
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return f"请求指标快照:\n{snapshot}\n\n{preview}"[:4000]
+
+
+def _screenshot_ai_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value[key]
+        for key in ("preview_id", "mime_type", "size_bytes", "sha256")
+        if value.get(key) not in (None, "")
+    }
 
 def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
     if endpoint == "open":

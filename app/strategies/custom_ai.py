@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import re
 from typing import Any
 from uuid import uuid4
 
 from app.models import OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision, UsageSummary
 from app.services.ai_service import AiDecisionClient
+from app.services.custom_indicators import calculate_indicator_payload
+from app.services.custom_rule_engine import (
+    RulePlanError,
+    evaluate_open_rule_plan,
+    evaluate_position_rule_plan,
+    normalize_rule_plan,
+)
 from app.strategies.pa_agent_lite import _position_size_lot
 
 
@@ -17,52 +23,59 @@ class CustomAiStrategy:
         self.ai_client = ai_client
 
     def evaluate_open(self, request: OpenEvaluateRequest, deployment: dict[str, Any]) -> TradeDecision:
-        if len(request.candles) < 10:
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        data_type = str(config.get("open_data_type") or request.data_type or "kline")
+        if data_type in {"kline", "both"} and len(request.candles) < 10:
             return self._hold(request, "K线数量不足，自定义策略至少需要10根已收盘K线")
-        result = self.ai_client.custom_open_decision(deployment=deployment, request_payload=request)
+        if data_type in {"screenshot", "both"} and not request.screenshot_data_url:
+            return self._hold(request, "EA未提供策略所需截图，本次分析已停止")
+        plan = config.get("open_rule_plan") if isinstance(config.get("open_rule_plan"), dict) else {}
+        plan = _runtime_rule_plan(plan, stage="open", config=config, data_type=data_type)
+        engine_result = None
+        if str(plan.get("mode") or "") == "deterministic":
+            indicators = calculate_indicator_payload(
+                request.candles,
+                list(config.get("open_indicators") or []),
+                output_count=max(20, min(int(config.get("indicator_output_count") or 100), 300)),
+            )
+            engine_result = evaluate_open_rule_plan(plan, request=request, indicators=indicators)
+            result = self.ai_client.custom_rule_explanation(
+                deployment=deployment,
+                endpoint="open",
+                calculated_result=engine_result.explanation_payload(stage="open"),
+            )
+        else:
+            result = self.ai_client.custom_open_decision(deployment=deployment, request_payload=request)
         if result is None:
             return self._hold(request, "AI模型未配置，暂不开仓")
         content = result.content
-        direction = str(content.get("direction") or "").strip().lower()
-        should_open = _truthy_bool(content.get("should_open")) and direction in {"buy", "sell"}
-        confidence = _confidence(content.get("confidence"))
+        direction = engine_result.direction if engine_result is not None else str(content.get("direction") or "").strip().lower()
+        should_open = (
+            engine_result is not None and engine_result.action == "open" and direction in {"buy", "sell"}
+        ) or (
+            engine_result is None and _truthy_bool(content.get("should_open")) and direction in {"buy", "sell"}
+        )
+        confidence = 1.0 if engine_result is not None else _confidence(content.get("confidence"))
         reason = _reason(content, "自定义策略条件未全部满足，继续观望")
         if not should_open:
             return self._hold(request, reason, confidence=confidence, usage=result.usage)
 
-        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        open_logic = str(config.get("open_logic") or config.get("open_prompt_template") or "")
         entry = request.ask if direction == "buy" else request.bid
-        sl = _optional_price(content.get("sl"))
-        tp = _optional_price(content.get("tp"))
-        rule_based_sl = _recent_candle_extreme_stop(open_logic, direction, request.candles)
-        if rule_based_sl is not None:
-            # This value is deterministic from the user's rule and submitted candles.
-            # Always prefer it over an AI-calculated absolute price.
-            sl = rule_based_sl
-            reason = (
-                f"{str(content.get('reason') or '满足用户开仓条件').strip()}；"
-                f"止损已按用户规则和K线数据重算为{sl:g}"
-            )
-        elif sl is None:
+        sl = engine_result.sl if engine_result is not None else _optional_price(content.get("sl"))
+        tp = engine_result.tp if engine_result is not None else _optional_price(content.get("tp"))
+        if sl is None:
             distance = _positive_float(content.get("sl_distance_price"))
             if distance:
                 sl = entry - distance if direction == "buy" else entry + distance
-        if sl is None and _rule_requires_stop(open_logic):
-            return self._hold(
-                request,
-                "策略要求设置止损，但AI未返回可计算的有效止损价，已阻止无止损开仓",
-                confidence=0.2,
-                usage=result.usage,
-            )
         if tp is None:
             distance = _positive_float(content.get("tp_distance_price"))
             if distance:
                 tp = entry + distance if direction == "buy" else entry - distance
         if sl is not None and not _valid_stop(direction, entry, sl):
-            return self._hold(request, "AI返回的止损价方向无效，已阻止开仓", confidence=0.2, usage=result.usage)
+            source = "服务端计算" if engine_result is not None else "AI返回"
+            return self._hold(request, f"{source}的止损价方向无效，已阻止开仓", confidence=0.2, usage=result.usage)
         if tp is not None and not _valid_target(direction, entry, tp):
-            tp = None
+            return self._hold(request, "AI返回的止盈价方向无效，已阻止开仓", confidence=0.2, usage=result.usage)
         lot = _position_size_lot(config, request, entry=entry, sl=sl)
         return TradeDecision(
             decision_id=_decision_id(), request_id=request.request_id, status="APPROVED",
@@ -73,16 +86,52 @@ class CustomAiStrategy:
 
     def evaluate_position(self, request: PositionEvaluateRequest, deployment: dict[str, Any]) -> TradeDecision:
         target = request.positions[0]
-        if len(request.candles) < 10:
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        data_type = str(config.get("position_data_type") or request.data_type or "kline")
+        if data_type in {"kline", "both"} and len(request.candles) < 10:
             return self._position_hold(request, target.ticket, "K线数量不足，暂不执行持仓操作")
-        result = self.ai_client.custom_position_decision(deployment=deployment, request_payload=request)
+        if data_type in {"screenshot", "both"} and not request.screenshot_data_url:
+            return self._position_hold(request, target.ticket, "EA未提供策略所需截图，本次分析已停止")
+        plan = config.get("position_rule_plan") if isinstance(config.get("position_rule_plan"), dict) else {}
+        plan = _runtime_rule_plan(plan, stage="position", config=config, data_type=data_type)
+        engine_result = None
+        if str(plan.get("mode") or "") == "deterministic":
+            indicators = calculate_indicator_payload(
+                request.candles,
+                list(config.get("position_indicators") or []),
+                output_count=max(20, min(int(config.get("indicator_output_count") or 100), 300)),
+            )
+            engine_result = evaluate_position_rule_plan(plan, request=request, indicators=indicators, position=target)
+            result = self.ai_client.custom_rule_explanation(
+                deployment=deployment,
+                endpoint="position",
+                calculated_result=engine_result.explanation_payload(stage="position"),
+            )
+        else:
+            result = self.ai_client.custom_position_decision(deployment=deployment, request_payload=request)
         if result is None:
             return self._position_hold(request, target.ticket, "AI模型未配置，继续持有")
-        content = result.content
+        content = (
+            {
+                "action": engine_result.action,
+                "ticket": engine_result.ticket,
+                "direction": engine_result.direction,
+                "lot": engine_result.lot,
+                "close_scope": engine_result.close_scope,
+                "volume": engine_result.volume,
+                "sl": engine_result.sl,
+                "tp": engine_result.tp,
+                "confidence": 1,
+                "reason": result.content.get("reason"),
+                "analysis": result.content.get("analysis"),
+            }
+            if engine_result is not None
+            else result.content
+        )
         ticket = str(content.get("ticket") or target.ticket)
         target = next((item for item in request.positions if item.ticket == ticket), target)
         action = str(content.get("action") or "hold").strip().lower()
-        confidence = _confidence(content.get("confidence"))
+        confidence = 1.0 if engine_result is not None else _confidence(content.get("confidence"))
         reason = _reason(content, "自定义风控条件未触发，继续持有")
         if action == "close":
             close_scope = str(content.get("close_scope") or "").strip().lower()
@@ -104,33 +153,18 @@ class CustomAiStrategy:
         if action == "modify":
             requested_sl = _optional_price(content.get("sl"))
             requested_tp = _optional_price(content.get("tp"))
-            sl_rejected_reason = _invalid_modified_stop_reason(request, target, requested_sl)
-            if sl_rejected_reason:
-                requested_sl = None
             if requested_sl is None and requested_tp is None:
-                if sl_rejected_reason:
-                    return self._position_hold(
-                        request,
-                        target.ticket,
-                        sl_rejected_reason,
-                        confidence=confidence,
-                        usage=result.usage,
-                    )
                 return self._position_hold(request, target.ticket, "未返回有效止盈止损价，继续持有", usage=result.usage)
-            # MT5 modifies SL and TP together. Preserve any side that the AI did
-            # not validly change so a null/invalid field can never clear or
-            # loosen an existing protection level.
+            # MT5 modifies SL and TP together. Preserve the side that the user
+            # rule did not request changing; do not impose a tightening policy.
             sl = requested_sl if requested_sl is not None else target.sl
             tp = requested_tp if requested_tp is not None else target.tp
-            if sl_rejected_reason:
-                reason = f"{reason}；{sl_rejected_reason}，仅处理其他有效修改"
             return TradeDecision(
                 decision_id=_decision_id(), request_id=request.request_id, status="APPROVED",
                 action="MODIFY_SL", symbol=request.symbol, confidence=confidence, reason=reason,
                 expires_at=_expires_at(), position_ticket=target.ticket, sl=sl, tp=tp, usage=result.usage,
             )
         if action == "add":
-            config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
             if not bool(config.get("allow_add")):
                 return self._position_hold(request, target.ticket, "策略未开启加仓权限，继续持有", usage=result.usage)
             if len(request.positions) >= int(config.get("max_positions") or 1):
@@ -180,6 +214,30 @@ class CustomAiStrategy:
         )
 
 
+def _runtime_rule_plan(
+    plan: dict[str, Any],
+    *,
+    stage: str,
+    config: dict[str, Any],
+    data_type: str,
+) -> dict[str, Any]:
+    # A deterministic plan cannot inspect an attached chart image. Mixed
+    # kline+screenshot stages must stay in AI mode so visual rules are not
+    # silently skipped while only the numeric subset is executed.
+    if data_type in {"screenshot", "both"}:
+        return {"version": 1, "mode": "ai", "rules": []}
+    specs = config.get(f"{stage}_indicators")
+    aliases = {
+        str(item.get("alias") or item.get("name") or "").strip().lower()
+        for item in (specs if isinstance(specs, list) else [])
+        if isinstance(item, dict)
+    }
+    try:
+        return normalize_rule_plan(plan, stage=stage, indicator_aliases=aliases)
+    except RulePlanError:
+        return {"version": 1, "mode": "ai", "rules": []}
+
+
 def _decision_id() -> str:
     return f"dec_{uuid4().hex}"
 
@@ -196,7 +254,10 @@ def _confidence(value: Any) -> float:
 
 
 def _reason(content: dict[str, Any], fallback: str) -> str:
-    return str(content.get("analysis") or content.get("reason") or fallback).strip()[:800]
+    # Show the bounded, auditable decision explanation on the EA panel. The
+    # short reason remains useful in the structured AI result, but by itself it
+    # does not contain enough evidence for users to verify a custom rule.
+    return str(content.get("analysis") or content.get("reason") or fallback).strip()[:500]
 
 
 def _positive_float(value: Any) -> float | None:
@@ -217,61 +278,6 @@ def _valid_stop(direction: str, entry: float, price: float) -> bool:
 
 def _valid_target(direction: str, entry: float, price: float) -> bool:
     return price > entry if direction == "buy" else price < entry
-
-
-def _invalid_modified_stop_reason(
-    request: PositionEvaluateRequest,
-    position: Any,
-    requested_sl: float | None,
-) -> str:
-    if requested_sl is None:
-        return ""
-    side = str(position.side or "").upper()
-    current_sl = _optional_price(position.sl)
-    tolerance = max(1e-9, abs(position.open_price) * 1e-10)
-    if side == "BUY":
-        if current_sl is not None and requested_sl <= current_sl + tolerance:
-            return f"AI返回的多单止损{requested_sl:g}未高于当前止损{current_sl:g}，已拒绝回退止损"
-        if requested_sl >= request.bid - tolerance:
-            return f"AI返回的多单止损{requested_sl:g}不低于当前Bid {request.bid:g}，已拒绝无效止损"
-    elif side == "SELL":
-        if current_sl is not None and requested_sl >= current_sl - tolerance:
-            return f"AI返回的空单止损{requested_sl:g}未低于当前止损{current_sl:g}，已拒绝回退止损"
-        if requested_sl <= request.ask + tolerance:
-            return f"AI返回的空单止损{requested_sl:g}不高于当前Ask {request.ask:g}，已拒绝无效止损"
-    return ""
-
-
-def _recent_candle_extreme_stop(
-    rule: str,
-    direction: str,
-    candles: list[Any],
-) -> float | None:
-    if not rule or not candles:
-        return None
-    target_words = r"(?:最低(?:价|点)?|低点)" if direction == "buy" else r"(?:最高(?:价|点)?|高点)"
-    pattern = re.compile(
-        rf"(\d{{1,4}})\s*根\s*[kKＫｋ]\s*线[^。；;\n]{{0,40}}?{target_words}",
-        re.IGNORECASE,
-    )
-    count = None
-    for segment in re.split(r"[。；;\n]", rule):
-        if "止损" not in segment and not re.search(r"\b(?:stop\s*loss|sl)\b", segment, re.IGNORECASE):
-            continue
-        match = pattern.search(segment)
-        if match:
-            count = int(match.group(1))
-            break
-    if count is None or count < 1 or len(candles) < count:
-        return None
-    recent = sorted(candles, key=lambda candle: candle.timestamp)[-count:]
-    if direction == "buy":
-        return min(float(candle.low) for candle in recent)
-    return max(float(candle.high) for candle in recent)
-
-
-def _rule_requires_stop(rule: str) -> bool:
-    return bool(re.search(r"止损|\b(?:stop\s*loss|sl)\b", rule or "", re.IGNORECASE))
 
 
 def _truthy_bool(value: Any) -> bool:

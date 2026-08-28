@@ -50,6 +50,7 @@ from app.services.decision_service import DecisionService
 from app.services.auth_service import AuthError, UserAuthService
 from app.services.ai_service import AiDecisionClient
 from app.services.custom_indicators import public_indicator_catalog
+from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
 from app.store import SqliteStore
 
 
@@ -524,6 +525,11 @@ def create_mt5_router(
             )
             return test_response
 
+        try:
+            screenshot_data_url, screenshot_metadata = _request_screenshot(request.data_type, request.market.screenshot)
+        except ScreenshotError as exc:
+            return _mt5_open_error_response(request, request_id, str(exc))
+
         evaluate_request = OpenEvaluateRequest(
             deployment_key=request.deployment_key,
             request_id=request_id,
@@ -536,6 +542,9 @@ def create_mt5_router(
             spread_points=request.market.spread,
             candles=_candles(request.market.bars),
             symbol_info=request.market.metadata,
+            data_type=request.data_type,
+            screenshot_data_url=screenshot_data_url,
+            screenshot_metadata=screenshot_metadata,
             balance=request.balance or request.account.balance,
             equity=request.equity or request.account.equity,
         )
@@ -562,6 +571,11 @@ def create_mt5_router(
             )
             return test_response
 
+        try:
+            screenshot_data_url, screenshot_metadata = _request_screenshot(request.data_type, request.market.screenshot)
+        except ScreenshotError as exc:
+            return _mt5_position_error_response(request, request_id, str(exc))
+
         evaluate_request = PositionEvaluateRequest(
             deployment_key=request.deployment_key,
             request_id=request_id,
@@ -574,6 +588,9 @@ def create_mt5_router(
             spread_points=request.market.spread,
             candles=_candles(request.market.bars),
             symbol_info=request.market.metadata,
+            data_type=request.data_type,
+            screenshot_data_url=screenshot_data_url,
+            screenshot_metadata=screenshot_metadata,
             balance=request.balance or request.account.balance,
             equity=request.equity or request.account.equity,
             positions=[
@@ -833,6 +850,7 @@ def create_admin_ai_router(
             keyword=str(payload.get("keyword") or "").strip(),
             user_id=user_id,
             entry_type=str(payload.get("entry_type") or "").strip(),
+            exclude_entry_type=str(payload.get("exclude_entry_type") or "").strip(),
         ))
 
     @router.post("/official-strategy/list")
@@ -852,7 +870,16 @@ def create_admin_ai_router(
             page=int(payload.get("page") or 1),
             size=int(payload.get("size") or 20),
             keyword=str(payload.get("keyword") or "").strip(),
+            unsupported_only=bool(payload.get("unsupported_only", False)),
         ))
+
+    @router.post("/screenshot-preview")
+    def screenshot_preview(payload: dict[str, object]) -> dict[str, object]:
+        preview_id = str(payload.get("preview_id") or "").strip()
+        try:
+            return ok(load_preview(preview_id))
+        except ScreenshotError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.post("/official-strategy/detail")
     def official_strategy_detail(payload: dict[str, object]) -> dict[str, object]:
@@ -889,15 +916,17 @@ def create_admin_ai_router(
         deployment_id = str(payload.get("deployment_id") or "").strip()
         if not deployment_id:
             raise HTTPException(status_code=400, detail="deployment_id_required")
-        return ok(store.admin_deployment_history_orders(
-            deployment_id,
-            account_login=str(payload.get("account_login") or "").strip(),
-            account_server=str(payload.get("account_server") or "").strip(),
-            symbol=str(payload.get("symbol") or "").strip(),
-            period=str(payload.get("period") or "all").strip(),
-            page=int(payload.get("page") or 1),
-            size=int(payload.get("size") or 50),
-        ))
+        try:
+            return ok(store.admin_deployment_order_overview(
+                deployment_id,
+                period=str(payload.get("period") or "all").strip(),
+                page=int(payload.get("page") or 1),
+                size=int(payload.get("size") or 50),
+            ))
+        except RuntimeError as exc:
+            if str(exc) == "deployment_not_found":
+                raise HTTPException(status_code=404, detail="deployment_not_found") from exc
+            raise
 
     @router.post("/official-strategy/save")
     def official_strategy_save(payload: dict[str, object]) -> dict[str, object]:
@@ -1274,6 +1303,17 @@ def create_auth_router(
             end_at=end_at,
         ))
 
+    @router.post("/usage/screenshot-preview")
+    def user_usage_screenshot_preview(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.usage_screenshot_preview(
+            token,
+            usage_id=str(payload.get("usage_id") or ""),
+        ))
+
     @router.get("/orders")
     def user_orders(
         page: int = Query(default=1, ge=1),
@@ -1418,6 +1458,7 @@ def _request_id(
             request.symbol.upper(),
             request.timeframe.upper(),
             request.data_type,
+            _screenshot_request_fingerprint(request),
             last_bar_time,
             str(request.market.bid),
             str(request.market.ask),
@@ -1444,6 +1485,25 @@ def _bar_time(bars: list[Mt5Bar]) -> int:
         return int(datetime.now(timezone.utc).timestamp())
     now = int(datetime.now(timezone.utc).timestamp())
     return max(_bar_timestamp(item, now) for item in bars)
+
+
+def _request_screenshot(data_type: str, screenshot: object) -> tuple[str, dict[str, object]]:
+    if data_type not in {"screenshot", "both"}:
+        return "", {}
+    if screenshot is None:
+        raise ScreenshotError("screenshot_required")
+    mime_type = str(getattr(screenshot, "mime_type", "") or "")
+    encoded = str(getattr(screenshot, "base64", "") or "")
+    return prepare_screenshot(mime_type, encoded)
+
+
+def _screenshot_request_fingerprint(request: Mt5OpenDecisionRequest | Mt5PositionDecisionRequest) -> str:
+    if request.market.screenshot_id:
+        return str(request.market.screenshot_id)
+    screenshot = request.market.screenshot
+    if screenshot is None or not screenshot.base64:
+        return "no_screenshot"
+    return sha256(str(screenshot.base64).encode("ascii", errors="ignore")).hexdigest()[:16]
 
 
 def _normalize_epoch_seconds(value: int) -> int:
@@ -1551,6 +1611,13 @@ def _mt5_business_error_description(
         "deployment_account_mismatch": "当前 MT 账号与策略绑定账号不一致，请在用户中心修改绑定账号",
         "invalid_deployment_account": "MT 账号无效，请检查账号后重试",
         "insufficient_balance": "AI 余额不足，策略分析已停止，请充值后继续使用",
+        "screenshot_required": "EA未提供策略所需截图，本次分析已停止",
+        "unsupported_screenshot_type": "截图格式不支持，请使用PNG、JPEG或WebP",
+        "invalid_screenshot_base64": "截图Base64数据无效，本次分析已停止",
+        "invalid_screenshot_image": "截图文件内容无效，本次分析已停止",
+        "empty_screenshot": "截图内容为空，本次分析已停止",
+        "screenshot_too_large": "截图超过5MB，本次分析已停止",
+        "screenshot_type_mismatch": "截图格式与声明类型不一致，本次分析已停止",
     }
     message = messages.get(error_code, "策略暂时不可用")
     return f"{message}（{error_code}）" if include_code else message

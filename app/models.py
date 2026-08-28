@@ -85,6 +85,9 @@ class BaseEvaluateRequest(StrictModel):
     spread_points: float = Field(ge=0)
     candles: list[Candle] = Field(default_factory=list, max_length=1000)
     symbol_info: dict[str, Any] = Field(default_factory=dict)
+    data_type: Literal["kline", "screenshot", "both"] = "kline"
+    screenshot_data_url: str = ""
+    screenshot_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class OpenEvaluateRequest(BaseEvaluateRequest):

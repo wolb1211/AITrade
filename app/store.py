@@ -1789,6 +1789,75 @@ class SqliteStore:
             "orders": orders,
         }
 
+    def admin_deployment_order_overview(
+        self,
+        deployment_id: str,
+        *,
+        period: str = "all",
+        page: int = 1,
+        size: int = 50,
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            deployment = connection.execute(
+                "SELECT * FROM deployments WHERE id = ?",
+                (deployment_id,),
+            ).fetchone()
+            if deployment is None:
+                raise RuntimeError("deployment_not_found")
+            start_iso, end_iso, _, _, _ = _period_bounds(period)
+            decision_rows = connection.execute(
+                """
+                SELECT endpoint, response_json
+                FROM decisions
+                WHERE deployment_id = ? AND created_at >= ? AND created_at <= ?
+                """,
+                (deployment_id, start_iso, end_iso),
+            ).fetchall()
+            usage = connection.execute(
+                """
+                SELECT COALESCE(SUM(input_tokens), 0) input_tokens,
+                       COALESCE(SUM(output_tokens), 0) output_tokens,
+                       COALESCE(SUM(total_tokens), 0) total_tokens,
+                       COALESCE(SUM(official_tokens), 0) official_tokens,
+                       COALESCE(SUM(custom_tokens), 0) custom_tokens
+                FROM ai_usage_logs
+                WHERE deployment_id = ? AND created_at >= ? AND created_at <= ?
+                """,
+                (deployment_id, start_iso, end_iso),
+            ).fetchone()
+        analysis_count = len(decision_rows)
+        signal_count = 0
+        order_count = 0
+        for row in decision_rows:
+            try:
+                payload = json.loads(str(row["response_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            action = str(payload.get("action") or "").upper()
+            if action and action != "HOLD":
+                signal_count += 1
+            if str(row["endpoint"] or "") == "open" and action in {"BUY", "SELL"}:
+                order_count += 1
+        result = self.list_user_orders(
+            user_id=int(deployment["user_id"]),
+            deployment_id=deployment_id,
+            page=page,
+            size=size,
+            start_at=start_iso,
+            end_at=end_iso,
+        )
+        result["runtime_summary"] = {
+            "analysis_count": analysis_count,
+            "signal_count": signal_count,
+            "order_count": order_count,
+            "input_tokens": int(usage["input_tokens"] or 0) if usage else 0,
+            "output_tokens": int(usage["output_tokens"] or 0) if usage else 0,
+            "total_tokens": int(usage["total_tokens"] or 0) if usage else 0,
+            "official_tokens": int(usage["official_tokens"] or 0) if usage else 0,
+            "custom_tokens": int(usage["custom_tokens"] or 0) if usage else 0,
+        }
+        return result
+
     def admin_deployment_account_symbol_stats(
         self,
         deployment_id: str,
@@ -2190,7 +2259,9 @@ class SqliteStore:
             mapper=self._official_strategy_row,
         )
 
-    def list_admin_custom_strategies(self, *, page: int, size: int, keyword: str = "") -> dict[str, Any]:
+    def list_admin_custom_strategies(
+        self, *, page: int, size: int, keyword: str = "", unsupported_only: bool = False,
+    ) -> dict[str, Any]:
         clauses = ["d.strategy_code = 'CUSTOM_AI_V1'", "d.status <> 'deleted'"]
         params: list[Any] = []
         if keyword:
@@ -2200,6 +2271,11 @@ class SqliteStore:
                 "OR d.config_json LIKE ? OR u.email LIKE ? OR u.nickname LIKE ?)"
             )
             params.extend([like, like, like, like, like, like])
+        if unsupported_only:
+            clauses.append(
+                "d.config_json LIKE '%\"unsupported_condition_count\": %' "
+                "AND d.config_json NOT LIKE '%\"unsupported_condition_count\": 0%'"
+            )
         where = f"WHERE {' AND '.join(clauses)}"
         return self._paged_query_sql(
             count_sql=f"""
@@ -2774,7 +2850,7 @@ class SqliteStore:
         ]
 
         deployments_list = sorted(
-            expanded_deployments,
+            by_deployment.values(),
             key=lambda item: (
                 str(item.get("last_active_at") or item.get("updated_at") or ""),
                 int(item["activity_count"]),
@@ -2804,7 +2880,7 @@ class SqliteStore:
                 "bucket": bucket,
                 "pnl_curve": _pnl_curve_points(pnl_buckets),
             },
-            "deployments": deployments_list[:100],
+            "deployments": deployments_list,
         }
 
     def activate_deployment(
@@ -4257,6 +4333,9 @@ class SqliteStore:
                 "position_logic": str(config.get("position_logic") or ""),
                 "open_indicators": list(config.get("open_indicators") or []),
                 "position_indicators": list(config.get("position_indicators") or []),
+                "open_rule_plan": dict(config.get("open_rule_plan") or {}),
+                "position_rule_plan": dict(config.get("position_rule_plan") or {}),
+                "rule_engine_version": int(config.get("rule_engine_version") or 0),
                 "unsupported_indicators": list(config.get("unsupported_indicators") or []),
                 "compile_status": str(config.get("compile_status") or ""),
                 "open_ai_mode": open_ai_mode,
@@ -4374,6 +4453,9 @@ class SqliteStore:
                 "volume": float(row["volume"] or 0),
                 "open_price": float(row["open_price"] or 0),
                 "close_price": float(row["close_price"] or row["price"] or 0),
+                "profit": float(row["profit"] or 0),
+                "commission": float(row["commission"] or 0),
+                "swap": float(row["swap"] or 0),
                 "net_profit": float(row["net_profit"] or 0),
                 "open_time": int(row["open_time"] or 0),
                 "close_time": int(row["close_time"] or row["deal_time"] or 0),
@@ -4609,6 +4691,9 @@ class SqliteStore:
                 "volume": float(row["volume"] or 0),
                 "open_price": float(row["open_price"] or 0),
                 "close_price": float(row["close_price"] or row["price"] or 0),
+                "profit": float(row["profit"] or 0),
+                "commission": float(row["commission"] or 0),
+                "swap": float(row["swap"] or 0),
                 "net_profit": float(row["net_profit"] or 0),
                 "open_time": int(row["open_time"] or 0),
                 "close_time": int(row["close_time"] or row["deal_time"] or 0),
@@ -5464,6 +5549,16 @@ class SqliteStore:
             },
         }
 
+    def get_user_ai_usage_screenshot_preview_id(self, *, user_id: int, usage_id: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_usage_logs WHERE id = ? AND user_id = ? LIMIT 1",
+                (str(usage_id or "").strip(), str(user_id)),
+            ).fetchone()
+        if row is None:
+            return ""
+        return str(self._usage_row(row).get("screenshot_preview_id") or "")
+
     def save_ai_usage_log(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = utc_now_iso()
         log_id = str(payload.get("id") or f"ailog_{uuid4().hex}")
@@ -5937,6 +6032,19 @@ class SqliteStore:
         for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount"):
             data[field] = decimal_string(data.get(field))
         data["balance_after"] = None if data.get("balance_after") is None else decimal_string(data.get("balance_after"))
+        data["screenshot_preview_id"] = ""
+        data["screenshot_metadata"] = {}
+        try:
+            snapshot = json.loads(str(data.get("request_snapshot") or "{}"))
+            messages = snapshot.get("messages") if isinstance(snapshot, dict) else []
+            user_content = messages[1].get("content") if isinstance(messages, list) and len(messages) > 1 else ""
+            payload = json.loads(user_content) if isinstance(user_content, str) else {}
+            screenshot = payload.get("screenshot") if isinstance(payload, dict) else {}
+            if isinstance(screenshot, dict):
+                data["screenshot_metadata"] = screenshot
+                data["screenshot_preview_id"] = str(screenshot.get("preview_id") or "")
+        except (TypeError, json.JSONDecodeError, IndexError):
+            pass
         return data
 
     @staticmethod
@@ -6007,6 +6115,14 @@ class SqliteStore:
             "position_prompt_template": str(config.get("position_prompt_template") or ""),
             "open_indicators": list_value("open_indicators"),
             "position_indicators": list_value("position_indicators"),
+            "open_rule_plan": dict(config.get("open_rule_plan") or {}),
+            "position_rule_plan": dict(config.get("position_rule_plan") or {}),
+            "rule_engine_version": int(config.get("rule_engine_version") or 0),
+            "unsupported_conditions": list_value("unsupported_conditions"),
+            "unsupported_condition_count": int(
+                config.get("unsupported_condition_count") or len(list_value("unsupported_conditions"))
+            ),
+            "visual_conditions": list_value("visual_conditions"),
             "unsupported_indicators": list_value("unsupported_indicators"),
             "warnings": list_value("warnings"),
             "compile_status": str(config.get("compile_status") or ""),
