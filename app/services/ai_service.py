@@ -2131,9 +2131,12 @@ def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
 def _vision_test_answer_is_correct(value: str) -> bool:
     text = str(value or "")
     normalized_english = re.sub(r"[^A-Z]+", " ", text.upper()).strip()
-    red_circle = bool(re.search(r"\b(?:RED CIRCLE|CIRCLE RED)\b", normalized_english))
+    red_circle = bool(re.search(
+        r"\b(?:RED (?:CIRCLE|SEMICIRCLE)S?|(?:CIRCLE|SEMICIRCLE)S? RED)\b",
+        normalized_english,
+    ))
     blue_shape = bool(re.search(
-        r"\b(?:BLUE (?:SQUARE|RECTANGLE)|(?:SQUARE|RECTANGLE) BLUE)\b",
+        r"\b(?:BLUE (?:SQUARE|RECTANGLE)S?|(?:SQUARE|RECTANGLE)S? BLUE)\b",
         normalized_english,
     ))
     english_correct = red_circle and blue_shape
