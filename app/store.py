@@ -217,6 +217,37 @@ def _is_profit_deal_entry(entry: str) -> bool:
     return entry.strip().lower() in {"out", "out_by", "inout"}
 
 
+_SETUP_COMMENT_CODES = {
+    "BOL": ("breakout_long", "突破做多", "buy"),
+    "BOS": ("breakout_short", "突破做空", "sell"),
+    "BRL": ("breakout_retest_long", "突破回踩做多", "buy"),
+    "BRS": ("breakout_retest_short", "突破回踩做空", "sell"),
+    "TCL": ("trend_continuation_long", "趋势延续做多", "buy"),
+    "TCS": ("trend_continuation_short", "趋势延续做空", "sell"),
+    "PH1": ("pullback_h1_long", "回调H1做多", "buy"),
+    "PH2": ("pullback_h2_long", "回调H2做多", "buy"),
+    "PL1": ("pullback_l1_short", "回调L1做空", "sell"),
+    "PL2": ("pullback_l2_short", "回调L2做空", "sell"),
+}
+
+
+def _parse_setup_order_comment(comment: str) -> dict[str, Any] | None:
+    matched = re.search(r"\bGL(?P<version>\d+)-(?P<code>[A-Z0-9]+)-(?P<token>[a-fA-F0-9]{6,12})\b", str(comment or ""))
+    if matched is None:
+        return None
+    setup = _SETUP_COMMENT_CODES.get(matched.group("code"))
+    if setup is None:
+        return None
+    setup_code, setup_name, direction = setup
+    return {
+        "setup_version": int(matched.group("version")),
+        "setup_code": setup_code,
+        "setup_name": setup_name,
+        "direction": direction,
+        "decision_token": matched.group("token").lower(),
+    }
+
+
 class SqliteStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -431,6 +462,37 @@ class SqliteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_mt_order_archive_deployment
                     ON mt_order_archived_deals(deployment_id, close_time);
+
+                CREATE TABLE IF NOT EXISTS strategy_trade_outcomes (
+                    id TEXT PRIMARY KEY,
+                    deployment_id TEXT NOT NULL,
+                    account_login TEXT NOT NULL DEFAULT '',
+                    account_server TEXT NOT NULL DEFAULT '',
+                    deal_id TEXT NOT NULL,
+                    order_id TEXT NOT NULL DEFAULT '',
+                    decision_id TEXT NOT NULL DEFAULT '',
+                    decision_token TEXT NOT NULL DEFAULT '',
+                    setup_version INTEGER NOT NULL DEFAULT 0,
+                    setup_code TEXT NOT NULL DEFAULT '',
+                    setup_name TEXT NOT NULL DEFAULT '',
+                    direction TEXT NOT NULL DEFAULT '',
+                    score INTEGER NOT NULL DEFAULT 0,
+                    components_json TEXT NOT NULL DEFAULT '{}',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    timeframe TEXT NOT NULL DEFAULT '',
+                    volume REAL NOT NULL DEFAULT 0,
+                    net_profit REAL NOT NULL DEFAULT 0,
+                    open_time INTEGER NOT NULL DEFAULT 0,
+                    close_time INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(account_login, account_server, deal_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_strategy_outcome_deployment_close
+                    ON strategy_trade_outcomes(deployment_id, close_time);
+                CREATE INDEX IF NOT EXISTS idx_strategy_outcome_setup_close
+                    ON strategy_trade_outcomes(setup_code, setup_version, close_time);
 
                 CREATE TABLE IF NOT EXISTS ai_providers (
                     id TEXT PRIMARY KEY,
@@ -1856,7 +1918,117 @@ class SqliteStore:
             "official_tokens": int(usage["official_tokens"] or 0) if usage else 0,
             "custom_tokens": int(usage["custom_tokens"] or 0) if usage else 0,
         }
+        setup_stats = self.strategy_setup_stats(
+            deployment_id,
+            start_at=start_iso,
+            end_at=end_iso,
+        )
+        setup_stats["unclassified_orders"] = max(
+            0,
+            int(result.get("summary", {}).get("total") or 0) - int(setup_stats["attributed_orders"]),
+        )
+        result["setup_stats"] = setup_stats
         return result
+
+    def strategy_setup_stats(
+        self,
+        deployment_id: str,
+        *,
+        start_at: str = "",
+        end_at: str = "",
+    ) -> dict[str, Any]:
+        clauses = ["deployment_id = ?"]
+        params: list[Any] = [deployment_id]
+        if start_at:
+            clauses.append("close_time >= ?")
+            params.append(int(datetime.fromisoformat(normalized_utc_iso(start_at)).timestamp()))
+        if end_at:
+            clauses.append("close_time <= ?")
+            params.append(int(datetime.fromisoformat(normalized_utc_iso(end_at)).timestamp()))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT setup_code, setup_name, setup_version, direction, score,
+                       net_profit, close_time
+                FROM strategy_trade_outcomes
+                WHERE {' AND '.join(clauses)}
+                ORDER BY setup_version, setup_code, close_time, id
+                """,
+                params,
+            ).fetchall()
+
+        groups: dict[tuple[int, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (int(row["setup_version"] or 0), str(row["setup_code"] or "unknown"))
+            item = groups.setdefault(key, {
+                "setup_version": key[0],
+                "setup_code": key[1],
+                "setup_name": str(row["setup_name"] or key[1]),
+                "direction": str(row["direction"] or ""),
+                "order_count": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "flat_count": 0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "net_profit": 0.0,
+                "score_total": 0,
+                "max_consecutive_losses": 0,
+                "_consecutive_losses": 0,
+                "_cumulative": 0.0,
+                "_peak": 0.0,
+                "max_drawdown": 0.0,
+            })
+            profit = float(row["net_profit"] or 0)
+            item["order_count"] += 1
+            item["score_total"] += int(row["score"] or 0)
+            item["net_profit"] += profit
+            if profit > 0:
+                item["win_count"] += 1
+                item["gross_profit"] += profit
+                item["_consecutive_losses"] = 0
+            elif profit < 0:
+                item["loss_count"] += 1
+                item["gross_loss"] += abs(profit)
+                item["_consecutive_losses"] += 1
+                item["max_consecutive_losses"] = max(
+                    item["max_consecutive_losses"], item["_consecutive_losses"],
+                )
+            else:
+                item["flat_count"] += 1
+                item["_consecutive_losses"] = 0
+            item["_cumulative"] += profit
+            item["_peak"] = max(item["_peak"], item["_cumulative"])
+            item["max_drawdown"] = max(item["max_drawdown"], item["_peak"] - item["_cumulative"])
+
+        stats: list[dict[str, Any]] = []
+        for item in groups.values():
+            count = int(item["order_count"])
+            wins = int(item["win_count"])
+            losses = int(item["loss_count"])
+            average_win = item["gross_profit"] / wins if wins else 0.0
+            average_loss = item["gross_loss"] / losses if losses else 0.0
+            stats.append({
+                key: value for key, value in item.items() if not key.startswith("_") and key != "score_total"
+            } | {
+                "win_rate": round(wins / count * 100, 2) if count else 0.0,
+                "average_score": round(item["score_total"] / count, 2) if count else 0.0,
+                "average_win": round(average_win, 2),
+                "average_loss": round(average_loss, 2),
+                "average_win_loss_ratio": round(average_win / average_loss, 2) if average_loss else 0.0,
+                "profit_factor": round(item["gross_profit"] / item["gross_loss"], 2) if item["gross_loss"] else 0.0,
+                "expectancy": round(item["net_profit"] / count, 2) if count else 0.0,
+                "gross_profit": round(item["gross_profit"], 2),
+                "gross_loss": round(item["gross_loss"], 2),
+                "net_profit": round(item["net_profit"], 2),
+                "max_drawdown": round(item["max_drawdown"], 2),
+            })
+        stats.sort(key=lambda item: (int(item["setup_version"]), int(item["order_count"])), reverse=True)
+        return {
+            "attributed_orders": len(rows),
+            "unclassified_orders": 0,
+            "list": stats,
+        }
 
     def admin_deployment_account_symbol_stats(
         self,
@@ -3192,6 +3364,152 @@ class SqliteStore:
             )
         return report_id
 
+    def _save_strategy_trade_outcome(
+        self,
+        connection: Any,
+        *,
+        deployment_id: str,
+        account_login: str,
+        account_server: str,
+        deal_id: str,
+        order: dict[str, Any],
+        net_profit: float,
+        now: str,
+    ) -> None:
+        attribution = _parse_setup_order_comment(str(order.get("comment") or ""))
+        decision_row = None
+        if attribution is not None:
+            decision_row = connection.execute(
+                """
+                SELECT id, timeframe, response_json
+                FROM decisions
+                WHERE deployment_id = ? AND id LIKE ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (deployment_id, f"%{attribution['decision_token']}"),
+            ).fetchone()
+
+        # Some brokers replace or truncate the MT order comment. In that case,
+        # recover the originating decision from the execution report sent by EA.
+        if decision_row is None:
+            target_ids = {
+                str(value)
+                for value in (deal_id, order.get("deal_id"), order.get("order_id"))
+                if str(value or "")
+            }
+            report_rows = connection.execute(
+                """
+                SELECT decision_id, payload_json
+                FROM execution_reports
+                WHERE deployment_id = ?
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (deployment_id,),
+            ).fetchall()
+            matched_decision_id = ""
+            for report_row in report_rows:
+                try:
+                    report = json.loads(str(report_row["payload_json"] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(report, dict) or report.get("success") is not True:
+                    continue
+                nested_payload = report.get("payload")
+                payload = nested_payload if isinstance(nested_payload, dict) else {}
+                report_ids = {
+                    str(value)
+                    for value in (
+                        report.get("order_id"), report.get("deal_id"),
+                        payload.get("order_id"), payload.get("deal_id"),
+                        payload.get("ticket"),
+                    )
+                    if str(value or "")
+                }
+                if target_ids & report_ids:
+                    matched_decision_id = str(report_row["decision_id"] or report.get("decision_id") or "")
+                    break
+            if matched_decision_id:
+                decision_row = connection.execute(
+                    """
+                    SELECT id, timeframe, response_json
+                    FROM decisions
+                    WHERE deployment_id = ? AND id = ?
+                    LIMIT 1
+                    """,
+                    (deployment_id, matched_decision_id),
+                ).fetchone()
+        metadata: dict[str, Any] = {}
+        decision_id = ""
+        timeframe = ""
+        if decision_row is not None:
+            decision_id = str(decision_row["id"] or "")
+            timeframe = str(decision_row["timeframe"] or "")
+            try:
+                response = json.loads(str(decision_row["response_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                response = {}
+            raw_metadata = response.get("metadata") if isinstance(response, dict) else {}
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        if attribution is None:
+            setup_code = str(metadata.get("setup_code") or "")
+            setup_version = int(metadata.get("setup_version") or 0)
+            if not setup_code or setup_version <= 0 or not decision_id:
+                return
+            attribution = {
+                "setup_version": setup_version,
+                "setup_code": setup_code,
+                "setup_name": str(metadata.get("setup_name") or setup_code),
+                "direction": str(metadata.get("direction") or ""),
+                "decision_token": decision_id.rsplit("_", 1)[-1][-8:].lower(),
+            }
+        score = int(metadata.get("score") or 0)
+        components = metadata.get("components") if isinstance(metadata.get("components"), dict) else {}
+        outcome_id = f"sto_{uuid4().hex}"
+        connection.execute(
+            """
+            INSERT INTO strategy_trade_outcomes (
+                id, deployment_id, account_login, account_server, deal_id,
+                order_id, decision_id, decision_token, setup_version,
+                setup_code, setup_name, direction, score, components_json,
+                symbol, timeframe, volume, net_profit, open_time, close_time,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_login, account_server, deal_id) DO UPDATE SET
+                deployment_id = excluded.deployment_id,
+                order_id = excluded.order_id,
+                decision_id = excluded.decision_id,
+                decision_token = excluded.decision_token,
+                setup_version = excluded.setup_version,
+                setup_code = excluded.setup_code,
+                setup_name = excluded.setup_name,
+                direction = excluded.direction,
+                score = excluded.score,
+                components_json = excluded.components_json,
+                symbol = excluded.symbol,
+                timeframe = excluded.timeframe,
+                volume = excluded.volume,
+                net_profit = excluded.net_profit,
+                open_time = excluded.open_time,
+                close_time = excluded.close_time,
+                updated_at = excluded.updated_at
+            """,
+            (
+                outcome_id, deployment_id, account_login, account_server, deal_id,
+                str(order.get("order_id") or deal_id), decision_id,
+                str(attribution["decision_token"]), int(attribution["setup_version"]),
+                str(metadata.get("setup_code") or attribution["setup_code"]),
+                str(metadata.get("setup_name") or attribution["setup_name"]),
+                str(metadata.get("direction") or attribution["direction"]),
+                score, json.dumps(components, ensure_ascii=False, separators=(",", ":")),
+                str(order.get("symbol") or ""), timeframe,
+                float(order.get("volume") or 0), net_profit,
+                int(order.get("open_time") or 0), int(order.get("close_time") or 0),
+                now, now,
+            ),
+        )
+
     def sync_mt5_history_deals(
         self,
         deployment_id: str,
@@ -3331,6 +3649,17 @@ class SqliteStore:
                     updated_count += 1
                 else:
                     inserted_count += 1
+
+                self._save_strategy_trade_outcome(
+                    connection,
+                    deployment_id=deployment_id,
+                    account_login=account_login,
+                    account_server=account_server,
+                    deal_id=order_id,
+                    order=order,
+                    net_profit=net_profit,
+                    now=now,
+                )
 
                 close_timestamp = int(order.get("close_time") or 0)
                 if close_timestamp > 0:
@@ -6189,6 +6518,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_ea_download_table()
         self._ensure_mysql_guide_article_table()
         self._ensure_mysql_order_summary_table()
+        self._ensure_mysql_strategy_outcome_table()
         required_tables = {
             "users",
             "email_verification_codes",
@@ -6204,6 +6534,7 @@ class MySQLStore(SqliteStore):
             "mt5_history_deals",
             "mt_order_time_summaries",
             "mt_order_archived_deals",
+            "strategy_trade_outcomes",
             "ai_templates",
             "ai_endpoints",
             "ai_user_quotas",
@@ -6282,6 +6613,41 @@ class MySQLStore(SqliteStore):
                     archived_at VARCHAR(40) NOT NULL,
                     PRIMARY KEY (account_login, account_server, deal_id),
                     KEY idx_mt_order_archive_deployment (deployment_id, close_time)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+    def _ensure_mysql_strategy_outcome_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_trade_outcomes (
+                    id VARCHAR(64) NOT NULL,
+                    deployment_id VARCHAR(128) NOT NULL,
+                    account_login VARCHAR(64) NOT NULL DEFAULT '',
+                    account_server VARCHAR(128) NOT NULL DEFAULT '',
+                    deal_id VARCHAR(128) NOT NULL,
+                    order_id VARCHAR(128) NOT NULL DEFAULT '',
+                    decision_id VARCHAR(128) NOT NULL DEFAULT '',
+                    decision_token VARCHAR(16) NOT NULL DEFAULT '',
+                    setup_version INT NOT NULL DEFAULT 0,
+                    setup_code VARCHAR(64) NOT NULL DEFAULT '',
+                    setup_name VARCHAR(128) NOT NULL DEFAULT '',
+                    direction VARCHAR(8) NOT NULL DEFAULT '',
+                    score INT NOT NULL DEFAULT 0,
+                    components_json TEXT NOT NULL,
+                    symbol VARCHAR(32) NOT NULL DEFAULT '',
+                    timeframe VARCHAR(16) NOT NULL DEFAULT '',
+                    volume DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    net_profit DECIMAL(24,8) NOT NULL DEFAULT 0,
+                    open_time BIGINT NOT NULL DEFAULT 0,
+                    close_time BIGINT NOT NULL DEFAULT 0,
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_strategy_outcome_deal (account_login, account_server, deal_id),
+                    KEY idx_strategy_outcome_deployment_close (deployment_id, close_time),
+                    KEY idx_strategy_outcome_setup_close (setup_code, setup_version, close_time)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )

@@ -133,6 +133,7 @@ class TradeDecision(StrictModel):
     tp: float | None = None
     position_ticket: str | None = None
     volume: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
     usage: UsageSummary = Field(default_factory=UsageSummary)
     idempotent: bool = False
 

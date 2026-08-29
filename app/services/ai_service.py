@@ -103,7 +103,18 @@ class AiDecisionClient:
                         "bias": features.get("setup_bias"),
                         "score": features.get("setup_score"),
                         "setup": features.get("setup_name"),
-                        "rule": "score >= 70 means a valid PA candidate; AI may reject only for clear risk or conflicting structure.",
+                        "setup_code": features.get("setup_code"),
+                        "score_components": features.get("setup_components"),
+                        "long_score": features.get("long_score"),
+                        "short_score": features.get("short_score"),
+                        "score_margin": features.get("score_margin"),
+                        "candidate_direction": features.get("server_candidate_direction"),
+                        "structure_stop": features.get("server_structure_sl"),
+                        "minimum_risk_reward": features.get("server_min_risk_reward"),
+                        "rule": (
+                            "The server candidate direction is fixed. AI may approve that direction or reject the trade, "
+                            "but must never reverse it. The final server also preserves the structure stop and minimum risk-reward."
+                        ),
                     },
                     "risk_notes": [
                         "Avoid trading when barbwire_candidate is true unless breakout/retest or failed-breakout reversal is clear.",
@@ -732,6 +743,12 @@ class AiDecisionClient:
                         "Modify stop when profit exists and structure allows a tighter protective stop.",
                         "Add only when setup_score is high and direction matches the position plan.",
                     ],
+                    "execution_constraints": {
+                        "allow_add": bool(deployment["config"].get("allow_add")),
+                        "max_positions": int(deployment["config"].get("max_positions") or 1),
+                        "current_positions": len(request_payload.positions),
+                        "rule": "Never request add when allow_add is false or current_positions reached max_positions.",
+                    },
                 },
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
                 "recent_candles": _compact_candles(request_payload.candles, limit=40),

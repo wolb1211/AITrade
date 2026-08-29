@@ -3,11 +3,27 @@ from __future__ import annotations
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Any
 from uuid import uuid4
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision
 from app.services.ai_service import AiDecisionClient
+
+
+@dataclass(frozen=True)
+class PaSetupCandidate:
+    code: str
+    label: str
+    direction: str
+    context_score: int
+    structure_score: int
+    trigger_score: int
+    space_score: int
+    penalty_score: int
+    total_score: int
+    hard_blocks: tuple[str, ...]
+    evidence: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -60,6 +76,15 @@ class PaFeatureSnapshot:
     setup_bias: str
     setup_score: int
     setup_name: str
+    setup_code: str
+    setup_version: int
+    setup_components: dict[str, int]
+    long_score: int
+    short_score: int
+    score_margin: int
+    candidate_valid: bool
+    h_l_pattern: dict[str, Any]
+    setup_candidates: tuple[dict[str, Any], ...]
     last_close: float
 
 
@@ -115,7 +140,13 @@ class PaAgentLiteStrategy:
         if local_decision.action not in {"BUY", "SELL"}:
             return local_decision
 
-        ai_decision = self._evaluate_open_with_ai(request, deployment, features)
+        ai_decision = self._evaluate_open_with_ai(
+            request,
+            deployment,
+            features,
+            expected_direction=direction,
+            local_decision=local_decision,
+        )
         if ai_decision is not None:
             return ai_decision
 
@@ -131,10 +162,11 @@ class PaAgentLiteStrategy:
         config = deployment["config"]
         max_loss, take_profit = _position_money_limits(config, request)
 
-        if position.profit <= -max_loss:
-            return _close(request, self._decision_id(), position.ticket, "Position reached configured maximum loss")
-        if position.profit >= take_profit:
-            return _close(request, self._decision_id(), position.ticket, "Position reached configured profit target")
+        for checked_position in request.positions:
+            if max_loss is not None and checked_position.profit <= -max_loss:
+                return _close(request, self._decision_id(), checked_position.ticket, "Position reached configured maximum loss")
+            if take_profit is not None and checked_position.profit >= take_profit:
+                return _close(request, self._decision_id(), checked_position.ticket, "Position reached configured profit target")
         if features is None:
             return _position_hold(request, self._decision_id(), position.ticket, "PA Agent position strategy requires at least 30 candles")
 
@@ -142,9 +174,13 @@ class PaAgentLiteStrategy:
         if ai_decision is not None:
             if ai_decision.action != "HOLD":
                 return ai_decision
+            target = next(
+                (item for item in request.positions if item.ticket == ai_decision.position_ticket),
+                position,
+            )
             protective_stop = _atr_protective_stop(
                 request,
-                position,
+                target,
                 atr=features.atr14,
                 usage=ai_decision.usage,
             )
@@ -171,13 +207,22 @@ class PaAgentLiteStrategy:
         request: OpenEvaluateRequest,
         deployment: dict[str, Any],
         features: PaFeatureSnapshot,
+        *,
+        expected_direction: str,
+        local_decision: TradeDecision,
     ) -> TradeDecision | None:
         if self.ai_client is None:
             return None
+        ai_features = _feature_dict(features)
+        ai_features.update({
+            "server_candidate_direction": expected_direction.lower(),
+            "server_structure_sl": local_decision.sl,
+            "server_min_risk_reward": 1.8,
+        })
         result = self.ai_client.pa_open_decision(
             deployment=deployment,
             request_payload=request,
-            features=_feature_dict(features),
+            features=ai_features,
         )
         if result is None:
             return None
@@ -196,20 +241,35 @@ class PaAgentLiteStrategy:
                 usage=result.usage,
             )
 
+        if direction.upper() != expected_direction:
+            return _hold(
+                request,
+                self._decision_id(),
+                "AI返回方向与服务端候选方向冲突，本次不开仓",
+                confidence=min(confidence, 0.45),
+                usage=result.usage,
+            )
+
         config = deployment["config"]
         spread_price = abs(request.ask - request.bid)
         min_distance = max(spread_price * 30, features.atr14 * 1.2)
-        sl_distance = max(abs(float(content.get("sl_distance_price") or 0.0)), min_distance)
-        tp_distance = max(abs(float(content.get("tp_distance_price") or 0.0)), min_distance * 1.5)
+        ai_sl_distance = _positive_float(content.get("sl_distance_price"), min_distance)
+        ai_tp_distance = _positive_float(content.get("tp_distance_price"), 0.0)
 
         if direction == "buy":
             entry = request.ask
             action = "BUY"
+            structure_distance = max(entry - float(local_decision.sl or entry), 0.0)
+            sl_distance = max(ai_sl_distance, structure_distance, min_distance)
+            tp_distance = max(ai_tp_distance, sl_distance * 1.8)
             sl = entry - sl_distance
             tp = entry + tp_distance
         else:
             entry = request.bid
             action = "SELL"
+            structure_distance = max(float(local_decision.sl or entry) - entry, 0.0)
+            sl_distance = max(ai_sl_distance, structure_distance, min_distance)
+            tp_distance = max(ai_tp_distance, sl_distance * 1.8)
             sl = entry + sl_distance
             tp = entry - tp_distance
 
@@ -217,6 +277,15 @@ class PaAgentLiteStrategy:
             lot = _position_size_lot(config, request, entry=entry, sl=sl)
         else:
             lot = _fixed_lot(config)
+
+        if lot <= 0:
+            return _hold(
+                request,
+                self._decision_id(),
+                "最小交易手数超过当前风险额度，本次不开仓",
+                confidence=min(confidence, 0.45),
+                usage=result.usage,
+            )
 
         space_reason = _space_block_reason(features, action, entry)
         if space_reason:
@@ -241,6 +310,7 @@ class PaAgentLiteStrategy:
             entry=entry,
             sl=sl,
             tp=tp,
+            metadata=_setup_metadata(features),
             usage=result.usage,
         )
 
@@ -273,10 +343,21 @@ class PaAgentLiteStrategy:
             decision.usage = result.usage
             return decision
         if action == "modify":
-            sl = _optional_float(content.get("sl"))
-            tp = _optional_float(content.get("tp"))
-            if sl is None and tp is None:
-                return None
+            sl, tp, changed = _validated_position_modification(
+                request,
+                target,
+                sl=_optional_float(content.get("sl")),
+                tp=_optional_float(content.get("tp")),
+            )
+            if not changed:
+                return _position_hold(
+                    request,
+                    self._decision_id(),
+                    target.ticket,
+                    "AI返回的止损止盈未收紧或不符合当前持仓方向，保持原设置",
+                    confidence=min(confidence, 0.45),
+                    usage=result.usage,
+                )
             decision = _modify(
                 request,
                 self._decision_id(),
@@ -292,19 +373,40 @@ class PaAgentLiteStrategy:
             direction = str(content.get("direction") or "").strip().lower()
             if direction not in {"buy", "sell"}:
                 return None
-            lot = _fixed_lot(deployment["config"])
+            config = deployment["config"]
+            max_positions = max(1, int(config.get("max_positions") or 1))
+            same_direction = all(item.side.lower() == direction for item in request.positions)
+            if not bool(config.get("allow_add")) or len(request.positions) >= max_positions or not same_direction:
+                return _position_hold(
+                    request,
+                    self._decision_id(),
+                    target.ticket,
+                    "当前策略配置不允许本次加仓，继续持有原仓位",
+                    confidence=min(confidence, 0.45),
+                    usage=result.usage,
+                )
             spread_price = abs(request.ask - request.bid)
             min_distance = max(spread_price * 30, features.atr14 * 1.2)
             if direction == "buy":
                 entry = request.ask
                 sl = entry - min_distance
-                tp = entry + min_distance * 1.5
+                tp = entry + min_distance * 1.8
                 trade_action = "BUY"
             else:
                 entry = request.bid
                 sl = entry + min_distance
-                tp = entry - min_distance * 1.5
+                tp = entry - min_distance * 1.8
                 trade_action = "SELL"
+            lot = _position_size_lot(config, request, entry=entry, sl=sl)
+            if lot <= 0:
+                return _position_hold(
+                    request,
+                    self._decision_id(),
+                    target.ticket,
+                    "最小交易手数超过当前风险额度，本次不加仓",
+                    confidence=min(confidence, 0.45),
+                    usage=result.usage,
+                )
             return TradeDecision(
                 decision_id=self._decision_id(),
                 request_id=request.request_id,
@@ -510,11 +612,19 @@ def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:
     bull_trend_bars = _same_direction_count(bars, bullish=True)
     bear_trend_bars = _same_direction_count(bars, bullish=False)
     breakout = _breakout(bars)
-    breakout_event = _breakout_event(bars, range_high, range_low)
+    prior_window = window[:-1]
+    prior_range_high = max(bar.high for bar in prior_window)
+    prior_range_low = min(bar.low for bar in prior_window)
+    breakout_event = _breakout_event(bars, prior_range_high, prior_range_low)
     pivots = _swing_pivots(bars[-40:])
     swing_structure = _swing_structure(pivots)
     support_1, resistance_1 = _nearest_levels(pivots, last_close)
-    pullback_depth_atr, pullback_bars = _pullback_metrics(pivots, last_close, atr14)
+    pullback_depth_atr, pullback_bars = _pullback_metrics(
+        pivots,
+        last_close,
+        atr14,
+        window_size=min(len(bars), 40),
+    )
     h_count, l_count = _hl_counts(bars[-20:])
     background_direction = _direction_vote(bars[:-40], atr14, ema20) if len(bars) > 50 else "neutral"
     recent_direction = _direction_vote(bars[-40:], atr14, ema20)
@@ -582,7 +692,18 @@ def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:
         final_flag_candidate=final_flag_candidate,
         climax_risk=climax_risk,
     )
-    setup = _score_setup(
+    long_attempt = _pullback_attempt_pattern(
+        bars[-16:],
+        direction="long",
+        invalidation= support_1 or range_low,
+    )
+    short_attempt = _pullback_attempt_pattern(
+        bars[-16:],
+        direction="short",
+        invalidation=resistance_1 or range_high,
+    )
+    setup_candidates = _build_setup_candidates(
+        bars=bars,
         breakout=breakout,
         breakout_event=breakout_event,
         range_position=range_position,
@@ -598,6 +719,7 @@ def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:
         dist_to_high_atr=dist_to_high_atr,
         dist_to_low_atr=dist_to_low_atr,
         cycle_position=cycle_position,
+        background_direction=background_direction,
         recent_direction=recent_direction,
         trend_relationship=trend_relationship,
         detected_patterns=detected_patterns,
@@ -607,7 +729,14 @@ def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:
         always_in=always_in,
         signal_bar_quality=signal_bar_quality,
         follow_through=follow_through,
+        support=support_1,
+        resistance=resistance_1,
+        atr14=atr14,
+        last_close=last_close,
+        long_attempt=long_attempt,
+        short_attempt=short_attempt,
     )
+    setup = _select_setup_candidate(setup_candidates)
 
     return PaFeatureSnapshot(
         atr14=atr14,
@@ -658,24 +787,25 @@ def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:
         setup_bias=setup["bias"],
         setup_score=int(setup["score"]),
         setup_name=str(setup["name"]),
+        setup_code=str(setup["code"]),
+        setup_version=2,
+        setup_components=dict(setup["components"]),
+        long_score=int(setup["long_score"]),
+        short_score=int(setup["short_score"]),
+        score_margin=int(setup["margin"]),
+        candidate_valid=bool(setup["valid"]),
+        h_l_pattern=(long_attempt if setup["bias"] == "bullish" else short_attempt),
+        setup_candidates=tuple(asdict(item) for item in setup_candidates),
         last_close=last_close,
     )
 
 
 def _open_direction(features: PaFeatureSnapshot) -> str | None:
-    above_ema = features.ema20 is not None and features.last_close > features.ema20
-    below_ema = features.ema20 is not None and features.last_close < features.ema20
-    if features.setup_score >= 70 and features.setup_bias == "bullish":
+    if not features.candidate_valid:
+        return None
+    if features.setup_bias == "bullish":
         return "BUY"
-    if features.setup_score >= 70 and features.setup_bias == "bearish":
-        return "SELL"
-    if features.breakout == "up" and above_ema and features.range_position >= 0.7:
-        return "BUY"
-    if features.breakout == "down" and below_ema and features.range_position <= 0.3:
-        return "SELL"
-    if features.bull_trend_bars >= 3 and above_ema and features.range_position >= 0.6:
-        return "BUY"
-    if features.bear_trend_bars >= 3 and below_ema and features.range_position <= 0.4:
+    if features.setup_bias == "bearish":
         return "SELL"
     return None
 
@@ -900,6 +1030,13 @@ def _build_open_decision(
         tp = entry - risk * 1.8
 
     lot = _position_size_lot(config, request, entry=entry, sl=sl)
+    if lot <= 0:
+        return _hold(
+            request,
+            PaAgentLiteStrategy._decision_id(),
+            "最小交易手数超过当前风险额度，本次不开仓",
+            confidence=0.4,
+        )
     return TradeDecision(
         decision_id=PaAgentLiteStrategy._decision_id(),
         request_id=request.request_id,
@@ -913,12 +1050,13 @@ def _build_open_decision(
         entry=entry,
         sl=sl,
         tp=tp,
+        metadata=_setup_metadata(features),
     )
 
 
 def _position_size_lot(
     config: dict[str, Any],
-    request: OpenEvaluateRequest,
+    request: OpenEvaluateRequest | PositionEvaluateRequest,
     *,
     entry: float,
     sl: float | None,
@@ -977,6 +1115,8 @@ def _position_size_lot(
     min_lot = _first_positive_float(info, "volume_min", "lots_min", "min_lot", "minLot") or 0.01
     max_lot = _first_positive_float(info, "volume_max", "lots_max", "max_lot", "maxLot") or raw_lot
     step = _first_positive_float(info, "volume_step", "lots_step", "lot_step", "lotStep") or 0.01
+    if raw_lot < min_lot:
+        return 0.0
     return _normalize_volume(raw_lot, min_lot=min_lot, max_lot=max_lot, step=step)
 
 
@@ -984,11 +1124,14 @@ def _fixed_lot(config: dict[str, Any]) -> float:
     return _positive_float(config.get("fixed_volume") or config.get("lot"), 0.01)
 
 
-def _position_money_limits(config: dict[str, Any], request: PositionEvaluateRequest) -> tuple[float, float]:
+def _position_money_limits(
+    config: dict[str, Any],
+    request: PositionEvaluateRequest,
+) -> tuple[float | None, float | None]:
     if config.get("position_size_mode") != "risk":
-        max_loss = _positive_float(config.get("max_loss_per_position"), 100.0)
-        take_profit = _positive_float(config.get("take_profit_per_position"), 150.0)
-        return abs(max_loss), abs(take_profit)
+        # Fixed-volume strategies are protected by their price SL/TP. Do not
+        # apply the old hidden 100/150 account-currency close thresholds.
+        return None, None
 
     if config.get("risk_base_mode") == "balance_percent":
         risk_money = request.balance * _positive_float(config.get("risk_percent"), 1.0) / 100
@@ -1007,7 +1150,7 @@ def _positive_float(value: Any, fallback: float) -> float:
         number = float(value)
     except (TypeError, ValueError):
         return fallback
-    return number if number > 0 else fallback
+    return number if math.isfinite(number) and number > 0 else fallback
 
 
 def _first_positive_float(payload: dict[str, Any], *keys: str) -> float | None:
@@ -1016,7 +1159,7 @@ def _first_positive_float(payload: dict[str, Any], *keys: str) -> float | None:
             value = float(payload.get(key))
         except (TypeError, ValueError):
             continue
-        if value > 0:
+        if math.isfinite(value) and value > 0:
             return value
     return None
 
@@ -1584,13 +1727,16 @@ def _pullback_metrics(
     pivots: list[dict[str, float | str | int]],
     close: float,
     atr14: float,
+    *,
+    window_size: int,
 ) -> tuple[float, int]:
     if not pivots or atr14 <= 0:
         return 0.0, 0
     last = pivots[-1]
     price = float(last["price"])
     depth = abs(close - price) / atr14
-    return depth, max(0, int(last["index"]))
+    bars_since_pivot = max(0, window_size - 1 - int(last["index"]))
+    return depth, bars_since_pivot
 
 
 def _hl_counts(bars: list[Candle]) -> tuple[int, int]:
@@ -1604,136 +1750,355 @@ def _hl_counts(bars: list[Candle]) -> tuple[int, int]:
     return h_count, l_count
 
 
-def _score_setup(**kwargs: Any) -> dict[str, str | int]:
-    bull = 0
-    bear = 0
-    penalty = 0
-    name_parts: list[str] = []
-    patterns = set(kwargs.get("detected_patterns") or ())
+def _pullback_attempt_pattern(
+    bars: list[Candle],
+    *,
+    direction: str,
+    invalidation: float | None,
+) -> dict[str, Any]:
+    """Detect H1/H2 or L1/L2 as distinct attempts inside a pullback."""
+    if len(bars) < 4:
+        return {
+            "pattern": "none", "direction": direction, "triggered": False,
+            "trigger_bar_index": None, "pullback_bars": 0, "structure_valid": False,
+        }
 
-    if kwargs["above_ema"]:
-        bull += 12
-    if kwargs["below_ema"]:
-        bear += 12
-    if kwargs["breakout"] == "up":
-        bull += 22
-        name_parts.append("range breakout up")
-    if kwargs["breakout"] == "down":
-        bear += 22
-        name_parts.append("range breakout down")
-    if kwargs["breakout_event"] == "breakout_up_retest":
-        bull += 26
-        name_parts.append("breakout retest up")
-    if kwargs["breakout_event"] == "breakout_down_retest":
-        bear += 26
-        name_parts.append("breakout retest down")
-    if kwargs["breakout_event"] == "failed_breakout_down":
-        bull += 18
-        name_parts.append("failed breakdown reversal")
-    if kwargs["breakout_event"] == "failed_breakout_up":
-        bear += 18
-        name_parts.append("failed breakout reversal")
+    pullback_start: int | None = None
+    for index in range(1, len(bars)):
+        current, previous = bars[index], bars[index - 1]
+        is_pullback = (
+            current.low < previous.low or current.close < current.open
+            if direction == "long"
+            else current.high > previous.high or current.close > current.open
+        )
+        if is_pullback:
+            pullback_start = index
+            break
+    if pullback_start is None:
+        return {
+            "pattern": "none", "direction": direction, "triggered": False,
+            "trigger_bar_index": None, "pullback_bars": 0, "structure_valid": True,
+        }
 
-    bull_trend = int(kwargs["bull_trend_bars"])
-    bear_trend = int(kwargs["bear_trend_bars"])
-    bull += min(bull_trend * 9, 27)
-    bear += min(bear_trend * 9, 27)
-    bull += min(int(kwargs["h_count"]) * 3, 18)
-    bear += min(int(kwargs["l_count"]) * 3, 18)
+    attempts = 0
+    armed = True
+    latest_attempt_index: int | None = None
+    for index in range(pullback_start + 1, len(bars)):
+        current, previous = bars[index], bars[index - 1]
+        if direction == "long":
+            if current.low < previous.low:
+                armed = True
+            triggered = current.high > previous.high
+        else:
+            if current.high > previous.high:
+                armed = True
+            triggered = current.low < previous.low
+        if triggered and armed:
+            attempts += 1
+            latest_attempt_index = index
+            armed = False
 
-    if kwargs["swing_structure"] == "HH_HL":
-        bull += 20
-        name_parts.append("HH/HL structure")
-    if kwargs["swing_structure"] == "LL_LH":
-        bear += 20
-        name_parts.append("LL/LH structure")
-    if kwargs["cycle_position"] in {"spike", "micro_channel", "tight_channel"}:
-        if kwargs["recent_direction"] == "bullish":
-            bull += 18
-            name_parts.append(str(kwargs["cycle_position"]))
-        elif kwargs["recent_direction"] == "bearish":
-            bear += 18
-            name_parts.append(str(kwargs["cycle_position"]))
-    if kwargs["trend_relationship"] == "aligned":
-        if kwargs["recent_direction"] == "bullish":
-            bull += 10
-        elif kwargs["recent_direction"] == "bearish":
-            bear += 10
-    if "breakout_pullback" in patterns:
-        bull += 10 if kwargs["recent_direction"] == "bullish" else 0
-        bear += 10 if kwargs["recent_direction"] == "bearish" else 0
-    if "failed_signal" in patterns:
-        bull += 8 if kwargs["breakout_event"] == "failed_breakout_down" else 0
-        bear += 8 if kwargs["breakout_event"] == "failed_breakout_up" else 0
-    if "h2" in patterns:
-        bull += 8
-    if "l2" in patterns:
-        bear += 8
-    if "mtr" in patterns:
-        bull += 12 if kwargs["breakout_event"] == "failed_breakout_down" else 0
-        bear += 12 if kwargs["breakout_event"] == "failed_breakout_up" else 0
-        name_parts.append("MTR/reversal attempt")
-    if "final_flag" in patterns:
-        penalty += 8
-        name_parts.append("final flag risk")
-    if "wedge" in patterns:
-        if kwargs["recent_direction"] == "bullish":
-            bull += 6
-        elif kwargs["recent_direction"] == "bearish":
-            bear += 6
-    if any(item in patterns for item in {"ascending_triangle", "descending_triangle", "symmetrical_triangle"}):
-        if kwargs["recent_direction"] == "bullish":
-            bull += 5
-        elif kwargs["recent_direction"] == "bearish":
-            bear += 5
-        name_parts.append("triangle compression")
-    if kwargs["signal_bar_quality"] == "strong":
-        if kwargs["recent_direction"] == "bullish":
-            bull += 8
-        elif kwargs["recent_direction"] == "bearish":
-            bear += 8
-    if kwargs["follow_through"] == "failed":
-        penalty += 12
-    if kwargs["climax_risk"] == "triggered":
-        penalty += 15
-    elif kwargs["climax_risk"] == "warning":
-        penalty += 8
-    if float(kwargs["range_position"]) >= 0.67:
-        bull += 8
-    if float(kwargs["range_position"]) <= 0.33:
-        bear += 8
-
-    pullback = float(kwargs["pullback_depth_atr"])
-    if 0.3 <= pullback <= 2.2:
-        bull += 6 if kwargs["above_ema"] else 0
-        bear += 6 if kwargs["below_ema"] else 0
-
-    if float(kwargs["barbwire_score"]) >= 0.6:
-        penalty += 25
-        name_parts.append("barbwire risk")
-    if kwargs["cycle_position"] == "trading_range" and "breakout_pullback" not in patterns and "failed_signal" not in patterns:
-        penalty += 12
-    if kwargs["breakout"] == "none" and kwargs["breakout_event"] == "none":
-        penalty += 8
-
-    bull = max(0, bull - penalty)
-    bear = max(0, bear - penalty)
-    if bull >= bear and bull > 0:
-        bias = "bullish"
-        score = min(bull, 100)
-    elif bear > 0:
-        bias = "bearish"
-        score = min(bear, 100)
-    else:
-        bias = "neutral"
-        score = 0
-
-    if not name_parts:
-        name_parts.append("no qualified PA setup")
+    latest = bars[-1]
+    structure_valid = True
+    if invalidation is not None:
+        structure_valid = latest.low > invalidation if direction == "long" else latest.high < invalidation
+    is_latest_trigger = latest_attempt_index == len(bars) - 1
+    prefix = "H" if direction == "long" else "L"
+    pattern = f"{prefix}{min(attempts, 2)}" if attempts else "none"
     return {
-        "bias": bias,
-        "score": int(score),
-        "name": ", ".join(name_parts[:3]),
+        "pattern": pattern,
+        "direction": direction,
+        "triggered": bool(is_latest_trigger),
+        "trigger_bar_index": -1 if is_latest_trigger else None,
+        "pullback_bars": len(bars) - pullback_start,
+        "structure_valid": structure_valid,
+    }
+
+
+def _candidate_space(
+    *,
+    direction: str,
+    entry: float,
+    support: float | None,
+    resistance: float | None,
+    atr14: float,
+) -> tuple[int, tuple[str, ...]]:
+    barrier = resistance if direction == "bullish" else support
+    if barrier is None or atr14 <= 0:
+        return 15, ()
+    distance = barrier - entry if direction == "bullish" else entry - barrier
+    if distance <= 0:
+        return 15, ()
+    distance_atr = distance / atr14
+    if distance_atr >= 1.5:
+        return 15, ()
+    if distance_atr >= 1.2:
+        return 12, ()
+    if distance_atr >= 0.8:
+        return 7, ()
+    return 0, ("insufficient_space",)
+
+
+def _setup_penalty(
+    *,
+    barbwire_score: float,
+    trend_relationship: str,
+    follow_through: str,
+    climax_risk: str,
+    transition_risk: str,
+    breakout_setup: bool = False,
+) -> int:
+    penalty = 0
+    if barbwire_score >= 0.6:
+        penalty += 8 if breakout_setup else 18
+    if trend_relationship == "conflict":
+        penalty += 12
+    if follow_through == "failed":
+        penalty += 12
+    if climax_risk == "triggered":
+        penalty += 18
+    elif climax_risk == "warning":
+        penalty += 8
+    if transition_risk == "high":
+        penalty += 8
+    return min(penalty, 40)
+
+
+def _make_setup_candidate(
+    *,
+    code: str,
+    label: str,
+    direction: str,
+    context: int,
+    structure: int,
+    trigger: int,
+    space: int,
+    penalty: int,
+    hard_blocks: tuple[str, ...] = (),
+    evidence: list[str] | tuple[str, ...] = (),
+) -> PaSetupCandidate:
+    context_score = min(25, max(0, context))
+    structure_score = min(30, max(0, structure))
+    trigger_score = min(30, max(0, trigger))
+    space_score = min(15, max(0, space))
+    penalty_score = min(40, max(0, penalty))
+    total = max(0, min(100, context_score + structure_score + trigger_score + space_score - penalty_score))
+    return PaSetupCandidate(
+        code=code,
+        label=label,
+        direction=direction,
+        context_score=context_score,
+        structure_score=structure_score,
+        trigger_score=trigger_score,
+        space_score=space_score,
+        penalty_score=penalty_score,
+        total_score=total,
+        hard_blocks=hard_blocks,
+        evidence=tuple(evidence),
+    )
+
+
+def _build_setup_candidates(**kwargs: Any) -> list[PaSetupCandidate]:
+    candidates: list[PaSetupCandidate] = []
+    bars: list[Candle] = kwargs["bars"]
+    latest = bars[-1]
+    full_range = max(latest.high - latest.low, 0.0)
+    body_ratio = abs(latest.close - latest.open) / full_range if full_range > 0 else 0.0
+    close_position = (latest.close - latest.low) / full_range if full_range > 0 else 0.5
+
+    def direction_context(direction: str) -> int:
+        bullish = direction == "bullish"
+        score = 0
+        if kwargs["recent_direction"] == direction:
+            score += 10
+        if kwargs["trend_relationship"] == "aligned" and kwargs["background_direction"] == direction:
+            score += 8
+        if kwargs["swing_structure"] == ("HH_HL" if bullish else "LL_LH"):
+            score += 7
+        if kwargs["above_ema"] if bullish else kwargs["below_ema"]:
+            score += 5
+        return min(score, 25)
+
+    def direction_space(direction: str) -> tuple[int, tuple[str, ...]]:
+        return _candidate_space(
+            direction=direction,
+            entry=float(kwargs["last_close"]),
+            support=kwargs.get("support"),
+            resistance=kwargs.get("resistance"),
+            atr14=float(kwargs["atr14"]),
+        )
+
+    breakout_direction = "bullish" if (
+        kwargs["breakout"] == "up"
+        or kwargs["breakout_event"] in {"breakout_up_retest", "range_breakout_up", "failed_breakout_down"}
+    ) else "bearish" if (
+        kwargs["breakout"] == "down"
+        or kwargs["breakout_event"] in {"breakout_down_retest", "range_breakout_down", "failed_breakout_up"}
+    ) else ""
+    if breakout_direction:
+        bullish = breakout_direction == "bullish"
+        context = 8
+        if kwargs["cycle_position"] in {"trading_range", "trending_tr"} or kwargs["barbwire_score"] >= 0.4:
+            context += 9
+        if kwargs["recent_direction"] in {breakout_direction, "neutral"}:
+            context += 6
+        event = str(kwargs["breakout_event"])
+        is_retest = event in {"breakout_up_retest", "breakout_down_retest"}
+        structure = 24 if is_retest else 18
+        if kwargs["swing_structure"] == ("HH_HL" if bullish else "LL_LH"):
+            structure += 6
+        trigger = 0
+        if body_ratio >= 0.5:
+            trigger += 12
+        if (bullish and close_position >= 0.7) or (not bullish and close_position <= 0.3):
+            trigger += 10
+        if kwargs["signal_bar_quality"] == "strong":
+            trigger += 8
+        elif kwargs["signal_bar_quality"] == "medium":
+            trigger += 4
+        space, blocks = direction_space(breakout_direction)
+        penalty = _setup_penalty(
+            barbwire_score=float(kwargs["barbwire_score"]),
+            trend_relationship=str(kwargs["trend_relationship"]),
+            follow_through=str(kwargs["follow_through"]),
+            climax_risk=str(kwargs["climax_risk"]),
+            transition_risk=str(kwargs["transition_risk"]),
+            breakout_setup=True,
+        )
+        suffix = "long" if bullish else "short"
+        candidates.append(_make_setup_candidate(
+            code=f"breakout_{'retest_' if is_retest else ''}{suffix}",
+            label=f"突破{'回踩' if is_retest else ''}{'做多' if bullish else '做空'}",
+            direction=breakout_direction,
+            context=context,
+            structure=structure,
+            trigger=trigger,
+            space=space,
+            penalty=penalty,
+            hard_blocks=blocks,
+            evidence=[str(kwargs["breakout"]), event, str(kwargs["signal_bar_quality"])],
+        ))
+
+    for direction in ("bullish", "bearish"):
+        bullish = direction == "bullish"
+        trend_bars = int(kwargs["bull_trend_bars"] if bullish else kwargs["bear_trend_bars"])
+        direction_matches = kwargs["recent_direction"] == direction
+        trend_structure = kwargs["swing_structure"] == ("HH_HL" if bullish else "LL_LH")
+        if direction_matches and (trend_bars >= 2 or trend_structure or kwargs["always_in"] == ("long" if bullish else "short")):
+            context = direction_context(direction)
+            structure = min(30, min(trend_bars, 4) * 4)
+            if kwargs["cycle_position"] in {"micro_channel", "tight_channel", "normal_channel", "spike"}:
+                structure += 9
+            if kwargs["always_in"] == ("long" if bullish else "short"):
+                structure += 7
+            structure = min(structure, 30)
+            trigger = 0
+            latest_matches = latest.close > latest.open if bullish else latest.close < latest.open
+            if latest_matches:
+                trigger += 12
+            if kwargs["signal_bar_quality"] == "strong":
+                trigger += 8
+            elif kwargs["signal_bar_quality"] == "medium":
+                trigger += 4
+            if kwargs["follow_through"] == "yes":
+                trigger += 10
+            if (bullish and kwargs["breakout"] == "up") or (not bullish and kwargs["breakout"] == "down"):
+                trigger += 5
+            space, blocks = direction_space(direction)
+            penalty = _setup_penalty(
+                barbwire_score=float(kwargs["barbwire_score"]),
+                trend_relationship=str(kwargs["trend_relationship"]),
+                follow_through=str(kwargs["follow_through"]),
+                climax_risk=str(kwargs["climax_risk"]),
+                transition_risk=str(kwargs["transition_risk"]),
+            )
+            candidates.append(_make_setup_candidate(
+                code=f"trend_continuation_{'long' if bullish else 'short'}",
+                label=f"趋势延续{'做多' if bullish else '做空'}",
+                direction=direction,
+                context=context,
+                structure=structure,
+                trigger=trigger,
+                space=space,
+                penalty=penalty,
+                hard_blocks=blocks,
+                evidence=[str(kwargs["recent_direction"]), str(kwargs["cycle_position"]), f"bars={trend_bars}"],
+            ))
+
+        attempt = kwargs["long_attempt"] if bullish else kwargs["short_attempt"]
+        if direction_matches and bool(attempt.get("triggered")):
+            context = direction_context(direction)
+            pullback = float(kwargs["pullback_depth_atr"])
+            structure = 10 if bool(attempt.get("structure_valid")) else 0
+            if 0.3 <= pullback <= 2.0:
+                structure += 12
+            elif 0 < pullback <= 2.5:
+                structure += 6
+            if kwargs["swing_structure"] == ("HH_HL" if bullish else "LL_LH"):
+                structure += 8
+            pattern = str(attempt.get("pattern") or "none")
+            trigger = 22 if pattern in {"H2", "L2"} else 16
+            latest_matches = latest.close > latest.open if bullish else latest.close < latest.open
+            if latest_matches:
+                trigger += 8
+            if kwargs["signal_bar_quality"] == "strong":
+                trigger += 6
+            space, blocks = direction_space(direction)
+            if not bool(attempt.get("structure_valid")):
+                blocks = (*blocks, "pullback_structure_broken")
+            penalty = _setup_penalty(
+                barbwire_score=float(kwargs["barbwire_score"]),
+                trend_relationship=str(kwargs["trend_relationship"]),
+                follow_through=str(kwargs["follow_through"]),
+                climax_risk=str(kwargs["climax_risk"]),
+                transition_risk=str(kwargs["transition_risk"]),
+            )
+            candidates.append(_make_setup_candidate(
+                code=f"pullback_{pattern.lower()}_{'long' if bullish else 'short'}",
+                label=f"回调{pattern}{'做多' if bullish else '做空'}",
+                direction=direction,
+                context=context,
+                structure=structure,
+                trigger=trigger,
+                space=space,
+                penalty=penalty,
+                hard_blocks=tuple(dict.fromkeys(blocks)),
+                evidence=[pattern, f"depth={pullback:.2f}ATR", str(kwargs["swing_structure"])],
+            ))
+
+    return candidates
+
+
+def _select_setup_candidate(candidates: list[PaSetupCandidate]) -> dict[str, Any]:
+    eligible = [item for item in candidates if not item.hard_blocks]
+    longs = [item for item in eligible if item.direction == "bullish"]
+    shorts = [item for item in eligible if item.direction == "bearish"]
+    long_score = max((item.total_score for item in longs), default=0)
+    short_score = max((item.total_score for item in shorts), default=0)
+    best = max(eligible, key=lambda item: item.total_score, default=None)
+    margin = abs(long_score - short_score)
+    valid = bool(best and best.total_score >= 70 and margin >= 12)
+    if best is None:
+        return {
+            "bias": "neutral", "score": 0, "name": "no qualified PA setup", "code": "none",
+            "components": {}, "long_score": 0, "short_score": 0, "margin": 0, "valid": False,
+        }
+    return {
+        "bias": best.direction,
+        "score": best.total_score,
+        "name": best.label,
+        "code": best.code,
+        "components": {
+            "context": best.context_score,
+            "structure": best.structure_score,
+            "trigger": best.trigger_score,
+            "space": best.space_score,
+            "penalty": best.penalty_score,
+        },
+        "long_score": long_score,
+        "short_score": short_score,
+        "margin": margin,
+        "valid": valid,
     }
 
 
@@ -1745,10 +2110,64 @@ def _feature_dict(features: PaFeatureSnapshot) -> dict[str, Any]:
     }
 
 
+def _setup_metadata(features: PaFeatureSnapshot) -> dict[str, Any]:
+    return {
+        "setup_code": features.setup_code,
+        "setup_name": features.setup_name,
+        "setup_version": features.setup_version,
+        "direction": "buy" if features.setup_bias == "bullish" else "sell",
+        "score": features.setup_score,
+        "long_score": features.long_score,
+        "short_score": features.short_score,
+        "score_margin": features.score_margin,
+        "components": dict(features.setup_components),
+    }
+
+
+def _validated_position_modification(
+    request: PositionEvaluateRequest,
+    position: PositionSnapshot,
+    *,
+    sl: float | None,
+    tp: float | None,
+) -> tuple[float | None, float | None, bool]:
+    """Accept only direction-valid changes and never loosen an existing stop."""
+    existing_sl = position.sl if position.sl is not None and position.sl > 0 else None
+    existing_tp = position.tp if position.tp is not None and position.tp > 0 else None
+    tolerance = max(1e-9, abs(position.open_price) * 1e-10)
+    valid_sl = existing_sl
+    valid_tp = existing_tp
+    changed = False
+
+    if sl is not None:
+        if position.side == "BUY":
+            tightens = existing_sl is None or sl > existing_sl + tolerance
+            direction_valid = sl < request.bid - tolerance
+        else:
+            tightens = existing_sl is None or sl < existing_sl - tolerance
+            direction_valid = sl > request.ask + tolerance
+        if tightens and direction_valid:
+            valid_sl = sl
+            changed = True
+
+    if tp is not None:
+        direction_valid = tp > request.ask + tolerance if position.side == "BUY" else tp < request.bid - tolerance
+        differs = existing_tp is None or abs(tp - existing_tp) > tolerance
+        if direction_valid and differs:
+            valid_tp = tp
+            changed = True
+
+    return valid_sl, valid_tp, changed
+
+
 def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:

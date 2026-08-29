@@ -1495,7 +1495,7 @@ def _normalize_epoch_seconds(value: int) -> int:
 
 
 def _candles(bars: list[Mt5Bar]) -> list[Candle]:
-    return [
+    candles = [
         Candle(
             timestamp=_bar_timestamp(item, index),
             open=item.open,
@@ -1506,6 +1506,9 @@ def _candles(bars: list[Mt5Bar]) -> list[Candle]:
         )
         for index, item in enumerate(bars)
     ]
+    # MT arrays may arrive newest-first, while strategy engines consistently
+    # treat [-1] as the latest closed candle.
+    return sorted(candles, key=lambda item: item.timestamp)
 
 
 def _position_snapshot(position: Mt5Position, *, bid: float, ask: float) -> PositionSnapshot:
@@ -1538,7 +1541,7 @@ def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDeci
                 price=decision.entry or 0.0,
                 sl=decision.sl,
                 tp=decision.tp,
-                comment="GainLabAI",
+                comment=_strategy_order_comment(decision),
             ),
         )
 
@@ -1552,6 +1555,28 @@ def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDeci
         orders_count=len(orders),
         orders=orders,
     )
+
+
+def _strategy_order_comment(decision: TradeDecision) -> str:
+    setup_code = str(decision.metadata.get("setup_code") or "")
+    setup_version = int(decision.metadata.get("setup_version") or 0)
+    abbreviations = {
+        "breakout_long": "BOL",
+        "breakout_short": "BOS",
+        "breakout_retest_long": "BRL",
+        "breakout_retest_short": "BRS",
+        "trend_continuation_long": "TCL",
+        "trend_continuation_short": "TCS",
+        "pullback_h1_long": "PH1",
+        "pullback_h2_long": "PH2",
+        "pullback_l1_short": "PL1",
+        "pullback_l2_short": "PL2",
+    }
+    short_code = abbreviations.get(setup_code)
+    if setup_version <= 0 or not short_code:
+        return "GainLabAI"
+    decision_token = decision.decision_id.rsplit("_", 1)[-1][-8:]
+    return f"GL{setup_version}-{short_code}-{decision_token}"[:31]
 
 
 def _mt5_validate_deployment_account(
