@@ -292,3 +292,34 @@ def test_vision_result_rejects_a_source_that_can_be_bypassed() -> None:
     ])
     with pytest.raises(WorkflowError, match="vision_result_source_can_be_bypassed"):
         validate_workflow(value)
+
+
+def test_price_indicator_can_compare_with_price_or_compatible_price_line() -> None:
+    value = _workflow()
+    condition = value["open"]["nodes"][1]["condition"]
+    condition["left"] = {
+        "kind": "indicator", "indicator": "bbands", "component": "upper",
+        "params": {"length": 20, "std": 2},
+    }
+    condition["right"] = {"kind": "market_price", "name": "bid"}
+    validate_workflow(value)
+
+    condition["right"] = {
+        "kind": "indicator", "indicator": "ema", "component": "value", "params": {"length": 20},
+    }
+    validate_workflow(value)
+
+
+def test_numeric_indicator_rejects_market_price_comparison() -> None:
+    value = _workflow()
+    value["open"]["nodes"][1]["condition"] = {
+        "kind": "cross",
+        "left": {
+            "kind": "indicator", "indicator": "macd", "component": "histogram",
+            "params": {"fast": 12, "slow": 26, "signal": 9},
+        },
+        "right": {"kind": "market_price", "name": "bid"},
+        "direction": "above",
+    }
+    with pytest.raises(WorkflowError, match="indicator_right_operand_not_supported"):
+        validate_workflow(value)

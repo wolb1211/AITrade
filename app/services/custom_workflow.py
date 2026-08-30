@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from app.services.custom_indicators import public_indicator_catalog
+from app.services.custom_indicators import indicator_output_capability, public_indicator_catalog
 
 
 WORKFLOW_SCHEMA_VERSION = 1
@@ -406,6 +406,7 @@ def _validate_stage(stage: WorkflowStage, expected_stage: Literal["open", "posit
             _validate_stage_action(node, expected_stage)
         if isinstance(node, WorkflowConditionNode):
             _validate_condition_depth(node.condition)
+            _validate_indicator_capabilities(node.condition, node.id)
             _validate_vision_result_references(node, nodes, outgoing, stage.entry_node_id)
             if expected_stage == "open" and _condition_uses_position(node.condition):
                 raise WorkflowError("position_condition_not_allowed_in_open_stage", node_id=node.id)
@@ -515,6 +516,32 @@ def _validate_condition_depth(condition: WorkflowCondition, depth: int = 1) -> N
         raise WorkflowError("condition_group_too_deep")
     for child in condition.conditions:
         _validate_condition_depth(child, depth + 1)
+
+
+def _validate_indicator_capabilities(condition: WorkflowCondition, node_id: str) -> None:
+    left = condition.left
+    if left is not None and left.kind == "indicator":
+        capability = indicator_output_capability(left.indicator, left.component or "value")
+        if capability is None:
+            raise WorkflowError("indicator_output_not_supported", node_id=node_id, detail=f"{left.indicator}.{left.component or 'value'}")
+        if condition.kind in {"comparison", "cross", "consecutive", "indicator_trend"}:
+            if condition.kind not in capability.condition_kinds:
+                raise WorkflowError("indicator_condition_not_supported", node_id=node_id, detail=condition.kind)
+            right = condition.right
+            if right is not None:
+                if right.kind not in capability.right_operand_kinds:
+                    raise WorkflowError("indicator_right_operand_not_supported", node_id=node_id, detail=right.kind)
+                if right.kind == "indicator":
+                    right_capability = indicator_output_capability(right.indicator, right.component or "value")
+                    if right_capability is None or right_capability.comparison_group not in capability.compatible_groups:
+                        raise WorkflowError(
+                            "indicator_comparison_group_not_compatible", node_id=node_id,
+                            detail=f"{capability.comparison_group}:{right_capability.comparison_group if right_capability else 'unknown'}",
+                        )
+            if condition.kind in {"comparison", "consecutive"} and condition.operator not in capability.operators:
+                raise WorkflowError("indicator_operator_not_supported", node_id=node_id, detail=str(condition.operator or ""))
+    for child in condition.conditions:
+        _validate_indicator_capabilities(child, node_id)
 
 
 def _condition_uses_position(condition: WorkflowCondition) -> bool:
