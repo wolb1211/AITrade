@@ -60,6 +60,20 @@
 - `workflow_version` 表示用户策略的修改版本。
 - `source_text` 仅保留 AI 生成时的原始描述，不参与实际执行。
 
+## 指标能力目录
+
+指标选择、输出项和比较限制统一由服务端目录驱动，客户端不得自行维护另一套指标规则。每个指标输出必须定义：
+
+- `component`、`title`：逻辑输出名和用户可见名称。
+- `column_prefix`：对应 Pandas TA Classic 的实际输出列。
+- `value_type`、`comparison_group`：输出语义及可兼容的比较组。
+- `operators`、`condition_kinds`：允许的大于、小于、等于、交叉、连续和趋势判断。
+- `right_operand_kinds`、`compatible_groups`：右侧允许使用常量、价格、K线或哪些指标输出。
+- `minimum_points`：完成该类判断至少需要的有效数据点。
+- `default_constant`、`constant_options`：数字比较默认值或方向、布尔状态选项。
+
+例如，EMA 属于价格线，可以与价格、K线价格和其他价格线比较；MACD 柱状值只能与固定数字或兼容的 MACD 输出比较，不能与市场价格比较。目录由 `/custom-strategy/workflow/catalog` 和 `/custom-strategy/indicators` 返回。
+
 ## 编译结果
 
 编译器会：

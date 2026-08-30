@@ -169,6 +169,8 @@ def test_ai_condition_is_reported_as_unstructured() -> None:
 def test_catalog_exposes_v1_node_dictionary() -> None:
     catalog = workflow_catalog()
     assert catalog["schema_version"] == 1
+    assert len(catalog["indicators"]) == 49
+    assert all(item["outputs"] for item in catalog["indicators"])
     assert any(item["kind"] == "cross" for item in catalog["condition_nodes"])
     assert any(item["type"] == "vision_condition" for item in catalog["ai_nodes"])
     assert any(item["kind"] == "close_partial" for item in catalog["action_nodes"])

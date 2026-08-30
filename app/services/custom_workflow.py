@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from app.services.custom_indicators import public_indicator_catalog
+
 
 WORKFLOW_SCHEMA_VERSION = 1
 MAX_WORKFLOW_NODES = 120
@@ -285,6 +287,7 @@ def workflow_catalog() -> dict[str, Any]:
     return {
         "schema_version": WORKFLOW_SCHEMA_VERSION,
         "limits": {"max_nodes_per_stage": MAX_WORKFLOW_NODES, "max_condition_group_depth": MAX_CONDITION_GROUP_DEPTH},
+        "indicators": public_indicator_catalog(),
         "entry_nodes": [
             {"type": "open", "title": "开仓分析", "description": "没有持仓时判断是否开多、开空或不操作"},
             {"type": "position", "title": "持仓风控", "description": "持仓后判断平仓、加仓、修改止损止盈或继续持有"},
