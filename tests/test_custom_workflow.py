@@ -193,3 +193,20 @@ def test_consecutive_condition_requires_complete_comparison() -> None:
     result = workflow_validation_result(value)
     assert result["valid"] is False
     assert any("consecutive_condition_requires_comparison" in item["detail"] for item in result["errors"])
+
+
+def test_multi_output_indicator_component_is_preserved() -> None:
+    value = _workflow()
+    value["open"]["nodes"][1]["condition"] = {
+        "kind": "comparison",
+        "left": {
+            "kind": "indicator", "indicator": "macd", "component": "histogram",
+            "params": {"fast": 12, "slow": 26, "signal": 9},
+        },
+        "operator": "gt",
+        "right": {"kind": "constant", "value": 0},
+    }
+    compiled = compile_workflow(value)
+    indicator = compiled["open"]["indicators"][0]
+    assert indicator["component"] == "histogram"
+    assert indicator["alias"].endswith("_histogram")

@@ -49,6 +49,7 @@ class WorkflowOperand(WorkflowModel):
     name: str = Field(default="", max_length=80)
     value: float | str | bool | None = None
     indicator: str = Field(default="", max_length=40)
+    component: str = Field(default="", max_length=40)
     alias: str = Field(default="", max_length=64)
     source: str = Field(default="close", max_length=32)
     params: dict[str, int | float | str] = Field(default_factory=dict)
@@ -474,6 +475,7 @@ def _collect_condition_requirements(condition: WorkflowCondition, indicators: di
             indicators[alias] = {
                 "name": operand.indicator,
                 "alias": alias,
+                "component": operand.component,
                 "source": operand.source,
                 "params": operand.params,
             }
@@ -494,6 +496,8 @@ def _collect_condition_requirements(condition: WorkflowCondition, indicators: di
 def _indicator_alias(operand: WorkflowOperand) -> str:
     params = "_".join(str(value) for _, value in sorted(operand.params.items()))
     base = f"{operand.indicator}_{params}" if params else operand.indicator
+    if operand.component:
+        base = f"{base}_{operand.component}"
     return base.lower().replace(".", "_")[:64]
 
 
