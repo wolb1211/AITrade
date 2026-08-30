@@ -41,6 +41,7 @@ def test_register_password_and_code_login(tmp_path: Path) -> None:
     assert registered["user"]["id"] == 1
     assert registered["user"]["status"] == "active"
     assert registered["user"]["vip_level"] == 0
+    assert registered["user"]["max_strategy_keys"] == 1
 
     password_login = service.password_login(email=address, password="Password123")
     assert password_login["token"]
@@ -80,6 +81,24 @@ def test_register_password_and_code_login(tmp_path: Path) -> None:
         assert False, "all sessions should have been revoked"
     except Exception as exc:
         assert str(exc) == "invalid_session"
+
+
+def test_user_key_limit_default_does_not_overwrite_existing_limit(tmp_path: Path) -> None:
+    service, _ = create_service(tmp_path)
+    user = service.store.save_user({
+        "email": "existing-limit@example.com",
+        "status": "active",
+        "max_strategy_keys": 8,
+    })
+
+    updated = service.store.save_user({
+        "id": user["id"],
+        "email": user["email"],
+        "status": user["status"],
+        "nickname": "Existing user",
+    })
+
+    assert updated["max_strategy_keys"] == 8
 
 
 def test_user_remark_is_admin_only(tmp_path: Path) -> None:

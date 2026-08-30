@@ -273,7 +273,7 @@ class SqliteStore:
                     status TEXT NOT NULL DEFAULT 'pending_activation',
                     vip_level INTEGER NOT NULL DEFAULT 0,
                     vip_expires_at TEXT NOT NULL DEFAULT '',
-                    max_strategy_keys INTEGER NOT NULL DEFAULT 10,
+                    max_strategy_keys INTEGER NOT NULL DEFAULT 1,
                     agent_level INTEGER NOT NULL DEFAULT 0,
                     invite_code TEXT UNIQUE,
                     referrer_user_id INTEGER,
@@ -773,7 +773,7 @@ class SqliteStore:
                 status TEXT NOT NULL DEFAULT 'pending_activation',
                 vip_level INTEGER NOT NULL DEFAULT 0,
                 vip_expires_at TEXT NOT NULL DEFAULT '',
-                max_strategy_keys INTEGER NOT NULL DEFAULT 10,
+                max_strategy_keys INTEGER NOT NULL DEFAULT 1,
                 agent_level INTEGER NOT NULL DEFAULT 0,
                 invite_code TEXT UNIQUE,
                 referrer_user_id INTEGER,
@@ -5147,7 +5147,7 @@ class SqliteStore:
             raise RuntimeError("invalid_user_status")
         vip_level = max(0, int(payload.get("vip_level") or 0))
         vip_expires_at = str(payload.get("vip_expires_at") or "").strip()
-        max_strategy_keys = max(0, int(payload.get("max_strategy_keys", 10) or 0))
+        max_strategy_keys = max(0, int(payload.get("max_strategy_keys", 1) or 0))
         requested_agent_level = payload.get("agent_level")
         agent_level = max(0, int(requested_agent_level or 0))
 
@@ -5156,11 +5156,13 @@ class SqliteStore:
                 existing = None
                 if user_id is not None:
                     existing = connection.execute(
-                        "SELECT id, email_verified_at, agent_level, invite_code, remark FROM users WHERE id = ?",
+                        "SELECT id, email_verified_at, max_strategy_keys, agent_level, invite_code, remark FROM users WHERE id = ?",
                         (user_id,),
                     ).fetchone()
                 if existing and "agent_level" not in payload:
                     agent_level = int(existing["agent_level"] or 0)
+                if existing and "max_strategy_keys" not in payload:
+                    max_strategy_keys = int(existing["max_strategy_keys"] or 0)
                 if "remark" in payload:
                     remark = str(payload.get("remark") or "")
                 else:
@@ -5391,7 +5393,7 @@ class SqliteStore:
                         email, password_hash, nickname, status, vip_level,
                         vip_expires_at, max_strategy_keys, referrer_user_id, referred_at, email_verified_at,
                         last_login_at, remark, created_at, updated_at
-                    ) VALUES (?, ?, '', 'pending_activation', 0, '', 10, ?, ?, '', '', '', ?, ?)
+                    ) VALUES (?, ?, '', 'pending_activation', 0, '', 1, ?, ?, '', '', '', ?, ?)
                     """,
                     (normalized, password_hash, referrer_id, now if referrer_id else "", now, now),
                 )
@@ -6704,7 +6706,7 @@ class MySQLStore(SqliteStore):
                     status VARCHAR(32) NOT NULL DEFAULT 'pending_activation',
                     vip_level INT NOT NULL DEFAULT 0,
                     vip_expires_at VARCHAR(40) NOT NULL DEFAULT '',
-                    max_strategy_keys INT NOT NULL DEFAULT 10,
+                    max_strategy_keys INT NOT NULL DEFAULT 1,
                     agent_level INT NOT NULL DEFAULT 0,
                     invite_code VARCHAR(32) NULL,
                     referrer_user_id BIGINT NULL,
@@ -6752,6 +6754,10 @@ class MySQLStore(SqliteStore):
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+            # Change only the column default; existing users keep their current limits.
+            connection.execute(
+                "ALTER TABLE users MODIFY COLUMN max_strategy_keys INT NOT NULL DEFAULT 1"
+            )
             index_rows = connection.execute("SHOW INDEX FROM users").fetchall()
             indexes = {str(row["Key_name"]) for row in index_rows}
             if "uk_users_invite_code" not in indexes:
