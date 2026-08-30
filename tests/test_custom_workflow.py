@@ -120,6 +120,33 @@ def test_validate_and_compile_visual_workflow() -> None:
     assert compiled["position"]["data_requirements"]["data_type"] == "both"
 
 
+def test_open_action_keeps_market_and_risk_rules() -> None:
+    value = _workflow()
+    open_action = next(node for node in value["open"]["nodes"] if node["id"] == "open_yes")
+    open_action["action"].update({
+        "entry_mode": "pending",
+        "entry_price_rule": "在最近一次回调低点上方 0.2 ATR 挂多单",
+        "stop_loss_rule": "最近 5 根已收盘 K 线最低价",
+        "take_profit_rule": "止损距离的 2 倍",
+    })
+
+    compiled = compile_workflow(validate_workflow(value))
+    action = compiled["open"]["nodes"]["open_yes"]["action"]
+    assert action["entry_mode"] == "pending"
+    assert action["entry_price_rule"] == "在最近一次回调低点上方 0.2 ATR 挂多单"
+    assert action["stop_loss_rule"] == "最近 5 根已收盘 K 线最低价"
+    assert action["take_profit_rule"] == "止损距离的 2 倍"
+
+
+def test_pending_open_action_requires_price_rule() -> None:
+    value = _workflow()
+    open_action = next(node for node in value["open"]["nodes"] if node["id"] == "open_yes")
+    open_action["action"]["entry_mode"] = "pending"
+
+    with pytest.raises(Exception, match="pending_order_requires_entry_price_rule"):
+        validate_workflow(value)
+
+
 def test_condition_requires_both_yes_and_no_branches() -> None:
     value = _workflow()
     value["open"]["edges"].pop()

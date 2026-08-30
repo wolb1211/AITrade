@@ -165,6 +165,10 @@ class WorkflowAction(WorkflowModel):
     target: WorkflowPriceTarget | None = None
     stop_loss: WorkflowPriceTarget | None = None
     take_profit: WorkflowPriceTarget | None = None
+    entry_mode: Literal["market", "pending"] = "market"
+    entry_price_rule: str = Field(default="", max_length=1000)
+    stop_loss_rule: str = Field(default="", max_length=1000)
+    take_profit_rule: str = Field(default="", max_length=1000)
     description: str = Field(default="", max_length=500)
 
     @model_validator(mode="after")
@@ -175,6 +179,8 @@ class WorkflowAction(WorkflowModel):
             raise ValueError("add_action_requires_volume")
         if self.kind in {"modify_sl", "modify_tp"} and self.target is None:
             raise ValueError("modify_action_requires_target")
+        if self.kind in {"open_buy", "open_sell"} and self.entry_mode == "pending" and not self.entry_price_rule.strip():
+            raise ValueError("pending_order_requires_entry_price_rule")
         return self
 
 
