@@ -46,7 +46,7 @@ class WorkflowUiPosition(WorkflowModel):
 
 class WorkflowOperand(WorkflowModel):
     kind: Literal[
-        "indicator", "market_price", "candle", "position", "constant", "derived",
+        "indicator", "market_price", "candle", "position", "constant", "derived", "vision_result",
     ]
     name: str = Field(default="", max_length=80)
     value: float | str | bool | None = None
@@ -59,6 +59,8 @@ class WorkflowOperand(WorkflowModel):
     addend: float = Field(default=0, ge=-1000000000, le=1000000000)
     offset: int = Field(default=-1, ge=-1000, le=0)
     lookback: int = Field(default=1, ge=1, le=1000)
+    source_node_id: str = Field(default="", max_length=64)
+    output_key: str = Field(default="", max_length=64)
 
     @model_validator(mode="after")
     def validate_operand(self) -> "WorkflowOperand":
@@ -66,6 +68,8 @@ class WorkflowOperand(WorkflowModel):
             raise ValueError("indicator_operand_requires_indicator")
         if self.kind == "constant" and self.value is None:
             raise ValueError("constant_operand_requires_value")
+        if self.kind == "vision_result" and (not self.source_node_id or not self.output_key):
+            raise ValueError("vision_result_operand_requires_source")
         if self.kind in {"market_price", "candle", "position", "derived"} and not self.name:
             raise ValueError(f"{self.kind}_operand_requires_name")
         return self
@@ -81,6 +85,7 @@ ConditionKind = Literal[
     "breakout",
     "atr_distance",
     "position_state",
+    "vision_result",
     "group",
 ]
 
@@ -102,6 +107,13 @@ class WorkflowCondition(WorkflowModel):
     def validate_condition(self) -> "WorkflowCondition":
         if self.kind == "comparison" and (self.left is None or self.operator is None or self.right is None):
             raise ValueError("comparison_condition_incomplete")
+        if self.kind == "vision_result":
+            if (
+                self.left is None or self.left.kind != "vision_result" or
+                self.operator not in {"eq", "neq"} or
+                self.right is None or self.right.kind != "constant"
+            ):
+                raise ValueError("vision_result_condition_incomplete")
         if self.kind == "cross":
             if self.left is None or self.right is None or self.direction not in {"above", "below"}:
                 raise ValueError("cross_condition_incomplete")
@@ -118,6 +130,9 @@ class WorkflowCondition(WorkflowModel):
                 raise ValueError("condition_group_requires_two_conditions")
         elif self.conditions:
             raise ValueError("nested_conditions_only_allowed_for_group")
+        if any(item is not None and item.kind == "vision_result" for item in (self.left, self.right)):
+            if self.kind not in {"comparison", "consecutive", "vision_result"} or self.operator not in {"eq", "neq"}:
+                raise ValueError("vision_result_only_supports_equality")
         return self
 
 
@@ -179,13 +194,35 @@ class WorkflowConditionNode(WorkflowModel):
     position: WorkflowUiPosition | None = None
 
 
-class WorkflowVisionConditionNode(WorkflowModel):
+class WorkflowVisionOutputOption(WorkflowModel):
+    value: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=60)
+
+
+class WorkflowVisionOutput(WorkflowModel):
+    key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+    label: str = Field(min_length=1, max_length=100)
+    type: Literal["enum"] = "enum"
+    options: list[WorkflowVisionOutputOption] = Field(min_length=2, max_length=12)
+    fallback: str = Field(default="uncertain", max_length=64)
+
+    @model_validator(mode="after")
+    def validate_output(self) -> "WorkflowVisionOutput":
+        values = [item.value for item in self.options]
+        labels = [item.label for item in self.options]
+        if len(values) != len(set(values)) or len(labels) != len(set(labels)):
+            raise ValueError("vision_output_options_must_be_unique")
+        if self.fallback not in values:
+            raise ValueError("vision_output_fallback_not_found")
+        return self
+
+
+class WorkflowVisionExtractNode(WorkflowModel):
     id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
-    type: Literal["vision_condition"] = "vision_condition"
+    type: Literal["vision_extract"] = "vision_extract"
     label: str = Field(default="", max_length=100)
     instruction: str = Field(min_length=5, max_length=4000)
-    expected_result: str = Field(min_length=1, max_length=100)
-    result_options: list[str] = Field(default_factory=lambda: ["matched", "not_matched"], min_length=2, max_length=12)
+    output: WorkflowVisionOutput
     lookback: int = Field(default=3, ge=1, le=100)
     minimum_confidence: float = Field(default=0, ge=0, le=1)
     position: WorkflowUiPosition | None = None
@@ -209,7 +246,7 @@ class WorkflowActionNode(WorkflowModel):
 
 
 WorkflowNode = (
-    WorkflowEntryNode | WorkflowConditionNode | WorkflowVisionConditionNode |
+    WorkflowEntryNode | WorkflowConditionNode | WorkflowVisionExtractNode |
     WorkflowAiConditionNode | WorkflowActionNode
 )
 
@@ -302,10 +339,11 @@ def workflow_catalog() -> dict[str, Any]:
             {"kind": "breakout", "title": "突破 / 回踩", "description": "判断价格或指标是否突破、回踩指定参考值"},
             {"kind": "atr_distance", "title": "ATR距离", "description": "判断价格、开仓价或止损价之间的ATR倍数距离"},
             {"kind": "position_state", "title": "持仓状态", "description": "判断方向、盈亏、持仓数量、开仓价和止损止盈"},
+            {"kind": "vision_result", "title": "截图识别结果", "description": "比较前置截图信息提取节点返回的固定枚举结果"},
             {"kind": "group", "title": "条件组合", "description": "使用全部满足（AND）或任一满足（OR）组合条件"},
         ],
         "ai_nodes": [
-            {"type": "vision_condition", "title": "截图识别规则", "description": "识别自定义指标、图形、文字或其他视觉信号"},
+            {"type": "vision_extract", "title": "截图信息提取", "description": "从图表截图提取一个用户定义的固定枚举结果"},
             {"type": "ai_condition", "title": "AI判断规则", "description": "处理第一版暂时无法精确结构化的开放条件"},
         ],
         "action_nodes": [
@@ -349,9 +387,9 @@ def _validate_stage(stage: WorkflowStage, expected_stage: Literal["open", "posit
             raise WorkflowError("workflow_edge_node_not_found", detail=edge.id)
         if edge.source_handle in outgoing[edge.source]:
             raise WorkflowError("duplicate_workflow_branch", node_id=edge.source, detail=edge.source_handle)
-        if isinstance(source, WorkflowEntryNode) and edge.source_handle != "next":
-            raise WorkflowError("entry_requires_next_branch", node_id=source.id)
-        if isinstance(source, (WorkflowConditionNode, WorkflowVisionConditionNode, WorkflowAiConditionNode)) and edge.source_handle not in {"yes", "no"}:
+        if isinstance(source, (WorkflowEntryNode, WorkflowVisionExtractNode)) and edge.source_handle != "next":
+            raise WorkflowError("sequential_node_requires_next_branch", node_id=source.id)
+        if isinstance(source, (WorkflowConditionNode, WorkflowAiConditionNode)) and edge.source_handle not in {"yes", "no"}:
             raise WorkflowError("condition_requires_yes_no_branch", node_id=source.id)
         if isinstance(source, WorkflowActionNode):
             raise WorkflowError("action_node_cannot_have_outgoing_edge", node_id=source.id)
@@ -360,14 +398,15 @@ def _validate_stage(stage: WorkflowStage, expected_stage: Literal["open", "posit
 
     for node in stage.nodes:
         handles = set(outgoing[node.id])
-        if isinstance(node, WorkflowEntryNode) and handles != {"next"}:
-            raise WorkflowError("entry_branch_incomplete", node_id=node.id)
-        if isinstance(node, (WorkflowConditionNode, WorkflowVisionConditionNode, WorkflowAiConditionNode)) and handles != {"yes", "no"}:
+        if isinstance(node, (WorkflowEntryNode, WorkflowVisionExtractNode)) and handles != {"next"}:
+            raise WorkflowError("sequential_node_branch_incomplete", node_id=node.id)
+        if isinstance(node, (WorkflowConditionNode, WorkflowAiConditionNode)) and handles != {"yes", "no"}:
             raise WorkflowError("condition_branches_incomplete", node_id=node.id)
         if isinstance(node, WorkflowActionNode):
             _validate_stage_action(node, expected_stage)
         if isinstance(node, WorkflowConditionNode):
             _validate_condition_depth(node.condition)
+            _validate_vision_result_references(node, nodes, outgoing, stage.entry_node_id)
             if expected_stage == "open" and _condition_uses_position(node.condition):
                 raise WorkflowError("position_condition_not_allowed_in_open_stage", node_id=node.id)
     if incoming[stage.entry_node_id] != 0:
@@ -410,6 +449,67 @@ def _validate_stage_action(node: WorkflowActionNode, stage: Literal["open", "pos
         raise WorkflowError("workflow_action_not_allowed_in_stage", node_id=node.id, detail=node.action.kind)
 
 
+def _validate_vision_result_references(
+    node: WorkflowConditionNode,
+    nodes: dict[str, WorkflowNode],
+    outgoing: dict[str, dict[str, str]],
+    entry_node_id: str,
+) -> None:
+    def can_reach(source_id: str, target_id: str) -> bool:
+        queue = deque([source_id])
+        visited: set[str] = set()
+        while queue:
+            current = queue.popleft()
+            if current == target_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            queue.extend(outgoing.get(current, {}).values())
+        return False
+
+    def can_reach_without(source_id: str, target_id: str, blocked_id: str) -> bool:
+        if source_id == blocked_id:
+            return False
+        queue = deque([source_id])
+        visited: set[str] = set()
+        while queue:
+            current = queue.popleft()
+            if current == blocked_id or current in visited:
+                continue
+            if current == target_id:
+                return True
+            visited.add(current)
+            queue.extend(outgoing.get(current, {}).values())
+        return False
+
+    def validate_condition(condition: WorkflowCondition) -> None:
+        for operand in (condition.left, condition.right):
+            if operand is None or operand.kind != "vision_result":
+                continue
+            source = nodes.get(operand.source_node_id)
+            if not isinstance(source, WorkflowVisionExtractNode):
+                raise WorkflowError("vision_result_source_not_found", node_id=node.id, detail=operand.source_node_id)
+            if source.output.key != operand.output_key:
+                raise WorkflowError("vision_result_output_not_found", node_id=node.id, detail=operand.output_key)
+            if source.id == node.id or not can_reach(source.id, node.id):
+                raise WorkflowError("vision_result_source_must_be_upstream", node_id=node.id, detail=source.id)
+            if can_reach_without(entry_node_id, node.id, source.id):
+                raise WorkflowError("vision_result_source_can_be_bypassed", node_id=node.id, detail=source.id)
+        if condition.kind == "vision_result" and condition.left is not None and condition.right is not None:
+            source = nodes.get(condition.left.source_node_id)
+            if isinstance(source, WorkflowVisionExtractNode):
+                allowed = {item.value for item in source.output.options}
+                if str(condition.right.value) not in allowed:
+                    raise WorkflowError(
+                        "vision_result_value_not_allowed", node_id=node.id, detail=str(condition.right.value),
+                    )
+        for child in condition.conditions:
+            validate_condition(child)
+
+    validate_condition(node.condition)
+
+
 def _validate_condition_depth(condition: WorkflowCondition, depth: int = 1) -> None:
     if depth > MAX_CONDITION_GROUP_DEPTH:
         raise WorkflowError("condition_group_too_deep")
@@ -439,7 +539,7 @@ def _compile_stage(stage: WorkflowStage, stage_name: Literal["open", "position"]
     for node in stage.nodes:
         if isinstance(node, WorkflowConditionNode):
             required_kline_count = max(required_kline_count, _collect_condition_requirements(node.condition, indicators))
-        elif isinstance(node, WorkflowVisionConditionNode):
+        elif isinstance(node, WorkflowVisionExtractNode):
             requires_screenshot = True
             uses_ai = True
             required_kline_count = max(required_kline_count, node.lookback)

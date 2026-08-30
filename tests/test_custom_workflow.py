@@ -25,14 +25,38 @@ def _stage(stage: str, *, vision: bool = False) -> dict:
     yes_id = f"{stage}_yes"
     no_id = f"{stage}_no"
     if vision:
+        extract_id = f"{stage}_vision"
+        extract = {
+            "id": extract_id,
+            "type": "vision_extract",
+            "label": "提取SuperTrend信号",
+            "instruction": "检查最近三根已收盘K线的SuperTrend颜色变化并输出固定信号",
+            "output": {
+                "key": "supertrend_signal",
+                "label": "SuperTrend信号",
+                "options": [
+                    {"value": "long", "label": "多头信号"},
+                    {"value": "short", "label": "空头信号"},
+                    {"value": "none", "label": "无信号"},
+                    {"value": "uncertain", "label": "无法确认"},
+                ],
+                "fallback": "uncertain",
+            },
+            "lookback": 3,
+        }
         condition = {
             "id": condition_id,
-            "type": "vision_condition",
-            "label": "识别SuperTrend变色",
-            "instruction": "检查最近三根已收盘K线的SuperTrend是否由紫色变为蓝色",
-            "expected_result": "bullish",
-            "result_options": ["bullish", "bearish", "none"],
-            "lookback": 3,
+            "type": "condition",
+            "label": "SuperTrend信号等于多头",
+            "condition": {
+                "kind": "vision_result",
+                "left": {
+                    "kind": "vision_result", "source_node_id": extract_id,
+                    "output_key": "supertrend_signal",
+                },
+                "operator": "eq",
+                "right": {"kind": "constant", "value": "long"},
+            },
         }
     else:
         condition = {
@@ -54,15 +78,21 @@ def _stage(stage: str, *, vision: bool = False) -> dict:
     else:
         yes_action = _action(yes_id, "close_all")
         no_action = _action(no_id, "hold")
+    nodes = [_entry(entry_id, stage), condition, yes_action, no_action]
+    edges = [
+        {"id": f"{stage}_e1", "source": entry_id, "target": condition_id, "source_handle": "next"},
+        {"id": f"{stage}_e2", "source": condition_id, "target": yes_id, "source_handle": "yes"},
+        {"id": f"{stage}_e3", "source": condition_id, "target": no_id, "source_handle": "no"},
+    ]
+    if vision:
+        nodes.insert(1, extract)
+        edges[0]["target"] = extract_id
+        edges.insert(1, {"id": f"{stage}_vision_next", "source": extract_id, "target": condition_id, "source_handle": "next"})
     return {
         "entry_node_id": entry_id,
         "data_requirements": {"data_type": "both" if vision else "kline", "kline_count": 20},
-        "nodes": [_entry(entry_id, stage), condition, yes_action, no_action],
-        "edges": [
-            {"id": f"{stage}_e1", "source": entry_id, "target": condition_id, "source_handle": "next"},
-            {"id": f"{stage}_e2", "source": condition_id, "target": yes_id, "source_handle": "yes"},
-            {"id": f"{stage}_e3", "source": condition_id, "target": no_id, "source_handle": "no"},
-        ],
+        "nodes": nodes,
+        "edges": edges,
     }
 
 
@@ -151,6 +181,7 @@ def test_open_stage_rejects_position_operand() -> None:
 
 def test_ai_condition_is_reported_as_unstructured() -> None:
     value = _workflow()
+    value["position"] = _stage("position")
     value["position"]["nodes"][1] = {
         "id": "position_condition",
         "type": "ai_condition",
@@ -172,7 +203,7 @@ def test_catalog_exposes_v1_node_dictionary() -> None:
     assert len(catalog["indicators"]) == 49
     assert all(item["outputs"] for item in catalog["indicators"])
     assert any(item["kind"] == "cross" for item in catalog["condition_nodes"])
-    assert any(item["type"] == "vision_condition" for item in catalog["ai_nodes"])
+    assert any(item["type"] == "vision_extract" for item in catalog["ai_nodes"])
     assert any(item["kind"] == "close_partial" for item in catalog["action_nodes"])
 
 
@@ -212,3 +243,52 @@ def test_multi_output_indicator_component_is_preserved() -> None:
     indicator = compiled["open"]["indicators"][0]
     assert indicator["component"] == "histogram"
     assert indicator["alias"].endswith("_histogram")
+
+
+def test_vision_extract_has_one_next_branch_and_fixed_enum_output() -> None:
+    value = _workflow()
+    compiled = compile_workflow(value)
+    vision = compiled["position"]["nodes"]["position_vision"]
+    assert compiled["position"]["transitions"]["position_vision"] == {"next": "position_condition"}
+    assert [item["value"] for item in vision["output"]["options"]] == ["long", "short", "none", "uncertain"]
+
+
+def test_vision_result_must_use_an_allowed_upstream_enum_value() -> None:
+    value = _workflow()
+    value["position"]["nodes"][2]["condition"]["right"]["value"] = "outside_enum"
+    with pytest.raises(WorkflowError, match="vision_result_value_not_allowed"):
+        validate_workflow(value)
+
+
+def test_vision_output_requires_unique_options_and_existing_fallback() -> None:
+    value = _workflow()
+    output = value["position"]["nodes"][1]["output"]
+    output["options"][1]["value"] = "long"
+    result = workflow_validation_result(value)
+    assert result["valid"] is False
+    assert any("vision_output_options_must_be_unique" in item["detail"] for item in result["errors"])
+
+    value = _workflow()
+    value["position"]["nodes"][1]["output"]["fallback"] = "missing"
+    result = workflow_validation_result(value)
+    assert result["valid"] is False
+    assert any("vision_output_fallback_not_found" in item["detail"] for item in result["errors"])
+
+
+def test_vision_result_rejects_a_source_that_can_be_bypassed() -> None:
+    value = _workflow()
+    stage = value["position"]
+    stage["nodes"].append({
+        "id": "position_gate", "type": "condition", "label": "前置条件",
+        "condition": {
+            "kind": "comparison", "left": {"kind": "market_price", "name": "bid"},
+            "operator": "gt", "right": {"kind": "constant", "value": 0},
+        },
+    })
+    stage["edges"][0]["target"] = "position_gate"
+    stage["edges"].extend([
+        {"id": "position_gate_yes", "source": "position_gate", "target": "position_vision", "source_handle": "yes"},
+        {"id": "position_gate_no", "source": "position_gate", "target": "position_condition", "source_handle": "no"},
+    ])
+    with pytest.raises(WorkflowError, match="vision_result_source_can_be_bypassed"):
+        validate_workflow(value)
