@@ -52,6 +52,8 @@ class WorkflowOperand(WorkflowModel):
     alias: str = Field(default="", max_length=64)
     source: str = Field(default="close", max_length=32)
     params: dict[str, int | float | str] = Field(default_factory=dict)
+    multiplier: float = Field(default=1, ge=-1000000, le=1000000)
+    addend: float = Field(default=0, ge=-1000000000, le=1000000000)
     offset: int = Field(default=-1, ge=-1000, le=0)
     lookback: int = Field(default=1, ge=1, le=1000)
 
@@ -102,6 +104,8 @@ class WorkflowCondition(WorkflowModel):
                 raise ValueError("cross_condition_incomplete")
         if self.kind in {"consecutive", "indicator_trend"} and self.left is None:
             raise ValueError(f"{self.kind}_condition_requires_left")
+        if self.kind == "consecutive" and (self.operator is None or self.right is None):
+            raise ValueError("consecutive_condition_requires_comparison")
         if self.kind in {"candle_pattern", "market_structure"} and not self.pattern:
             raise ValueError(f"{self.kind}_condition_requires_pattern")
         if self.kind in {"breakout", "atr_distance", "position_state"} and self.left is None:

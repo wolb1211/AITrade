@@ -181,3 +181,15 @@ def test_validation_result_is_editor_friendly() -> None:
     assert result["valid"] is False
     assert result["compiled"] is None
     assert result["errors"][0]["code"] == "condition_branches_incomplete"
+
+
+def test_consecutive_condition_requires_complete_comparison() -> None:
+    value = _workflow()
+    value["open"]["nodes"][1]["condition"] = {
+        "kind": "consecutive",
+        "left": {"kind": "candle", "name": "close"},
+        "count": 3,
+    }
+    result = workflow_validation_result(value)
+    assert result["valid"] is False
+    assert any("consecutive_condition_requires_comparison" in item["detail"] for item in result["errors"])
