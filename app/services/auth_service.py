@@ -253,6 +253,68 @@ class UserAuthService:
                     )
         return self.create_strategy(token, payload=prepared, preview_only=True)
 
+    def generate_custom_workflow_stage(self, token: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+        session_user = self.me(token)
+        user = self.store.get_user(int(session_user["id"]))
+        if user is None:
+            raise AuthError("user_not_found", 404)
+        if not bool(user.get("vip_active")):
+            raise AuthError("vip_required", 403)
+        if self.ai_client is None:
+            raise AuthError("custom_strategy_compile_unavailable", 503)
+        stage = str(payload.get("stage") or "").strip().lower()
+        if stage not in {"open", "position"}:
+            raise AuthError("invalid_workflow_stage")
+        user_logic = str(payload.get("user_logic") or "").strip()
+        if len(user_logic) < 5 or len(user_logic) > 12000:
+            raise AuthError("custom_strategy_logic_required")
+        raw_requirements = payload.get("data_requirements")
+        requirements = dict(raw_requirements) if isinstance(raw_requirements, dict) else {}
+        data_type = str(requirements.get("data_type") or "kline").strip().lower()
+        try:
+            kline_count = int(requirements.get("kline_count") or 100)
+            call_value = float(requirements.get("call_value") or 1)
+        except (TypeError, ValueError) as exc:
+            raise AuthError("invalid_strategy_data_settings") from exc
+        call_mode = str(requirements.get("call_mode") or "bar").strip().lower()
+        if data_type not in {"kline", "screenshot", "both"} or not 1 <= kline_count <= 1000:
+            raise AuthError("invalid_strategy_data_settings")
+        if call_mode not in {"bar", "timer", "tick", "price_step"} or call_value < 0:
+            raise AuthError("invalid_strategy_data_settings")
+
+        workflow_endpoint = self.store.get_gl_ai_endpoint_by_model("qwen-plus")
+        if workflow_endpoint is None:
+            raise AuthError("workflow_generation_model_unavailable", 503)
+        config: dict[str, Any] = {
+            f"{stage}_ai_mode": "official",
+            f"{stage}_ai_endpoint_id": str(workflow_endpoint.get("id") or ""),
+            f"{stage}_ai_model": str(workflow_endpoint.get("model") or "qwen-plus"),
+        }
+        temporary = {
+            "id": "",
+            # Workflow generation is a platform-provided authoring feature.
+            # Keep it out of the customer's balance ledger and usage details.
+            "user_id": "",
+            "strategy_code": "WORKFLOW_BUILDER",
+            "strategy_name": "自定义AI策略流程生成",
+            "config": config,
+        }
+        try:
+            generated = self.ai_client.generate_custom_workflow_stage(
+                temporary,
+                stage=stage,
+                user_logic=user_logic,
+                data_requirements={
+                    "data_type": data_type,
+                    "kline_count": kline_count,
+                    "call_mode": call_mode,
+                    "call_value": call_value,
+                },
+            )
+            return {**generated, "generation_model": "qwen-plus", "customer_billed": False}
+        except RuntimeError as exc:
+            raise AuthError(str(exc) or "workflow_generation_failed", 502) from exc
+
     def create_strategy(
         self,
         token: str,
@@ -366,9 +428,34 @@ class UserAuthService:
             "allow_add": bool(payload.get("allow_add", default_config.get("allow_add_position", False))),
             "ai_user_configured": True,
         })
+        visual_compilation: dict[str, Any] | None = None
+        if is_custom_strategy and payload.get("workflow") is not None:
+            if self.ai_client is None:
+                raise AuthError("custom_strategy_compile_unavailable", 503)
+            try:
+                visual_compilation = self.ai_client.compile_custom_workflow(
+                    payload.get("workflow"),
+                    open_logic=open_logic,
+                    position_logic=position_logic,
+                )
+            except (RuntimeError, ValueError) as exc:
+                raise AuthError("invalid_custom_strategy_workflow") from exc
         if preview_only:
             if not is_custom_strategy or self.ai_client is None:
                 raise AuthError("custom_strategy_compile_unavailable", 503)
+            if visual_compilation is not None:
+                self._apply_custom_compilation(config, visual_compilation, custom_data)
+                fields = (
+                    "summary", "open_prompt_template", "position_prompt_template",
+                    "open_indicators", "position_indicators", "open_rule_plan", "position_rule_plan",
+                    "rule_engine_version", "open_kline_count",
+                    "position_kline_count", "open_requested_kline_count",
+                    "position_requested_kline_count", "open_indicator_kline_count",
+                    "position_indicator_kline_count", "open_data_type", "position_data_type",
+                    "unsupported_indicators", "unsupported_conditions", "unsupported_condition_count",
+                    "visual_conditions", "warnings", "prompt_version", "compile_status",
+                )
+                return {key: config[key] for key in fields}
             temporary = {
                 "id": "",
                 "user_id": str(user["id"]),
@@ -405,6 +492,9 @@ class UserAuthService:
             except RuntimeError as exc:
                 raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
             self._apply_custom_compilation(config, compiled, custom_data)
+            if visual_compilation is not None:
+                config["workflow"] = visual_compilation["workflow"]
+                config["compiled_workflow"] = visual_compilation["compiled_workflow"]
         raw_key = "gl_" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")
         config["deployment_key"] = raw_key
         deployment = self.store.upsert_web_deployment(

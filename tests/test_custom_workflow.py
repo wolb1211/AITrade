@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
+from app.services.ai_service import (
+    AiDecisionClient,
+    _classify_workflow_source_rule,
+    _normalize_generated_workflow_stage,
+    _workflow_source_rules,
+    _workflow_stage_from_classified_rules,
+)
 from app.services.custom_workflow import (
     WorkflowError,
     compile_workflow,
     validate_workflow,
+    validate_workflow_stage,
     workflow_catalog,
     workflow_validation_result,
 )
+from app.store import SqliteStore
 
 
 def _entry(node_id: str, stage: str) -> dict:
@@ -118,6 +129,133 @@ def test_validate_and_compile_visual_workflow() -> None:
     assert compiled["open"]["uses_ai"] is False
     assert compiled["position"]["uses_ai"] is True
     assert compiled["position"]["data_requirements"]["data_type"] == "both"
+
+
+def test_validate_single_generated_stage() -> None:
+    stage = validate_workflow_stage(_stage("open"), "open")
+    assert stage.entry_node_id == "open_entry"
+    with pytest.raises(WorkflowError, match="invalid_workflow_entry"):
+        validate_workflow_stage(_stage("open"), "position")
+
+
+def test_generated_cross_operator_and_natural_language_stop_rule_are_supported() -> None:
+    value = _stage("position")
+    condition = next(node for node in value["nodes"] if node["type"] == "condition")["condition"]
+    condition.pop("direction", None)
+    condition["operator"] = "lt"
+    action = next(node for node in value["nodes"] if node["id"] == "position_yes")
+    action["action"] = {"kind": "modify_sl", "stop_loss_rule": "current_price + 0.5 * atr14"}
+
+    normalized = _normalize_generated_workflow_stage(
+        value,
+        stage="position",
+        data_requirements=value["data_requirements"],
+    )
+    validated = validate_workflow_stage(normalized, "position")
+    validated_condition = next(node for node in validated.nodes if node.type == "condition")
+    validated_action = next(node for node in validated.nodes if node.id == "position_yes")
+    assert validated_condition.condition.direction == "below"
+    assert validated_action.action.stop_loss_rule == "current_price + 0.5 * atr14"
+
+
+def test_complex_position_rules_can_fall_back_to_exact_source_decision_chain() -> None:
+    source = (
+        "多单出现EMA5下穿EMA10时，平仓。\n"
+        "空单出现EMA5上穿EMA10时，平仓。\n"
+        "当多单盈利达到0.5 ATR时，将止损移动到开仓价+0.2。"
+    )
+    rules = _workflow_source_rules(source)
+    stage = _workflow_stage_from_classified_rules(
+        {
+            "rules": [
+                {"rule_index": 1, "label": "多单反向交叉平仓", "action_kind": "close_all"},
+                {"rule_index": 2, "label": "空单反向交叉平仓", "action_kind": "close_all"},
+                {"rule_index": 3, "label": "多单移动止损", "action_kind": "modify_sl"},
+            ],
+        },
+        stage="position",
+        data_requirements={"data_type": "kline", "kline_count": 100, "call_mode": "bar", "call_value": 1},
+        source_rules=rules,
+    )
+    validated = validate_workflow_stage(stage, "position")
+    decisions = [node for node in validated.nodes if node.type == "ai_condition"]
+    actions = [node for node in validated.nodes if node.type == "action"]
+    assert [node.instruction for node in decisions] == rules
+    assert [node.action.kind for node in actions] == ["close_all", "close_all", "modify_sl", "hold"]
+    assert actions[2].action.stop_loss_rule == rules[2]
+
+
+def test_position_action_classification_uses_explicit_action_not_position_direction() -> None:
+    assert _classify_workflow_source_rule("多单出现EMA5下穿EMA10时，平仓", stage="position") == "close_all"
+    assert _classify_workflow_source_rule("空单盈利后将止损移动到开仓价-0.2", stage="position") == "modify_sl"
+    assert _classify_workflow_source_rule("多单盈利后加仓", stage="position") == "add_buy"
+    assert _classify_workflow_source_rule("空单盈利后加仓", stage="position") == "add_sell"
+
+
+def test_confirmed_workflow_compiles_without_runtime_model_call(tmp_path) -> None:
+    store = SqliteStore(tmp_path / "workflow-compile.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    result = client.compile_custom_workflow(
+        _workflow(),
+        open_logic="EMA5上穿EMA30开多",
+        position_logic="EMA5下穿EMA30时平仓",
+    )
+    assert result["compile_status"] == "generated"
+    assert result["compiled_workflow"]["open"]["entry_node_id"] == "open_entry"
+    assert result["workflow"]["schema_version"] == 1
+    assert "entry_node_id" in result["open_prompt_template"]
+
+
+def test_generated_flat_cross_rules_are_normalized_into_a_complete_chain() -> None:
+    value = _stage("open")
+    first = next(node for node in value["nodes"] if node["id"] == "open_condition")
+    first["condition"]["direction"] = "bullish"
+    first["condition"]["lookback"] = 1
+    first["condition"]["left"]["indicator"] = ""
+    first["condition"]["left"]["name"] = "ema"
+    first["condition"]["left"]["alias"] = ""
+    second = deepcopy(first)
+    second["id"] = "open_condition_short"
+    second["label"] = "EMA5下穿EMA30"
+    second["condition"]["direction"] = "bearish"
+    short_action = _action("open_short", "open_sell", stop_loss_rule="recent_low(5)", description="止损设在最近5根最高价")
+    value["nodes"].extend([second, short_action])
+    value["edges"].extend([
+        {"id": "short_yes", "source": second["id"], "target": short_action["id"], "source_handle": "yes"},
+        {"id": "short_no", "source": second["id"], "target": "open_no", "source_handle": "no"},
+    ])
+    value["nodes"].append({
+        "id": "latest_cross_meta", "type": "condition", "label": "时间最近的一次交叉",
+        "condition": {
+            "kind": "consecutive", "description": "同时出现时以最近交叉为准",
+            "left": {"kind": "condition", "name": "open_condition"}, "operator": "eq",
+            "right": {"kind": "condition", "name": "open_condition_short"}, "count": 1,
+        },
+    })
+    value["edges"].extend([
+        {"id": "meta_yes", "source": "latest_cross_meta", "target": "open_yes", "source_handle": "yes"},
+        {"id": "meta_no", "source": "latest_cross_meta", "target": "open_short", "source_handle": "no"},
+    ])
+    normalized = _normalize_generated_workflow_stage(
+        value,
+        stage="open",
+        data_requirements=value["data_requirements"],
+        user_logic=(
+            "最近3根K线内EMA5上穿EMA30开多，止损设在最近5根最低价；"
+            "最近3根K线内EMA5下穿EMA30开空，止损设在最近5根最高价；"
+            "如果同时出现上穿和下穿，以时间最近的一次交叉为准。"
+        ),
+    )
+    validated = validate_workflow_stage(normalized, "open")
+    conditions = [node for node in validated.nodes if node.type == "condition"]
+    assert all(node.condition.lookback == 3 for node in conditions)
+    assert all(node.condition.cross_mode == "latest" for node in conditions)
+    assert conditions[0].condition.left.alias == "ema5"
+    assert all(node.id != "latest_cross_meta" for node in validated.nodes)
+    assert any(edge.source == "open_condition" and edge.target == "open_condition_short" for edge in validated.edges)
+    short = next(node for node in validated.nodes if node.id == "open_short")
+    assert short.action.stop_loss_rule == "recent_high(5)"
 
 
 def test_open_action_keeps_market_and_risk_rules() -> None:

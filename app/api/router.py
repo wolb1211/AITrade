@@ -1253,6 +1253,14 @@ def create_auth_router(
         execute(lambda: auth_service.me(token))
         return ok(workflow_validation_result(payload.get("workflow")))
 
+    @router.post("/custom-strategy/workflow/generate")
+    def generate_custom_strategy_workflow_stage(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.generate_custom_workflow_stage(token, payload=payload))
+
     @router.post("/custom-strategy/preview")
     def preview_custom_strategy(
         payload: dict[str, object],

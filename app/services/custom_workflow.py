@@ -97,6 +97,7 @@ class WorkflowCondition(WorkflowModel):
     operator: Literal["gt", "gte", "lt", "lte", "eq", "neq"] | None = None
     right: WorkflowOperand | None = None
     direction: Literal["above", "below", "up", "down", "bullish", "bearish"] | None = None
+    cross_mode: Literal["any", "latest"] = "any"
     lookback: int = Field(default=1, ge=1, le=1000)
     count: int = Field(default=1, ge=1, le=1000)
     pattern: str = Field(default="", max_length=80)
@@ -155,7 +156,7 @@ class WorkflowVolume(WorkflowModel):
 
 ActionKind = Literal[
     "open_buy", "open_sell", "no_action", "close_all", "close_partial",
-    "add_buy", "add_sell", "modify_sl", "modify_tp", "hold",
+    "add_buy", "add_sell", "modify_sl", "modify_tp", "cancel_pending", "hold",
 ]
 
 
@@ -177,8 +178,10 @@ class WorkflowAction(WorkflowModel):
             raise ValueError("partial_close_requires_volume")
         if self.kind in {"add_buy", "add_sell"} and self.volume is None:
             raise ValueError("add_action_requires_volume")
-        if self.kind in {"modify_sl", "modify_tp"} and self.target is None:
-            raise ValueError("modify_action_requires_target")
+        if self.kind == "modify_sl" and self.target is None and not self.stop_loss_rule.strip():
+            raise ValueError("modify_sl_requires_target_or_rule")
+        if self.kind == "modify_tp" and self.target is None and not self.take_profit_rule.strip():
+            raise ValueError("modify_tp_requires_target_or_rule")
         if self.kind in {"open_buy", "open_sell"} and self.entry_mode == "pending" and not self.entry_price_rule.strip():
             raise ValueError("pending_order_requires_entry_price_rule")
         return self
@@ -284,6 +287,41 @@ def workflow_json_schema() -> dict[str, Any]:
     return CustomStrategyWorkflow.model_json_schema()
 
 
+def workflow_stage_json_schema() -> dict[str, Any]:
+    return WorkflowStage.model_json_schema()
+
+
+def validate_workflow_stage(value: Any, stage: Literal["open", "position"]) -> WorkflowStage:
+    workflow_stage = WorkflowStage.model_validate(value)
+    _validate_stage(workflow_stage, stage)
+    return workflow_stage
+
+
+def workflow_stage_validation_result(value: Any, stage: Literal["open", "position"]) -> dict[str, Any]:
+    try:
+        normalized = validate_workflow_stage(value, stage)
+        return {"valid": True, "errors": [], "stage": normalized.model_dump(mode="json", exclude_none=True)}
+    except WorkflowError as exc:
+        return {
+            "valid": False,
+            "errors": [{"code": exc.code, "node_id": exc.node_id, "detail": exc.detail}],
+            "stage": None,
+        }
+    except ValidationError as exc:
+        return {
+            "valid": False,
+            "errors": [
+                {
+                    "code": str(item.get("type") or "invalid_workflow_value"),
+                    "path": ".".join(str(part) for part in item.get("loc") or ()),
+                    "detail": str(item.get("msg") or ""),
+                }
+                for item in exc.errors(include_url=False, include_context=False, include_input=False)
+            ],
+            "stage": None,
+        }
+
+
 def validate_workflow(value: Any) -> CustomStrategyWorkflow:
     workflow = CustomStrategyWorkflow.model_validate(value)
     _validate_stage(workflow.open, "open")
@@ -362,6 +400,7 @@ def workflow_catalog() -> dict[str, Any]:
             {"kind": "add_sell", "title": "加空仓", "stages": ["position"]},
             {"kind": "modify_sl", "title": "修改止损", "stages": ["position"]},
             {"kind": "modify_tp", "title": "修改止盈", "stages": ["position"]},
+            {"kind": "cancel_pending", "title": "取消挂单", "stages": ["position"]},
             {"kind": "hold", "title": "保持持仓", "stages": ["position"]},
         ],
         "operators": [
@@ -450,7 +489,7 @@ def _validate_stage(stage: WorkflowStage, expected_stage: Literal["open", "posit
 
 def _validate_stage_action(node: WorkflowActionNode, stage: Literal["open", "position"]) -> None:
     open_actions = {"open_buy", "open_sell", "no_action"}
-    position_actions = {"close_all", "close_partial", "add_buy", "add_sell", "modify_sl", "modify_tp", "hold"}
+    position_actions = {"close_all", "close_partial", "add_buy", "add_sell", "modify_sl", "modify_tp", "cancel_pending", "hold"}
     allowed = open_actions if stage == "open" else position_actions
     if node.action.kind not in allowed:
         raise WorkflowError("workflow_action_not_allowed_in_stage", node_id=node.id, detail=node.action.kind)

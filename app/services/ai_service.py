@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from hashlib import sha256
 import logging
 from dataclasses import dataclass
@@ -20,6 +21,11 @@ from app.services.custom_indicators import (
     required_candle_count,
 )
 from app.services.custom_rule_engine import RULE_ENGINE_VERSION, RulePlanError, normalize_rule_plan
+from app.services.custom_workflow import (
+    compile_workflow,
+    workflow_stage_json_schema,
+    workflow_stage_validation_result,
+)
 from app.store import SqliteStore
 
 logger = logging.getLogger(__name__)
@@ -248,6 +254,137 @@ class AiDecisionClient:
             open_logic=open_logic,
             position_logic=position_logic,
         )
+
+    def generate_custom_workflow_stage(
+        self,
+        deployment: dict[str, Any],
+        *,
+        stage: str,
+        user_logic: str,
+        data_requirements: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Generate and validate one visual workflow stage without persisting a strategy."""
+        if stage not in {"open", "position"}:
+            raise RuntimeError("invalid_workflow_stage")
+        # ai_usage_logs.endpoint is intentionally compact (VARCHAR(16) in the
+        # existing MySQL schema).  "workflow_position" exceeds that limit and
+        # made an otherwise successful position-workflow response look like an
+        # AI generation failure while usage metadata was being saved.
+        endpoint = "workflow_open" if stage == "open" else "workflow_pos"
+        base_payload = {
+            "task": "generate_visual_strategy_workflow_stage",
+            "stage": stage,
+            "user_logic": user_logic,
+            "data_requirements": data_requirements,
+            "available_indicators": public_indicator_catalog(),
+            "workflow_stage_schema": workflow_stage_json_schema(),
+            "required_response": {"stage": "one WorkflowStage object matching workflow_stage_schema"},
+        }
+        result = self._chat_json(
+            deployment=deployment,
+            endpoint=endpoint,
+            system_prompt=_custom_workflow_stage_generation_prompt(stage),
+            user_payload=base_payload,
+        )
+        candidate = _normalize_generated_workflow_stage(
+            _workflow_stage_candidate(result.content if result is not None else {}),
+            stage=stage,
+            data_requirements=data_requirements,
+            user_logic=user_logic,
+        )
+        validation = workflow_stage_validation_result(candidate, stage)  # type: ignore[arg-type]
+        repaired = False
+        if not validation["valid"]:
+            repaired = True
+            source_rules = _workflow_source_rules(user_logic)
+            classified_rules = []
+            for index, source_rule in enumerate(source_rules):
+                action_kind = _classify_workflow_source_rule(source_rule, stage=stage)
+                if action_kind:
+                    classified_rules.append({
+                        "rule_index": index + 1,
+                        "label": _workflow_rule_label(source_rule, action_kind),
+                        "action_kind": action_kind,
+                    })
+            candidate = _workflow_stage_from_classified_rules(
+                {"rules": classified_rules},
+                stage=stage,
+                data_requirements=data_requirements,
+                source_rules=source_rules,
+            )
+            validation = workflow_stage_validation_result(candidate, stage)  # type: ignore[arg-type]
+        if not validation["valid"] or not isinstance(validation.get("stage"), dict):
+            logger.warning(
+                "Workflow generation validation failed after repair: stage=%s errors=%s",
+                stage,
+                json.dumps(validation.get("errors") or [], ensure_ascii=False),
+            )
+            raise RuntimeError("workflow_generation_validation_failed")
+        return {
+            "stage": validation["stage"],
+            "source_text": user_logic,
+            "repaired": repaired,
+        }
+
+    def compile_custom_workflow(
+        self,
+        workflow: Any,
+        *,
+        open_logic: str,
+        position_logic: str,
+    ) -> dict[str, Any]:
+        """Compile the confirmed visual workflow without asking a runtime model to reinterpret it."""
+        compiled_workflow = compile_workflow(workflow)
+
+        def stage_prompt(stage_name: str) -> str:
+            title = "开仓" if stage_name == "open" else "持仓风控"
+            stage = compiled_workflow[stage_name]
+            return (
+                f"严格执行用户已确认的{title}可视化流程。必须从 entry_node_id 开始，按 transitions 逐个判断；"
+                "判断节点只允许选择 yes 或 no 对应分支，抵达动作节点后立即执行并结束本次流程。"
+                "不得添加、删除、改写或优化任何条件和动作。流程数据如下：\n"
+                + json.dumps(stage, ensure_ascii=False, separators=(",", ":"))
+            )
+
+        open_stage = compiled_workflow["open"]
+        position_stage = compiled_workflow["position"]
+        unsupported_conditions = [
+            {"stage": stage_name, **item}
+            for stage_name, stage_data in (("open", open_stage), ("position", position_stage))
+            for item in stage_data.get("unsupported_conditions", [])
+        ]
+        content = {
+            "summary": "已根据开仓与持仓风控流程图生成策略配置，运行时严格按已确认的节点和分支执行。",
+            "open_prompt_template": stage_prompt("open"),
+            "position_prompt_template": stage_prompt("position"),
+            "open_indicators": open_stage.get("indicators", []),
+            "position_indicators": position_stage.get("indicators", []),
+            "open_rule_plan": {"version": RULE_ENGINE_VERSION, "mode": "ai", "rules": []},
+            "position_rule_plan": {"version": RULE_ENGINE_VERSION, "mode": "ai", "rules": []},
+            "unsupported_indicators": [],
+            "unsupported_conditions": unsupported_conditions,
+            "visual_conditions": [],
+            "warnings": [],
+        }
+        normalized = self.normalize_custom_strategy_compilation(
+            content,
+            open_logic=open_logic,
+            position_logic=position_logic,
+        )
+        # The visual workflow itself is the executable contract. A missing
+        # legacy rule_plan is therefore not an unsupported condition; only
+        # explicit ai_condition nodes should be counted as unstructured.
+        normalized["unsupported_conditions"] = [
+            item for item in normalized.get("unsupported_conditions", [])
+            if str(item.get("code") or "") != "rule_plan_unavailable"
+        ]
+        normalized["unsupported_condition_count"] = len(normalized["unsupported_conditions"])
+        normalized.update({
+            "workflow": workflow,
+            "compiled_workflow": compiled_workflow,
+            "compile_status": "generated",
+        })
+        return normalized
 
     def normalize_custom_strategy_compilation(
         self,
@@ -1132,7 +1269,7 @@ class AiDecisionClient:
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        prefix = "open" if endpoint in {"open", "compile", "compile_open"} else "position"
+        prefix = "open" if endpoint in {"open", "compile", "compile_open", "workflow_open"} else "position"
         if str(config.get(f"{prefix}_ai_mode") or "official") == "custom":
             base_url = str(config.get(f"{prefix}_ai_base_url") or config.get(f"{prefix}_ai_provider") or "").strip()
             model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
@@ -1378,6 +1515,508 @@ def _pa_system_prompt() -> str:
         "reason must be Chinese, concrete, <=60 Chinese characters. "
         "analysis must be Chinese, 120-300 Chinese characters, with market structure, setup score, price/risk context, and action rationale. "
         "Never invent prices. Use price distances for open SL/TP."
+    )
+
+
+def _workflow_stage_candidate(content: Any) -> dict[str, Any]:
+    if not isinstance(content, dict):
+        return {}
+    stage = content.get("stage")
+    return dict(stage) if isinstance(stage, dict) else dict(content)
+
+
+def _normalize_generated_workflow_stage(
+    content: dict[str, Any],
+    *,
+    stage: str,
+    data_requirements: dict[str, Any],
+    user_logic: str = "",
+) -> dict[str, Any]:
+    """Normalize common provider aliases without changing the user's strategy semantics."""
+    value = deepcopy(content)
+    value["data_requirements"] = {
+        "data_type": str(data_requirements.get("data_type") or "kline"),
+        "kline_count": int(data_requirements.get("kline_count") or 100),
+        "call_mode": str(data_requirements.get("call_mode") or "bar"),
+        "call_value": float(data_requirements.get("call_value") or 1),
+    }
+
+    def normalize_operand(operand: Any) -> None:
+        if not isinstance(operand, dict):
+            return
+        if str(operand.get("kind") or "") == "indicator":
+            indicator = str(operand.get("indicator") or operand.get("name") or "").strip().lower()
+            if indicator:
+                operand["indicator"] = indicator
+                params = operand.get("params") if isinstance(operand.get("params"), dict) else {}
+                length = params.get("length")
+                if not str(operand.get("alias") or "").strip():
+                    operand["alias"] = f"{indicator}{length}" if length not in (None, "") else indicator
+                operand.setdefault("source", "close")
+                operand.setdefault("component", "value")
+
+    def normalize_condition(condition: Any) -> None:
+        if not isinstance(condition, dict):
+            return
+        normalize_operand(condition.get("left"))
+        normalize_operand(condition.get("right"))
+        direction = str(condition.get("direction") or "").strip().lower()
+        if condition.get("kind") == "cross" and direction in {"up", "bullish"}:
+            condition["direction"] = "above"
+        elif condition.get("kind") == "cross" and direction in {"down", "bearish"}:
+            condition["direction"] = "below"
+        elif condition.get("kind") == "cross" and not direction:
+            operator = str(condition.get("operator") or "").strip().lower()
+            if operator in {"gt", "gte"}:
+                condition["direction"] = "above"
+            elif operator in {"lt", "lte"}:
+                condition["direction"] = "below"
+        for child in condition.get("conditions") if isinstance(condition.get("conditions"), list) else []:
+            normalize_condition(child)
+
+    cross_window_match = re.search(r"最近\s*(\d+)\s*根", user_logic, flags=re.IGNORECASE)
+    cross_window = int(cross_window_match.group(1)) if cross_window_match else 0
+    latest_cross = bool(re.search(r"(?:时间)?最近(?:的)?一次交叉|最新(?:的)?交叉|latest\s+cross", user_logic, flags=re.IGNORECASE))
+    nodes = value.get("nodes") if isinstance(value.get("nodes"), list) else []
+    nested_edges: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if node.get("position") is None:
+            node.pop("position", None)
+        if isinstance(node.get("edges"), list):
+            nested_edges.extend(item for item in node.pop("edges") if isinstance(item, dict))
+        if node.get("type") == "entry":
+            node["stage"] = stage
+        if node.get("type") == "condition":
+            condition = node.get("condition")
+            normalize_condition(condition)
+            if isinstance(condition, dict) and condition.get("kind") == "cross":
+                if cross_window >= 2:
+                    condition["lookback"] = cross_window
+                if latest_cross:
+                    condition["cross_mode"] = "latest"
+            if isinstance(condition, dict) and condition.get("kind") == "consecutive" and (
+                condition.get("operator") is None or not isinstance(condition.get("right"), dict)
+            ):
+                node.pop("condition", None)
+                node["type"] = "ai_condition"
+                node["instruction"] = str(condition.get("description") or node.get("label") or "按用户规则判断")
+                node["data_type"] = str(data_requirements.get("data_type") or "kline")
+        if node.get("type") == "action" and isinstance(node.get("action"), dict):
+            action = node["action"]
+            for key in ("volume", "target", "stop_loss", "take_profit"):
+                if action.get(key) is None:
+                    action.pop(key, None)
+            if action.get("kind") in {"open_buy", "open_sell"} and action.get("entry_mode") == "market":
+                action["entry_price_rule"] = ""
+            explicit_stop = _explicit_recent_extreme_stop_rule(
+                user_logic,
+                action_kind=str(action.get("kind") or ""),
+                action_description=str(action.get("description") or node.get("label") or ""),
+            )
+            if explicit_stop:
+                action["stop_loss_rule"] = explicit_stop
+    cross_nodes = [
+        node for node in nodes
+        if node.get("type") == "condition"
+        and isinstance(node.get("condition"), dict)
+        and node["condition"].get("kind") == "cross"
+        and node["condition"].get("cross_mode") == "latest"
+    ]
+    redundant_node_ids: set[str] = set()
+    if latest_cross and len(cross_nodes) >= 2:
+        for node in nodes:
+            condition = node.get("condition") if isinstance(node.get("condition"), dict) else {}
+            operands = [condition.get("left"), condition.get("right")]
+            references_conditions = any(
+                isinstance(operand, dict) and operand.get("kind") == "condition" for operand in operands
+            )
+            text = f"{node.get('label') or ''} {condition.get('description') or ''}"
+            if node.get("type") == "condition" and references_conditions and re.search(
+                r"最近|最新|交叉|latest", text, flags=re.IGNORECASE,
+            ):
+                redundant_node_ids.add(str(node.get("id") or ""))
+    if redundant_node_ids:
+        nodes = [node for node in nodes if str(node.get("id") or "") not in redundant_node_ids]
+        value["nodes"] = nodes
+    edges = value.get("edges") if isinstance(value.get("edges"), list) else []
+    if redundant_node_ids:
+        edges = [
+            edge for edge in edges
+            if str(edge.get("source") or "") not in redundant_node_ids
+            and str(edge.get("target") or "") not in redundant_node_ids
+        ]
+    edge_ids = {str(item.get("id") or "") for item in edges if isinstance(item, dict)}
+    for edge in nested_edges:
+        edge_id = str(edge.get("id") or "")
+        if edge_id and edge_id not in edge_ids:
+            edges.append(edge)
+            edge_ids.add(edge_id)
+    value["edges"] = edges
+    _connect_generated_flat_branches(value)
+    return value
+
+
+def _connect_generated_flat_branches(stage: dict[str, Any]) -> None:
+    """Connect flat if/else rules that share one fallback action into a decision chain."""
+    nodes = [item for item in stage.get("nodes", []) if isinstance(item, dict)]
+    edges = [item for item in stage.get("edges", []) if isinstance(item, dict)]
+    entry_id = str(stage.get("entry_node_id") or "")
+    condition_ids = [str(node.get("id") or "") for node in nodes if node.get("type") in {"condition", "ai_condition"}]
+
+    def reachable_ids() -> set[str]:
+        outgoing: dict[str, list[str]] = {}
+        for edge in edges:
+            outgoing.setdefault(str(edge.get("source") or ""), []).append(str(edge.get("target") or ""))
+        reached: set[str] = set()
+        queue = [entry_id]
+        while queue:
+            current = queue.pop(0)
+            if not current or current in reached:
+                continue
+            reached.add(current)
+            queue.extend(outgoing.get(current, []))
+        return reached
+
+    for _ in range(len(condition_ids)):
+        reachable = reachable_ids()
+        disconnected = [node_id for node_id in condition_ids if node_id not in reachable]
+        if not disconnected:
+            return
+        attached = False
+        for target_condition in disconnected:
+            target_no = next((edge for edge in edges if edge.get("source") == target_condition and edge.get("source_handle") == "no"), None)
+            if target_no is None:
+                continue
+            shared_fallback = target_no.get("target")
+            predecessor = next((
+                edge for edge in edges
+                if edge.get("source") in reachable
+                and edge.get("source") in condition_ids
+                and edge.get("source_handle") == "no"
+                and edge.get("target") == shared_fallback
+            ), None)
+            if predecessor is None:
+                continue
+            predecessor["target"] = target_condition
+            attached = True
+            break
+        if not attached:
+            return
+
+
+def _explicit_recent_extreme_stop_rule(
+    user_logic: str,
+    *,
+    action_kind: str,
+    action_description: str = "",
+) -> str:
+    if action_kind not in {"open_buy", "open_sell"}:
+        return ""
+    direction_terms = ("开多", "做多", "buy", "long") if action_kind == "open_buy" else ("开空", "做空", "sell", "short")
+    sentences = [item.strip() for item in re.split(r"[。；;\n]+", str(user_logic or "")) if item.strip()]
+    candidates = [
+        sentence for sentence in sentences
+        if any(term in sentence.lower() for term in direction_terms)
+    ]
+    if action_description:
+        candidates.append(action_description)
+    for text in candidates:
+        compact = re.sub(r"\s+", "", text.lower())
+        # A clause may contain another lookback first, for example
+        # "最近3根内出现下穿，止损设在最近5根最高价".  Only parse an
+        # explicit extreme expression near the stop-loss clause; a broad
+        # wildcard would incorrectly turn the first lookback into the stop.
+        stop_positions = [compact.rfind(marker) for marker in ("止损", "stoploss", "stop-loss")]
+        stop_position = max(stop_positions)
+        search_areas = [compact[stop_position:]] if stop_position >= 0 else []
+        search_areas.append(compact)
+        for area in search_areas:
+            match = re.search(
+                r"最近(\d+)根(?:(?:已收盘)?(?:k线|蜡烛|柱)?(?:内|以内|之内|范围内|区间内|区间|中|的)*)?(最低|最高)价?",
+                area,
+            )
+            if match:
+                function = "recent_low" if match.group(2) == "最低" else "recent_high"
+                return f"{function}({int(match.group(1))})"
+            english = re.search(
+                r"(?:last|recent)(\d+)(?:closed)?(?:bars?|candles?)(?:range)?(?:'s)?(lowest|highest)",
+                area,
+            )
+            if english:
+                function = "recent_low" if english.group(2) == "lowest" else "recent_high"
+                return f"{function}({int(english.group(1))})"
+    return ""
+
+
+def _workflow_stage_compact_contract(stage: str) -> dict[str, Any]:
+    return {
+        "root": {"entry_node_id": "entry id", "data_requirements": "copy supplied value", "nodes": "array", "edges": "array"},
+        "node_types": {
+            "entry": {"id": "ASCII id", "type": "entry", "stage": stage, "label": "Chinese label"},
+            "condition": {"id": "ASCII id", "type": "condition", "label": "Chinese label", "condition": "valid condition object"},
+            "ai_condition": {"id": "ASCII id", "type": "ai_condition", "label": "Chinese label", "instruction": "exact open rule", "data_type": "kline|screenshot|both"},
+            "action": {"id": "ASCII id", "type": "action", "label": "Chinese label", "action": {"kind": "allowed stage action"}},
+        },
+        "edges": {"fields": ["id", "source", "target", "source_handle"], "handles": "entry:next; condition/ai_condition:yes and no"},
+        "graph_rules": [
+            "entry has exactly one next edge",
+            "every condition has exactly one yes and one no edge",
+            "every node is reachable from entry",
+            "every branch ends at an action",
+            "action nodes have no outgoing edge",
+        ],
+    }
+
+
+def _workflow_source_rules(user_logic: str) -> list[str]:
+    """Split author text into stable rules while keeping each rule's wording intact."""
+    parts = re.split(r"(?:\r?\n)+|[。；;]+", str(user_logic or ""))
+    rules: list[str] = []
+    for part in parts:
+        text = re.sub(r"^\s*(?:[-*•]+|\d+[.、)])\s*", "", part).strip()
+        if text:
+            rules.append(text)
+    return rules
+
+
+def _classify_workflow_source_rule(source_rule: str, *, stage: str) -> str:
+    """Classify only explicit action verbs; position direction is not itself an action."""
+    text = re.sub(r"\s+", "", str(source_rule or "")).lower()
+    if stage == "open":
+        if any(term in text for term in ("开多", "做多", "buy", "long")):
+            return "open_buy"
+        if any(term in text for term in ("开空", "做空", "sell", "short")):
+            return "open_sell"
+        if any(term in text for term in ("不开仓", "不操作", "noaction")):
+            return "no_action"
+        return ""
+
+    if any(term in text for term in ("取消挂单", "撤销挂单", "撤单", "cancelpending")):
+        return "cancel_pending"
+    if any(term in text for term in ("部分平仓", "平仓一半", "关闭一半", "半仓", "partialclose")):
+        return "close_partial"
+    if any(term in text for term in ("全部平仓", "立即平仓", "平仓", "closeall", "closeposition")):
+        return "close_all"
+    if any(term in text for term in ("移动止损", "修改止损", "调整止损", "止损移动", "止损设", "stoploss")):
+        return "modify_sl"
+    if any(term in text for term in ("移动止盈", "修改止盈", "调整止盈", "止盈移动", "止盈设", "takeprofit")):
+        return "modify_tp"
+    if any(term in text for term in ("加多仓", "多单加仓", "加仓做多", "addbuy", "addlong")):
+        return "add_buy"
+    if any(term in text for term in ("加空仓", "空单加仓", "加仓做空", "addsell", "addshort")):
+        return "add_sell"
+    if "加仓" in text:
+        if any(term in text for term in ("空单", "空头", "做空")):
+            return "add_sell"
+        if any(term in text for term in ("多单", "多头", "做多")):
+            return "add_buy"
+    if any(term in text for term in ("保持持仓", "继续持有", "不操作", "hold")):
+        return "hold"
+    return ""
+
+
+def _workflow_rule_label(source_rule: str, action_kind: str) -> str:
+    action_titles = {
+        "open_buy": "开多",
+        "open_sell": "开空",
+        "no_action": "不开仓",
+        "close_all": "全部平仓",
+        "close_partial": "部分平仓",
+        "add_buy": "加多仓",
+        "add_sell": "加空仓",
+        "modify_sl": "修改止损",
+        "modify_tp": "修改止盈",
+        "cancel_pending": "取消挂单",
+        "hold": "保持持仓",
+    }
+    prefix = str(source_rule or "").strip()[:72]
+    title = action_titles.get(action_kind, "执行动作")
+    return f"{prefix} → {title}"[:100]
+
+
+def _workflow_stage_from_classified_rules(
+    content: Any,
+    *,
+    stage: str,
+    data_requirements: dict[str, Any],
+    source_rules: list[str],
+) -> dict[str, Any]:
+    """Render a valid decision chain from AI action classifications and exact source text."""
+    allowed = (
+        {"open_buy", "open_sell", "no_action"}
+        if stage == "open"
+        else {"close_all", "close_partial", "add_buy", "add_sell", "modify_sl", "modify_tp", "cancel_pending", "hold"}
+    )
+    raw_rules = content.get("rules") if isinstance(content, dict) else None
+    classified: dict[int, dict[str, Any]] = {}
+    for item in raw_rules if isinstance(raw_rules, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("rule_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        kind = str(item.get("action_kind") or item.get("kind") or "").strip().lower()
+        if 1 <= index <= len(source_rules) and kind in allowed:
+            classified[index] = {**item, "action_kind": kind}
+
+    entry_id = f"{stage}_entry"
+    fallback_kind = "no_action" if stage == "open" else "hold"
+    fallback_id = f"{stage}_fallback"
+    nodes: list[dict[str, Any]] = [
+        {"id": entry_id, "type": "entry", "stage": stage, "label": "开仓数据入口" if stage == "open" else "持仓风控入口"},
+    ]
+    edges: list[dict[str, Any]] = []
+    decision_ids: list[str] = []
+    for index in sorted(classified):
+        item = classified[index]
+        source_text = source_rules[index - 1]
+        kind = str(item["action_kind"])
+        # Reject classifications that introduce an action absent from the
+        # authoritative source sentence.
+        normalized = source_text.lower().replace(" ", "")
+        action_markers = {
+            "modify_sl": ("止损", "stoploss", "stop-loss"),
+            "modify_tp": ("止盈", "takeprofit", "take-profit"),
+            "close_all": ("平仓", "close"),
+            "close_partial": ("部分平仓", "平仓一半", "closepartial", "partialclose"),
+            "add_buy": ("加仓", "加多", "add"),
+            "add_sell": ("加仓", "加空", "add"),
+            "cancel_pending": ("取消挂单", "撤单", "cancel"),
+        }
+        markers = action_markers.get(kind)
+        if markers and not any(marker in normalized for marker in markers):
+            continue
+
+        condition_id = f"{stage}_rule_{index}"
+        action_id = f"{stage}_action_{index}"
+        label = str(item.get("label") or source_text)[:100]
+        action: dict[str, Any] = {"kind": kind, "description": source_text[:500]}
+        if kind in {"open_buy", "open_sell"}:
+            action["entry_mode"] = "market"
+        elif kind == "modify_sl":
+            action["stop_loss_rule"] = source_text
+        elif kind == "modify_tp":
+            action["take_profit_rule"] = source_text
+        elif kind in {"add_buy", "add_sell"}:
+            action["volume"] = {"mode": "open_sizing", "value": 1}
+        elif kind == "close_partial":
+            # The classifier must not guess a partial-close size. Keep an
+            # unclassified rule out of the graph when no explicit ratio exists.
+            ratio = re.search(r"(?:平仓|关闭)\s*(\d+(?:\.\d+)?)\s*%", source_text)
+            half = bool(re.search(r"(?:一半|半仓)", source_text))
+            if ratio:
+                action["volume"] = {"mode": "current_ratio", "value": float(ratio.group(1)) / 100}
+            elif half:
+                action["volume"] = {"mode": "current_ratio", "value": 0.5}
+            else:
+                continue
+        nodes.extend([
+            {
+                "id": condition_id,
+                "type": "ai_condition",
+                "label": label,
+                "instruction": source_text,
+                "data_type": str(data_requirements.get("data_type") or "kline"),
+            },
+            {"id": action_id, "type": "action", "label": label, "action": action},
+        ])
+        decision_ids.append(condition_id)
+        edges.append({
+            "id": f"{condition_id}_yes",
+            "source": condition_id,
+            "target": action_id,
+            "source_handle": "yes",
+        })
+
+    nodes.append({"id": fallback_id, "type": "action", "label": "不操作", "action": {"kind": fallback_kind}})
+    if not decision_ids:
+        return {}
+    edges.append({"id": f"{entry_id}_next", "source": entry_id, "target": decision_ids[0], "source_handle": "next"})
+    for offset, condition_id in enumerate(decision_ids):
+        target = decision_ids[offset + 1] if offset + 1 < len(decision_ids) else fallback_id
+        edges.append({
+            "id": f"{condition_id}_no",
+            "source": condition_id,
+            "target": target,
+            "source_handle": "no",
+        })
+    return {
+        "entry_node_id": entry_id,
+        "data_requirements": {
+            "data_type": str(data_requirements.get("data_type") or "kline"),
+            "kline_count": int(data_requirements.get("kline_count") or 100),
+            "call_mode": str(data_requirements.get("call_mode") or "bar"),
+            "call_value": float(data_requirements.get("call_value") or 1),
+        },
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def _custom_workflow_rule_classification_prompt(stage: str) -> str:
+    allowed = "open_buy, open_sell, no_action" if stage == "open" else (
+        "close_all, close_partial, add_buy, add_sell, modify_sl, modify_tp, cancel_pending, hold"
+    )
+    return (
+        "Classify each supplied trading rule by its explicit resulting action. Return only one compact JSON object "
+        "with shape {\"rules\":[{\"rule_index\":1,\"label\":\"short Chinese label\","
+        "\"action_kind\":\"allowed kind\"}]}. Include every source rule exactly once and preserve source order. "
+        "rule_index must be copied exactly; never merge, split, rewrite or add a rule. Classify only the explicit action, "
+        "not the condition. A full close is close_all, partial close is close_partial, moving/changing stop loss is "
+        "modify_sl, changing take profit is modify_tp, adding long/short is add_buy/add_sell, cancelling a pending order "
+        "is cancel_pending, and an explicit no-operation is hold/no_action according to stage. Never infer an action that "
+        f"the source text does not state. Allowed action kinds for this stage: {allowed}."
+    )
+
+
+def _custom_workflow_stage_generation_prompt(stage: str, *, repair: bool = False) -> str:
+    stage_title = "开仓" if stage == "open" else "持仓风控"
+    allowed_actions = "open_buy, open_sell, no_action" if stage == "open" else (
+        "close_all, close_partial, add_buy, add_sell, modify_sl, modify_tp, cancel_pending, hold"
+    )
+    contract_rule = (
+        "The previous candidate, compact_contract and validation_errors are supplied. Correct every listed error, preserve all "
+        "user rules and valid fields, and return a complete replacement stage matching compact_contract. "
+        if repair else "Follow workflow_stage_schema exactly. "
+    )
+    position_rule = ""
+    if stage == "position":
+        position_rule = (
+            "Treat each independently stated position-management rule as one complete decision and preserve its full "
+            "meaning. If a trigger combines position direction/state with another condition, or contains arithmetic "
+            "between current price, open price, current stop, profit or ATR, represent the complete trigger as one "
+            "ai_condition and copy the user's corresponding sentence into instruction without rewriting it. Do not split "
+            "such a trigger into partial structured conditions. A plain indicator crossover may use a structured cross "
+            "condition only when doing so preserves every qualifier in that rule; for example, a long-only or short-only "
+            "crossover must not lose the position-direction qualifier. Never introduce an indicator into an ATR/price "
+            "condition unless that indicator occurs in the same user rule. For modify_sl put the requested new-stop "
+            "formula in stop_loss_rule; for modify_tp put it in take_profit_rule. Never create modify_tp when the user did "
+            "not mention take profit, and never create modify_sl when the user did not mention stop loss. "
+        )
+    return (
+        f"Convert the user's {stage_title} rules into exactly one visual WorkflowStage JSON object. "
+        f"Output only {{\"stage\":{{...}}}}. {contract_rule}Never output markdown or explanations. "
+        "The user's text is the sole source of trading logic. Preserve every explicit condition, order, direction, "
+        "priority, price rule, stop-loss rule, take-profit rule and volume rule. Never add optimization, confirmation, "
+        "trend, risk, scoring or safety conditions. Create exactly one entry node with stage matching the requested stage. "
+        "Every reachable branch must end at an action node and action nodes must have no outgoing edges. Condition and "
+        "ai_condition nodes require both yes and no edges; entry and vision_extract require one next edge. Use unique ASCII "
+        "IDs beginning with a letter. Use concise Chinese node labels. Use structured condition nodes whenever the supplied "
+        "condition can be represented by the schema and available indicator capabilities. Preserve indicator name, component, "
+        "source, period and comparison direction exactly. For cross conditions use cross_mode latest when the user says the "
+        "most recent/latest crossing takes priority; otherwise use cross_mode any. Preserve the user's cross lookback window. "
+        "Use ai_condition only for an open semantic condition that cannot be "
+        "represented structurally. For screenshot rules, create vision_extract with user-defined enum outputs and then compare "
+        "its result using a condition node; fallback must be one enum option such as uncertain. Set data_requirements according "
+        "to the supplied selection and do not silently change it. Open price, stop-loss and take-profit descriptions belong in "
+        "entry_price_rule, stop_loss_rule and take_profit_rule. A market order uses entry_mode market; a pending order uses "
+        "entry_mode pending and must have entry_price_rule. When the user's rule does not trigger, end in no_action for opening "
+        "or hold for position management. Do not invent partial-close volume or add volume. "
+        f"{position_rule}"
+        f"Only these actions are allowed in this stage: {allowed_actions}."
     )
 
 
@@ -1812,6 +2451,12 @@ def _json_api_system_prompt(
     *,
     literal_user_rules: bool = False,
 ) -> str:
+    if endpoint.startswith("workflow_"):
+        return (
+            "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
+            "Start with { and end with }. No markdown, code fences, prefix, suffix or prose outside JSON. "
+            f"Task: {task_prompt}"
+        )
     if endpoint.startswith("compile"):
         return (
             "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
@@ -1869,6 +2514,8 @@ def _json_api_system_prompt(
 
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
+    if endpoint.startswith("workflow_"):
+        return 6000
     if endpoint.startswith("compile"):
         return 2400
     if endpoint == "open":
