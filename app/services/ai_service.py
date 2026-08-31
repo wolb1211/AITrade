@@ -537,6 +537,7 @@ class AiDecisionClient:
                 "equity": request_payload.equity,
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
+                "computed_facts": _workflow_computed_facts(config, "open", indicators),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "open"),
                 "required_json_schema": {
@@ -592,6 +593,7 @@ class AiDecisionClient:
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
+                "computed_facts": _workflow_computed_facts(config, "position", indicators),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
                 "required_json_schema": {
@@ -2431,6 +2433,49 @@ def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any
         "多单有利价格移动=current_price-open_price，空单有利价格移动=open_price-current_price。\n"
     )
     return f"{cleaned}\n\n{guardrails}".strip()
+
+
+def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any]) -> list[dict[str, Any]]:
+    """Derive objective comparison/crossover facts from a compiled workflow.
+
+    These facts are advisory context for the model; the workflow remains the
+    source of truth and visual/AI conditions are intentionally left unresolved.
+    """
+    compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
+    stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
+    nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
+    values = indicators.get("values") if isinstance(indicators.get("values"), dict) else {}
+    facts: list[dict[str, Any]] = []
+
+    def operand_key(operand: Any) -> str:
+        if not isinstance(operand, dict) or operand.get("kind") != "indicator":
+            return ""
+        return str(operand.get("alias") or "").strip()
+
+    def nums(key: str) -> list[float]:
+        raw = values.get(key, [])
+        if not isinstance(raw, list): return []
+        out: list[float] = []
+        for item in raw:
+            try: out.append(float(item))
+            except (TypeError, ValueError): pass
+        return out
+
+    for node in nodes.values():
+        if not isinstance(node, dict) or node.get("type") != "condition": continue
+        condition = node.get("condition") if isinstance(node.get("condition"), dict) else {}
+        left_key, right_key = operand_key(condition.get("left")), operand_key(condition.get("right"))
+        left, right = nums(left_key), nums(right_key)
+        if left_key and right_key and left and right:
+            count = min(len(left), len(right))
+            left, right = left[-count:], right[-count:]
+            relation = ["above" if a > b else "below" if a < b else "equal" for a, b in zip(left, right)]
+            cross_up = any(relation[i - 1] in {"below", "equal"} and relation[i] == "above" for i in range(1, len(relation)))
+            cross_down = any(relation[i - 1] in {"above", "equal"} and relation[i] == "below" for i in range(1, len(relation)))
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_relation": relation[-1], "relations_oldest_to_latest": relation, "cross_up": cross_up, "cross_down": cross_down})
+        elif left_key and left:
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1]})
+    return facts
 
 
 def _custom_runtime_template(value: Any) -> str:
