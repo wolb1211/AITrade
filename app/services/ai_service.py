@@ -593,7 +593,7 @@ class AiDecisionClient:
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
-                "computed_facts": _workflow_computed_facts(config, "position", indicators),
+                "computed_facts": _workflow_computed_facts(config, "position", indicators, {"position": ([item.model_dump(mode="json") for item in request_payload.positions] or [{}])[0]}),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
                 "required_json_schema": {
@@ -2435,7 +2435,7 @@ def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any
     return f"{cleaned}\n\n{guardrails}".strip()
 
 
-def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any]) -> list[dict[str, Any]]:
+def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any], runtime: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Derive objective comparison/crossover facts from a compiled workflow.
 
     These facts are advisory context for the model; the workflow remains the
@@ -2445,6 +2445,8 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
     stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
     nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
     values = indicators.get("values") if isinstance(indicators.get("values"), dict) else {}
+    runtime = runtime or {}
+    position = runtime.get("position") if isinstance(runtime.get("position"), dict) else {}
     facts: list[dict[str, Any]] = []
 
     def operand_key(operand: Any) -> str:
@@ -2461,18 +2463,43 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
             except (TypeError, ValueError): pass
         return out
 
+    def operand_values(operand: Any) -> list[float]:
+        if not isinstance(operand, dict): return []
+        kind, name = operand.get("kind"), str(operand.get("name") or "")
+        if kind == "indicator": return nums(operand_key(operand))
+        if kind == "constant":
+            try: return [float(operand.get("value"))]
+            except (TypeError, ValueError): return []
+        mapping = {"open_price": "open_price", "current_price": "current_price", "sl": "sl", "tp": "tp", "profit": "profit", "volume": "volume"}
+        if kind == "position" and name in mapping:
+            try: return [float(position.get(mapping[name]))]
+            except (TypeError, ValueError): return []
+        if kind == "position" and name == "price_open_distance":
+            try: return [float(position["current_price"]) - float(position["open_price"])]
+            except (KeyError, TypeError, ValueError): return []
+        if kind == "position" and name == "price_sl_distance":
+            try: return [float(position["current_price"]) - float(position["sl"])]
+            except (KeyError, TypeError, ValueError): return []
+        if kind == "position" and name == "price_tp_distance":
+            try: return [float(position["current_price"]) - float(position["tp"])]
+            except (KeyError, TypeError, ValueError): return []
+        return []
+
     for node in nodes.values():
         if not isinstance(node, dict) or node.get("type") != "condition": continue
         condition = node.get("condition") if isinstance(node.get("condition"), dict) else {}
         left_key, right_key = operand_key(condition.get("left")), operand_key(condition.get("right"))
-        left, right = nums(left_key), nums(right_key)
+        left, right = operand_values(condition.get("left")), operand_values(condition.get("right"))
         if left_key and right_key and left and right:
             count = min(len(left), len(right))
             left, right = left[-count:], right[-count:]
             relation = ["above" if a > b else "below" if a < b else "equal" for a, b in zip(left, right)]
             cross_up = any(relation[i - 1] in {"below", "equal"} and relation[i] == "above" for i in range(1, len(relation)))
             cross_down = any(relation[i - 1] in {"above", "equal"} and relation[i] == "below" for i in range(1, len(relation)))
-            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_relation": relation[-1], "relations_oldest_to_latest": relation, "cross_up": cross_up, "cross_down": cross_down})
+            operator = condition.get("operator") or "gt"
+            a, b = left[-1], right[-1]
+            result = {"gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b, "eq": a == b, "neq": a != b}.get(operator)
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_left": a, "latest_right": b, "operator": operator, "condition_result": result, "latest_relation": relation[-1], "relations_oldest_to_latest": relation, "cross_up": cross_up, "cross_down": cross_down})
         elif left_key and left:
             facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1]})
     return facts

@@ -139,7 +139,7 @@ class WorkflowCondition(WorkflowModel):
 
 class WorkflowPriceTarget(WorkflowModel):
     kind: Literal[
-        "fixed", "entry_price", "current_price", "indicator", "recent_high", "recent_low", "atr_offset",
+        "fixed", "entry_price", "current_price", "indicator", "recent_high", "recent_low", "atr_offset", "formula",
     ]
     value: float | None = None
     indicator: str = Field(default="", max_length=64)
@@ -147,6 +147,9 @@ class WorkflowPriceTarget(WorkflowModel):
     operation: Literal["none", "add", "subtract"] = "none"
     offset_value: float = 0
     atr_multiplier: float = Field(default=0, ge=0, le=1000)
+    formula_base: Literal["current_price", "entry_price", "sl", "tp", "recent_high", "recent_low"] = "current_price"
+    adjustment_kind: Literal["fixed", "atr"] = "fixed"
+    adjustment_value: float = 0
 
 
 class WorkflowVolume(WorkflowModel):
