@@ -235,7 +235,7 @@ _ALLOWED_FUNCTIONS = {
 }
 _OPEN_NAMES = {"bid", "ask", "true", "false"}
 _POSITION_NAMES = _OPEN_NAMES | {
-    "side", "open_price", "current_price", "sl", "tp", "volume", "profit", "favorable_move", "stop_distance",
+    "side", "open_price", "current_price", "sl", "tp", "volume", "profit", "favorable_move", "stop_distance", "price_open_distance", "price_sl_distance", "price_tp_distance",
 }
 
 
@@ -349,6 +349,10 @@ class _RuleContext:
                 else self.position.open_price - self.position.current_price
             ),
             "stop_distance": abs(self.position.current_price - self.position.sl) if self.position.sl else 0,
+            # Signed distances intentionally remain directional (no abs).
+            "price_open_distance": self.position.current_price - self.position.open_price,
+            "price_sl_distance": self.position.current_price - self.position.sl if self.position.sl else 0,
+            "price_tp_distance": self.position.current_price - self.position.tp if self.position.tp else 0,
         }
         if normalized not in mapping:
             raise RulePlanError(f"unknown_rule_name:{name}")
