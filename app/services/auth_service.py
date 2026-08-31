@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -13,6 +14,7 @@ from app.store import SqliteStore
 
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+logger = logging.getLogger(__name__)
 
 
 class AuthError(RuntimeError):
@@ -333,6 +335,13 @@ class UserAuthService:
             raise AuthError("strategy_key_limit_reached", 409)
         strategy_code = str(payload.get("strategy_code") or "PA_AGENT_V1").strip()
         is_custom_strategy = strategy_code == "CUSTOM_AI_V1"
+        logger.info(
+            "create_strategy code=%s custom=%s workflow_type=%s workflow_keys=%s",
+            strategy_code,
+            is_custom_strategy,
+            type(payload.get("workflow")).__name__,
+            sorted(payload.get("workflow", {}).keys()) if isinstance(payload.get("workflow"), dict) else [],
+        )
         strategy = None if is_custom_strategy else self.store.get_official_ai_strategy(strategy_code)
         if not is_custom_strategy and (strategy is None or not bool(strategy.get("enabled"))):
             raise AuthError("official_strategy_not_found", 404)
@@ -483,18 +492,20 @@ class UserAuthService:
         if is_custom_strategy:
             if self.ai_client is None:
                 raise AuthError("custom_strategy_compile_unavailable", 503)
-            try:
-                compiled = self.ai_client.normalize_custom_strategy_compilation(
-                    payload.get("compiled_config"),
-                    open_logic=open_logic,
-                    position_logic=position_logic,
-                )
-            except RuntimeError as exc:
-                raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
-            self._apply_custom_compilation(config, compiled, custom_data)
             if visual_compilation is not None:
+                self._apply_custom_compilation(config, visual_compilation, custom_data)
                 config["workflow"] = visual_compilation["workflow"]
                 config["compiled_workflow"] = visual_compilation["compiled_workflow"]
+            else:
+                try:
+                    compiled = self.ai_client.normalize_custom_strategy_compilation(
+                        payload.get("compiled_config"),
+                        open_logic=open_logic,
+                        position_logic=position_logic,
+                    )
+                except RuntimeError as exc:
+                    raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
+                self._apply_custom_compilation(config, compiled, custom_data)
         raw_key = "gl_" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")
         config["deployment_key"] = raw_key
         deployment = self.store.upsert_web_deployment(

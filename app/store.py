@@ -1632,6 +1632,11 @@ class SqliteStore:
             "allow_add": bool(payload.get("allow_add", config.get("allow_add", False))),
         })
         if deployment.get("strategy_code") == "CUSTOM_AI_V1":
+            # Persist the visual workflow whenever the client submits it.
+            # Previously settings updates kept the old workflow even though
+            # the frontend had sent the edited graph successfully.
+            if isinstance(payload.get("workflow"), dict):
+                config["workflow"] = payload["workflow"]
             if "open_logic" in payload:
                 config["open_logic"] = str(payload.get("open_logic") or "").strip()
             if "position_logic" in payload:
