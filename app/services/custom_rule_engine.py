@@ -235,7 +235,7 @@ _ALLOWED_FUNCTIONS = {
 }
 _OPEN_NAMES = {"bid", "ask", "true", "false"}
 _POSITION_NAMES = _OPEN_NAMES | {
-    "side", "open_price", "current_price", "sl", "tp", "volume", "profit", "favorable_move",
+    "side", "open_price", "current_price", "sl", "tp", "volume", "profit", "favorable_move", "stop_distance",
 }
 
 
@@ -348,6 +348,7 @@ class _RuleContext:
                 if self.position.side == "BUY"
                 else self.position.open_price - self.position.current_price
             ),
+            "stop_distance": abs(self.position.current_price - self.position.sl) if self.position.sl else 0,
         }
         if normalized not in mapping:
             raise RulePlanError(f"unknown_rule_name:{name}")
