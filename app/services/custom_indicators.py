@@ -17,6 +17,24 @@ class IndicatorDefinition:
     description: str
 
 
+@dataclass(frozen=True)
+class IndicatorOutputDefinition:
+    """Editor/runtime capabilities of one logical indicator output."""
+
+    component: str
+    title: str
+    column_prefix: str
+    value_type: str
+    comparison_group: str
+    operators: tuple[str, ...]
+    right_operand_kinds: tuple[str, ...]
+    compatible_groups: tuple[str, ...]
+    condition_kinds: tuple[str, ...]
+    minimum_points: int = 1
+    default_constant: float | None = None
+    constant_options: tuple[tuple[float, str], ...] = ()
+
+
 INDICATOR_DEFINITIONS = (
     IndicatorDefinition("ema", "EMA 指数移动平均线", {"length": 20}, "趋势与交叉判断"),
     IndicatorDefinition("sma", "SMA（MA）简单移动平均线", {"length": 20}, "策略中写 MA 时按 SMA 计算"),
@@ -68,6 +86,202 @@ INDICATOR_DEFINITIONS = (
     IndicatorDefinition("qstick", "QStick K线动量", {"length": 10}, "开收盘动量判断"),
     IndicatorDefinition("bias", "BIAS 乖离率", {"length": 26}, "价格偏离均线程度判断"),
 )
+
+
+_COMPARISON_OPERATORS = ("gt", "gte", "lt", "lte", "eq", "neq")
+_SERIES_CONDITIONS = ("comparison", "cross", "consecutive", "indicator_trend")
+_STATE_CONDITIONS = ("comparison", "consecutive")
+
+
+def _numeric_output(
+    component: str = "value",
+    title: str = "指标值",
+    *,
+    column_prefix: str = "",
+    value_type: str = "numeric",
+    group: str,
+    compatible_groups: tuple[str, ...] | None = None,
+    default_constant: float | None = None,
+    allow_cross: bool = True,
+) -> IndicatorOutputDefinition:
+    return IndicatorOutputDefinition(
+        component=component,
+        title=title,
+        column_prefix=column_prefix,
+        value_type=value_type,
+        comparison_group=group,
+        operators=_COMPARISON_OPERATORS,
+        right_operand_kinds=("constant", "indicator"),
+        compatible_groups=compatible_groups or (group,),
+        condition_kinds=_SERIES_CONDITIONS if allow_cross else _STATE_CONDITIONS,
+        minimum_points=2 if allow_cross else 1,
+        default_constant=default_constant,
+    )
+
+
+def _price_output(
+    component: str = "value",
+    title: str = "指标线",
+    *,
+    column_prefix: str = "",
+) -> IndicatorOutputDefinition:
+    return IndicatorOutputDefinition(
+        component=component,
+        title=title,
+        column_prefix=column_prefix,
+        value_type="price_line",
+        comparison_group="price",
+        operators=_COMPARISON_OPERATORS,
+        right_operand_kinds=("constant", "indicator", "market_price", "candle"),
+        compatible_groups=("price",),
+        condition_kinds=_SERIES_CONDITIONS,
+        minimum_points=2,
+    )
+
+
+def _state_output(
+    component: str,
+    title: str,
+    *,
+    column_prefix: str,
+    value_type: str = "state",
+    default_constant: float | None = None,
+    constant_options: tuple[tuple[float, str], ...] = (),
+) -> IndicatorOutputDefinition:
+    return IndicatorOutputDefinition(
+        component=component,
+        title=title,
+        column_prefix=column_prefix,
+        value_type=value_type,
+        comparison_group=f"state:{component}",
+        operators=("eq", "neq"),
+        right_operand_kinds=("constant",),
+        compatible_groups=(),
+        condition_kinds=_STATE_CONDITIONS,
+        minimum_points=1,
+        default_constant=default_constant,
+        constant_options=constant_options,
+    )
+
+
+# This is deliberately explicit. It is the single source of truth used by the
+# visual editor and, later, by workflow validation/execution. Adding an
+# indicator without adding its output capabilities must fail the tests.
+_INDICATOR_OUTPUTS: dict[str, tuple[IndicatorOutputDefinition, ...]] = {
+    "ema": (_price_output(title="EMA线"),),
+    "sma": (_price_output(title="SMA（MA）线"),),
+    "wma": (_price_output(title="WMA线"),),
+    "rsi": (_numeric_output(title="RSI值", group="rsi", default_constant=50),),
+    "atr": (_numeric_output(title="ATR值", value_type="volatility", group="true_range"),),
+    "macd": (
+        _numeric_output("macd", "MACD线", column_prefix="MACD_", group="macd", default_constant=0),
+        _numeric_output("histogram", "柱状值", column_prefix="MACDh_", group="macd", default_constant=0),
+        _numeric_output("signal", "信号线", column_prefix="MACDs_", group="macd", default_constant=0),
+    ),
+    "bbands": (
+        _price_output("lower", "下轨", column_prefix="BBL_"),
+        _price_output("middle", "中轨", column_prefix="BBM_"),
+        _price_output("upper", "上轨", column_prefix="BBU_"),
+        _numeric_output("bandwidth", "带宽", column_prefix="BBB_", value_type="ratio", group="bbands_ratio", default_constant=0),
+        _numeric_output("percent", "百分比位置", column_prefix="BBP_", value_type="ratio", group="bbands_ratio", default_constant=0.5),
+    ),
+    "stoch": (
+        _numeric_output("k", "K值", column_prefix="STOCHk_", value_type="bounded_oscillator", group="stoch", default_constant=50),
+        _numeric_output("d", "D值", column_prefix="STOCHd_", value_type="bounded_oscillator", group="stoch", default_constant=50),
+    ),
+    "adx": (
+        _numeric_output("adx", "ADX值", column_prefix="ADX_", value_type="trend_strength", group="adx", default_constant=25),
+        _numeric_output("plus_di", "+DI", column_prefix="DMP_", value_type="directional_movement", group="di", default_constant=0),
+        _numeric_output("minus_di", "-DI", column_prefix="DMN_", value_type="directional_movement", group="di", default_constant=0),
+    ),
+    "cci": (_numeric_output(title="CCI值", group="cci", default_constant=0),),
+    "roc": (_numeric_output(title="ROC值", value_type="ratio", group="roc", default_constant=0),),
+    "mom": (_numeric_output(title="动量值", group="momentum", default_constant=0),),
+    "dema": (_price_output(title="DEMA线"),),
+    "tema": (_price_output(title="TEMA线"),),
+    "hma": (_price_output(title="HMA线"),),
+    "kama": (_price_output(title="KAMA线"),),
+    "rma": (_price_output(title="RMA线"),),
+    "zlma": (_price_output(title="ZLMA线"),),
+    "vwma": (_price_output(title="VWMA线"),),
+    "supertrend": (
+        _price_output("trend", "趋势线", column_prefix="SUPERT_"),
+        _state_output(
+            "direction", "趋势方向", column_prefix="SUPERTd_", value_type="direction", default_constant=1,
+            constant_options=((1, "多头"), (-1, "空头")),
+        ),
+        _price_output("long", "多头趋势线", column_prefix="SUPERTl_"),
+        _price_output("short", "空头趋势线", column_prefix="SUPERTs_"),
+    ),
+    "psar": (
+        _price_output("long", "多头SAR", column_prefix="PSARl_"),
+        _price_output("short", "空头SAR", column_prefix="PSARs_"),
+        _numeric_output("acceleration", "加速因子", column_prefix="PSARaf_", group="psar_af", allow_cross=False),
+        _state_output(
+            "reversal", "反转信号", column_prefix="PSARr_", value_type="boolean", default_constant=1,
+            constant_options=((1, "出现"), (0, "未出现")),
+        ),
+    ),
+    "aroon": (
+        _numeric_output("down", "Aroon Down", column_prefix="AROOND_", value_type="bounded_oscillator", group="aroon", default_constant=50),
+        _numeric_output("up", "Aroon Up", column_prefix="AROONU_", value_type="bounded_oscillator", group="aroon", default_constant=50),
+        _numeric_output("oscillator", "Aroon振荡值", column_prefix="AROONOSC_", group="aroon", default_constant=0),
+    ),
+    "vortex": (
+        _numeric_output("plus", "+VI", column_prefix="VTXP_", group="vortex", default_constant=1),
+        _numeric_output("minus", "-VI", column_prefix="VTXM_", group="vortex", default_constant=1),
+    ),
+    "stochrsi": (
+        _numeric_output("k", "K值", column_prefix="STOCHRSIk_", value_type="bounded_oscillator", group="stochrsi", default_constant=50),
+        _numeric_output("d", "D值", column_prefix="STOCHRSId_", value_type="bounded_oscillator", group="stochrsi", default_constant=50),
+    ),
+    "mfi": (_numeric_output(title="MFI值", value_type="bounded_oscillator", group="mfi", default_constant=50),),
+    "willr": (_numeric_output(title="Williams %R值", value_type="bounded_oscillator", group="willr", default_constant=-50),),
+    "cmo": (_numeric_output(title="CMO值", value_type="bounded_oscillator", group="cmo", default_constant=0),),
+    "trix": (
+        _numeric_output("trix", "TRIX线", column_prefix="TRIX_", group="trix", default_constant=0),
+        _numeric_output("signal", "信号线", column_prefix="TRIXs_", group="trix", default_constant=0),
+    ),
+    "tsi": (
+        _numeric_output("tsi", "TSI线", column_prefix="TSI_", group="tsi", default_constant=0),
+        _numeric_output("signal", "信号线", column_prefix="TSIs_", group="tsi", default_constant=0),
+    ),
+    "ppo": (
+        _numeric_output("ppo", "PPO线", column_prefix="PPO_", value_type="ratio", group="ppo", default_constant=0),
+        _numeric_output("histogram", "柱状值", column_prefix="PPOh_", value_type="ratio", group="ppo", default_constant=0),
+        _numeric_output("signal", "信号线", column_prefix="PPOs_", value_type="ratio", group="ppo", default_constant=0),
+    ),
+    "ao": (_numeric_output(title="AO值", group="ao", default_constant=0),),
+    "uo": (_numeric_output(title="UO值", value_type="bounded_oscillator", group="uo", default_constant=50),),
+    "kc": (
+        _price_output("lower", "下轨", column_prefix="KCL"),
+        _price_output("middle", "中轨", column_prefix="KCB"),
+        _price_output("upper", "上轨", column_prefix="KCU"),
+    ),
+    "donchian": (
+        _price_output("lower", "下轨", column_prefix="DCL_"),
+        _price_output("middle", "中轨", column_prefix="DCM_"),
+        _price_output("upper", "上轨", column_prefix="DCU_"),
+    ),
+    "natr": (_numeric_output(title="NATR值", value_type="ratio", group="natr", default_constant=0),),
+    "true_range": (_numeric_output(title="真实波幅", value_type="volatility", group="true_range"),),
+    "obv": (_numeric_output(title="OBV值", value_type="volume_flow", group="obv"),),
+    "ad": (_numeric_output(title="AD值", value_type="volume_flow", group="ad"),),
+    "cmf": (_numeric_output(title="CMF值", value_type="volume_flow", group="cmf", default_constant=0),),
+    "efi": (_numeric_output(title="EFI值", value_type="volume_flow", group="efi", default_constant=0),),
+    "eom": (_numeric_output(title="EOM值", value_type="volume_flow", group="eom", default_constant=0),),
+    "pvt": (_numeric_output(title="PVT值", value_type="volume_flow", group="pvt"),),
+    "chop": (_numeric_output(title="震荡指数", value_type="bounded_oscillator", group="chop", default_constant=50),),
+    "fisher": (
+        _numeric_output("fisher", "Fisher线", column_prefix="FISHERT_", group="fisher", default_constant=0),
+        _numeric_output("signal", "信号线", column_prefix="FISHERTs_", group="fisher", default_constant=0),
+    ),
+    "dpo": (_numeric_output(title="DPO值", group="dpo", default_constant=0),),
+    "linreg": (_price_output(title="线性回归线"),),
+    "slope": (_numeric_output(title="斜率", group="slope", default_constant=0),),
+    "qstick": (_numeric_output(title="QStick值", value_type="price_delta", group="qstick", default_constant=0),),
+    "bias": (_numeric_output(title="乖离率", value_type="ratio", group="bias", default_constant=0),),
+}
 
 _DEFINITIONS = {item.name: item for item in INDICATOR_DEFINITIONS}
 _ALIASES = {
@@ -139,9 +353,43 @@ def public_indicator_catalog() -> list[dict[str, Any]]:
                 for name, default in item.default_params.items()
             ],
             "sources": list(_PRICE_SOURCES) if item.name in _SINGLE_SERIES_INDICATORS else [],
+            "outputs": [_public_output(output) for output in _INDICATOR_OUTPUTS[item.name]],
         }
         for item in INDICATOR_DEFINITIONS
     ]
+
+
+def indicator_output_capability(name: str, component: str = "value") -> IndicatorOutputDefinition | None:
+    normalized_name = _ALIASES.get(str(name or "").strip().lower(), str(name or "").strip().lower())
+    normalized_component = str(component or "value").strip().lower()
+    return next(
+        (
+            output
+            for output in _INDICATOR_OUTPUTS.get(normalized_name, ())
+            if output.component == normalized_component
+        ),
+        None,
+    )
+
+
+def _public_output(output: IndicatorOutputDefinition) -> dict[str, Any]:
+    return {
+        "component": output.component,
+        "title": output.title,
+        "column_prefix": output.column_prefix,
+        "value_type": output.value_type,
+        "comparison_group": output.comparison_group,
+        "operators": list(output.operators),
+        "right_operand_kinds": list(output.right_operand_kinds),
+        "compatible_groups": list(output.compatible_groups),
+        "condition_kinds": list(output.condition_kinds),
+        "minimum_points": output.minimum_points,
+        "default_constant": output.default_constant,
+        "constant_options": [
+            {"value": value, "label": label}
+            for value, label in output.constant_options
+        ],
+    }
 
 
 def required_candle_count(specs: list[dict[str, Any]]) -> int:

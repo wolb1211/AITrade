@@ -207,6 +207,7 @@ def test_authenticated_vip_user_can_create_strategy(tmp_path: Path) -> None:
 class FakeCustomStrategyCompiler:
     def __init__(self) -> None:
         self.compile_calls = 0
+        self.workflow_calls: list[dict[str, Any]] = []
 
     def compile_custom_strategy(self, deployment: dict[str, Any]) -> dict[str, Any]:
         self.compile_calls += 1
@@ -230,6 +231,25 @@ class FakeCustomStrategyCompiler:
         if not isinstance(content, dict) or not content.get("open_prompt_template") or not content.get("position_prompt_template"):
             raise RuntimeError("invalid_custom_strategy_compilation")
         return dict(content)
+
+    def generate_custom_workflow_stage(self, deployment: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        self.workflow_calls.append({"deployment": deployment, **kwargs})
+        stage = str(kwargs["stage"])
+        entry_id = f"{stage}_entry"
+        action_id = f"{stage}_action"
+        return {
+            "stage": {
+                "entry_node_id": entry_id,
+                "data_requirements": kwargs["data_requirements"],
+                "nodes": [
+                    {"id": entry_id, "type": "entry", "stage": stage, "label": "入口"},
+                    {"id": action_id, "type": "action", "label": "不操作", "action": {"kind": "no_action"}},
+                ],
+                "edges": [{"id": f"{stage}_edge", "source": entry_id, "target": action_id, "source_handle": "next"}],
+            },
+            "source_text": kwargs["user_logic"],
+            "repaired": False,
+        }
 
 
 def test_custom_strategy_is_previewed_before_key_is_created(tmp_path: Path) -> None:
@@ -264,6 +284,32 @@ def test_custom_strategy_is_previewed_before_key_is_created(tmp_path: Path) -> N
     assert saved["config"]["open_prompt_template"] == preview["open_prompt_template"]
     assert saved["config"]["ea_description"] == "EA显示的均线策略说明"
     assert service.store.get_user_portal_data(prepared["user_id"])["strategies"][0]["ea_description"] == "EA显示的均线策略说明"
+
+
+def test_workflow_generation_does_not_create_a_strategy(tmp_path: Path) -> None:
+    service, email = create_service(tmp_path)
+    compiler = FakeCustomStrategyCompiler()
+    service.ai_client = compiler
+    prepared = service.register(email="workflow@example.com", password="Password123")
+    session = service.verify_registration(email="workflow@example.com", code=email.codes[("workflow@example.com", "register")])
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    with service.store._connect() as connection:
+        connection.execute("UPDATE users SET vip_level = 1, vip_expires_at = ? WHERE id = ?", (expires_at, prepared["user_id"]))
+    endpoint = service.store.save_ai_endpoint({
+        "id": "aie_workflow", "owner_type": "gl", "name": "流程模型", "base_url": "https://example.com/v1",
+        "model": "qwen-plus", "api_key": "sk-platform", "enabled": True, "selectable_by_user": True,
+    })
+    generated = service.generate_custom_workflow_stage(session["token"], payload={
+        "stage": "open", "user_logic": "EMA5上穿EMA30时开多", "ai_mode": "official",
+        "ai_endpoint_id": endpoint["id"],
+        "data_requirements": {"data_type": "kline", "kline_count": 100, "call_mode": "bar", "call_value": 1},
+    })
+    assert generated["stage"]["entry_node_id"] == "open_entry"
+    assert generated["generation_model"] == "qwen-plus"
+    assert generated["customer_billed"] is False
+    assert compiler.workflow_calls[0]["stage"] == "open"
+    assert compiler.workflow_calls[0]["deployment"]["user_id"] == ""
+    assert service.store.list_web_deployments(str(prepared["user_id"])) == []
 
 
 def test_agent_invite_registration_and_dashboard(tmp_path: Path) -> None:

@@ -23,7 +23,9 @@ from app.services.ai_service import (
 from app.services.custom_indicators import (
     INDICATOR_DEFINITIONS,
     calculate_indicator_payload,
+    indicator_output_capability,
     normalize_indicator_specs,
+    public_indicator_catalog,
     required_candle_count,
 )
 from app.store import SqliteStore
@@ -178,6 +180,43 @@ def test_every_published_indicator_has_runtime_output() -> None:
         assert unsupported == [], definition.name
         assert payload["values"], definition.name
         assert payload["timestamps"], definition.name
+
+
+def test_every_published_indicator_has_editor_output_capabilities() -> None:
+    catalog = public_indicator_catalog()
+    assert {item["name"] for item in catalog} == {item.name for item in INDICATOR_DEFINITIONS}
+    for indicator in catalog:
+        assert indicator["outputs"], indicator["name"]
+        components = [output["component"] for output in indicator["outputs"]]
+        assert len(components) == len(set(components)), indicator["name"]
+        for output in indicator["outputs"]:
+            assert output["title"]
+            assert output["value_type"]
+            assert output["comparison_group"]
+            assert output["operators"]
+            assert output["right_operand_kinds"]
+            assert output["condition_kinds"]
+            assert output["minimum_points"] >= 1
+
+
+def test_indicator_capabilities_restrict_comparison_targets_by_semantics() -> None:
+    ema = indicator_output_capability("ema")
+    assert ema is not None
+    assert ema.comparison_group == "price"
+    assert {"market_price", "candle", "indicator", "constant"} <= set(ema.right_operand_kinds)
+    assert "cross" in ema.condition_kinds
+
+    macd_histogram = indicator_output_capability("macd", "histogram")
+    assert macd_histogram is not None
+    assert macd_histogram.default_constant == 0
+    assert set(macd_histogram.right_operand_kinds) == {"constant", "indicator"}
+    assert "price" not in macd_histogram.compatible_groups
+
+    supertrend_direction = indicator_output_capability("supertrend", "direction")
+    assert supertrend_direction is not None
+    assert supertrend_direction.operators == ("eq", "neq")
+    assert supertrend_direction.right_operand_kinds == ("constant",)
+    assert supertrend_direction.constant_options == ((1, "多头"), (-1, "空头"))
 
 
 class _FakeAiClient:

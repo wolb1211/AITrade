@@ -3875,6 +3875,23 @@ class SqliteStore:
             ).fetchone()
         return self._private_ai_endpoint_row(row) if row else None
 
+    def get_gl_ai_endpoint_by_model(self, model: str) -> dict[str, Any] | None:
+        normalized = str(model or "").strip().lower()
+        if not normalized:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM ai_endpoints
+                WHERE owner_type = 'gl' AND enabled = 1 AND api_key <> '' AND LOWER(model) = ?
+                ORDER BY is_default DESC, sort ASC, updated_at DESC
+                LIMIT 1
+                """,
+                (normalized,),
+            ).fetchone()
+        return self._private_ai_endpoint_row(row) if row else None
+
     def delete_ai_endpoint(self, endpoint_id: str) -> None:
         with self._connect() as connection:
             official_reference = connection.execute(
@@ -4665,6 +4682,8 @@ class SqliteStore:
                 "open_rule_plan": dict(config.get("open_rule_plan") or {}),
                 "position_rule_plan": dict(config.get("position_rule_plan") or {}),
                 "rule_engine_version": int(config.get("rule_engine_version") or 0),
+                "workflow": dict(config.get("workflow") or {}),
+                "compiled_workflow": dict(config.get("compiled_workflow") or {}),
                 "unsupported_indicators": list(config.get("unsupported_indicators") or []),
                 "compile_status": str(config.get("compile_status") or ""),
                 "open_ai_mode": open_ai_mode,
@@ -6427,6 +6446,15 @@ class SqliteStore:
             value = config.get(key)
             return value if isinstance(value, list) else []
 
+        workflow = dict(config.get("workflow") or {})
+        compiled_workflow = dict(config.get("compiled_workflow") or {})
+        unsupported_conditions = list_value("unsupported_conditions")
+        if workflow:
+            unsupported_conditions = [
+                item for item in unsupported_conditions
+                if not isinstance(item, dict) or str(item.get("code") or "") != "rule_plan_unavailable"
+            ]
+
         return {
             "id": str(data.get("id") or ""),
             "user_id": str(data.get("user_id") or ""),
@@ -6449,10 +6477,10 @@ class SqliteStore:
             "open_rule_plan": dict(config.get("open_rule_plan") or {}),
             "position_rule_plan": dict(config.get("position_rule_plan") or {}),
             "rule_engine_version": int(config.get("rule_engine_version") or 0),
-            "unsupported_conditions": list_value("unsupported_conditions"),
-            "unsupported_condition_count": int(
-                config.get("unsupported_condition_count") or len(list_value("unsupported_conditions"))
-            ),
+            "workflow": workflow,
+            "compiled_workflow": compiled_workflow,
+            "unsupported_conditions": unsupported_conditions,
+            "unsupported_condition_count": len(unsupported_conditions),
             "visual_conditions": list_value("visual_conditions"),
             "unsupported_indicators": list_value("unsupported_indicators"),
             "warnings": list_value("warnings"),
