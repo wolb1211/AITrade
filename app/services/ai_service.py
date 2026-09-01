@@ -2494,12 +2494,29 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
             count = min(len(left), len(right))
             left, right = left[-count:], right[-count:]
             relation = ["above" if a > b else "below" if a < b else "equal" for a, b in zip(left, right)]
-            cross_up = any(relation[i - 1] in {"below", "equal"} and relation[i] == "above" for i in range(1, len(relation)))
-            cross_down = any(relation[i - 1] in {"above", "equal"} and relation[i] == "below" for i in range(1, len(relation)))
+            # Limit crossover facts to the condition's requested lookback.
+            # The previous implementation scanned the complete indicator
+            # history, which could report both an old up-cross and down-cross
+            # for a single condition.
+            lookback = max(1, int(condition.get("lookback") or condition.get("count") or 1))
+            recent_relation = relation[-lookback:]
+            cross_events: list[dict[str, Any]] = []
+            for index in range(1, len(recent_relation)):
+                previous, current = recent_relation[index - 1], recent_relation[index]
+                if previous in {"below", "equal"} and current == "above":
+                    cross_events.append({"direction": "up", "index": -len(recent_relation) + index})
+                elif previous in {"above", "equal"} and current == "below":
+                    cross_events.append({"direction": "down", "index": -len(recent_relation) + index})
+            latest_cross = cross_events[-1]["direction"] if cross_events else None
+            cross_up = any(item["direction"] == "up" for item in cross_events)
+            cross_down = any(item["direction"] == "down" for item in cross_events)
             operator = condition.get("operator") or "gt"
             a, b = left[-1], right[-1]
             result = {"gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b, "eq": a == b, "neq": a != b}.get(operator)
-            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_left": a, "latest_right": b, "operator": operator, "condition_result": result, "latest_relation": relation[-1], "relations_oldest_to_latest": relation, "cross_up": cross_up, "cross_down": cross_down})
+            if condition.get("kind") == "cross":
+                expected = "up" if condition.get("direction") == "above" else "down"
+                result = (latest_cross == expected) if condition.get("cross_mode") == "latest" else (cross_up if expected == "up" else cross_down)
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_left": a, "latest_right": b, "operator": operator, "condition_result": result, "latest_relation": relation[-1], "relations_oldest_to_latest": recent_relation, "lookback": lookback, "cross_up": cross_up, "cross_down": cross_down, "latest_cross": latest_cross, "cross_events": cross_events})
         elif left_key and left:
             facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1]})
     return facts
