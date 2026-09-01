@@ -2818,16 +2818,17 @@ def _format_request_snapshot(
 
 def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) -> str:
     indicators = user_payload.get("indicators")
-    if not isinstance(indicators, dict):
+    computed_facts = user_payload.get("computed_facts")
+    if not isinstance(indicators, dict) and not computed_facts:
         return preview
-    recent_values = indicators.get("recent_values")
-    if not recent_values:
+    snapshot_data: dict[str, Any] = {}
+    if isinstance(indicators, dict) and indicators.get("recent_values"):
+        snapshot_data["recent_values"] = indicators["recent_values"]
+    if isinstance(computed_facts, list) and computed_facts:
+        snapshot_data["computed_facts"] = computed_facts
+    if not snapshot_data:
         return preview
-    snapshot = json.dumps(
-        {"recent_values": recent_values or {}},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    snapshot = json.dumps(snapshot_data, ensure_ascii=False, separators=(",", ":"))
     return f"请求指标快照:\n{snapshot}\n\n{preview}"[:4000]
 
 
