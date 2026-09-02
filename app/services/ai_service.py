@@ -2483,7 +2483,17 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
     try:
         lookback = max(1, int(target.get("lookback") or 1))
         recent = candles[-lookback:]
-        values = [float(item["high" if target["kind"] == "recent_high" else "low"]) for item in recent if isinstance(item, dict) and item.get("high" if target["kind"] == "recent_high" else "low") is not None]
+        field = "high" if target["kind"] == "recent_high" else "low"
+        values = []
+        for item in recent:
+            if not isinstance(item, dict):
+                continue
+            raw_value = item.get(field)
+            # Runtime compact candles use h/l; accept both representations.
+            if raw_value is None:
+                raw_value = item.get("h" if field == "high" else "l")
+            if raw_value is not None:
+                values.append(float(raw_value))
         if values:
             content["sl"] = max(values) if target["kind"] == "recent_high" else min(values)
             content.setdefault("reason", "已按流程图止损规则设置保护价")
