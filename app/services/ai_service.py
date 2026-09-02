@@ -1106,6 +1106,7 @@ class AiDecisionClient:
                         response_preview=_format_response_preview(raw=original_response_content or response_content),
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
+            content = _apply_workflow_action_defaults(endpoint, user_payload, content)
             response_preview = _with_indicator_request_preview(
                 _format_response_preview(raw=response_content, parsed=content),
                 user_payload,
@@ -2459,6 +2460,36 @@ def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict
             "description": action.get("description") or node.get("label"),
         })
     return actions
+
+
+def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any], content: dict[str, Any]) -> dict[str, Any]:
+    """Fill explicit workflow price targets when the model omits them."""
+    if endpoint != "open" or not isinstance(content, dict) or content.get("sl") not in (None, ""):
+        return content
+    direction = str(content.get("direction") or "").lower()
+    actions = user_payload.get("workflow_actions")
+    candles = user_payload.get("candles")
+    if direction not in {"buy", "sell"} or not isinstance(actions, list) or not isinstance(candles, list):
+        return content
+    selected = next((item for item in actions if isinstance(item, dict) and item.get("kind") == ("open_buy" if direction == "buy" else "open_sell")), None)
+    target = selected.get("stop_loss") if isinstance(selected, dict) and isinstance(selected.get("stop_loss"), dict) else None
+    if not target:
+        rule = str(selected.get("stop_loss_rule") or "") if isinstance(selected, dict) else ""
+        match = re.search(r"recent_(high|low)\s*\(\s*(\d+)\s*\)", rule, re.IGNORECASE)
+        if match:
+            target = {"kind": f"recent_{match.group(1).lower()}", "lookback": int(match.group(2))}
+    if not target or target.get("kind") not in {"recent_high", "recent_low"}:
+        return content
+    try:
+        lookback = max(1, int(target.get("lookback") or 1))
+        recent = candles[-lookback:]
+        values = [float(item["high" if target["kind"] == "recent_high" else "low"]) for item in recent if isinstance(item, dict) and item.get("high" if target["kind"] == "recent_high" else "low") is not None]
+        if values:
+            content["sl"] = max(values) if target["kind"] == "recent_high" else min(values)
+            content.setdefault("reason", "已按流程图止损规则设置保护价")
+    except (TypeError, ValueError, KeyError):
+        pass
+    return content
 
 
 def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any], runtime: dict[str, Any] | None = None) -> list[dict[str, Any]]:
