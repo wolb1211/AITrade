@@ -1622,6 +1622,18 @@ def _normalize_generated_workflow_stage(
             )
             if explicit_stop:
                 action["stop_loss_rule"] = explicit_stop
+                # Keep an explicit recent-extreme rule machine-readable as
+                # well as human-readable, so runtime can calculate the price
+                # without relying on the model to do arithmetic.
+                extreme = re.search(r"recent_(high|low)\s*\(\s*(\d+)\s*\)", explicit_stop, re.IGNORECASE)
+                if extreme:
+                    action["stop_loss"] = {
+                        "kind": f"recent_{extreme.group(1).lower()}",
+                        "lookback": int(extreme.group(2)),
+                        "operation": "none",
+                        "offset_value": 0,
+                        "atr_multiplier": 0,
+                    }
     cross_nodes = [
         node for node in nodes
         if node.get("type") == "condition"
