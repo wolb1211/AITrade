@@ -538,6 +538,7 @@ class AiDecisionClient:
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
                 "computed_facts": _workflow_computed_facts(config, "open", indicators),
+                "workflow_actions": _workflow_action_specs(config, "open"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "open"),
                 "required_json_schema": {
@@ -594,6 +595,7 @@ class AiDecisionClient:
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
                 "computed_facts": _workflow_computed_facts(config, "position", indicators, {"position": ([item.model_dump(mode="json") for item in request_payload.positions] or [{}])[0]}),
+                "workflow_actions": _workflow_action_specs(config, "position"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
                 "required_json_schema": {
@@ -2435,6 +2437,30 @@ def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any
     return f"{cleaned}\n\n{guardrails}".strip()
 
 
+def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict[str, Any]]:
+    """Expose confirmed action-node parameters explicitly to the runtime AI."""
+    compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
+    stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
+    nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
+    actions: list[dict[str, Any]] = []
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict) or node.get("type") != "action":
+            continue
+        action = node.get("action") if isinstance(node.get("action"), dict) else {}
+        actions.append({
+            "node_id": node_id,
+            "kind": action.get("kind"),
+            "entry_mode": action.get("entry_mode"),
+            "target": action.get("target"),
+            "stop_loss": action.get("stop_loss"),
+            "take_profit": action.get("take_profit"),
+            "stop_loss_rule": action.get("stop_loss_rule"),
+            "take_profit_rule": action.get("take_profit_rule"),
+            "description": action.get("description") or node.get("label"),
+        })
+    return actions
+
+
 def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any], runtime: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Derive objective comparison/crossover facts from a compiled workflow.
 
@@ -2836,13 +2862,16 @@ def _format_request_snapshot(
 def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) -> str:
     indicators = user_payload.get("indicators")
     computed_facts = user_payload.get("computed_facts")
-    if not isinstance(indicators, dict) and not computed_facts:
+    workflow_actions = user_payload.get("workflow_actions")
+    if not isinstance(indicators, dict) and not computed_facts and not workflow_actions:
         return preview
     snapshot_data: dict[str, Any] = {}
     if isinstance(indicators, dict) and indicators.get("recent_values"):
         snapshot_data["recent_values"] = indicators["recent_values"]
     if isinstance(computed_facts, list) and computed_facts:
         snapshot_data["computed_facts"] = computed_facts
+    if isinstance(workflow_actions, list) and workflow_actions:
+        snapshot_data["workflow_actions"] = workflow_actions
     if not snapshot_data:
         return preview
     snapshot = json.dumps(snapshot_data, ensure_ascii=False, separators=(",", ":"))
