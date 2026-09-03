@@ -2548,7 +2548,8 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
         if not raw:
             canonical = str(key).replace("_", "").lower()
             for candidate, candidate_values in values.items():
-                if str(candidate).replace("_", "").lower() == canonical:
+                candidate_key = str(candidate).replace("_", "").lower()
+                if candidate_key == canonical or candidate_key.startswith(canonical) or canonical.startswith(candidate_key):
                     raw = candidate_values
                     break
         if not isinstance(raw, list): return []
