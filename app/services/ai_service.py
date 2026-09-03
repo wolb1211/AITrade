@@ -2506,7 +2506,10 @@ def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators
 
 def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dict[str, Any]) -> dict[str, Any]:
     """Execute an explicit, satisfied trailing-stop rule when AI says hold."""
-    if not isinstance(content, dict) or content.get("action") not in {None, "", "hold"}:
+    # A model may correctly choose ``modify`` but echo the old stop price (or
+    # calculate it incorrectly).  For explicit trailing-stop rules the server
+    # must normalize both hold and modify responses to the workflow formula.
+    if not isinstance(content, dict) or content.get("action") not in {None, "", "hold", "modify"}:
         return content
     facts = user_payload.get("position_facts")
     actions = user_payload.get("workflow_actions")
