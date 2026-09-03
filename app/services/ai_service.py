@@ -2550,16 +2550,16 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
             try: return [float(operand.get("value"))]
             except (TypeError, ValueError): return []
         mapping = {"open_price": "open_price", "current_price": "current_price", "sl": "sl", "tp": "tp", "profit": "profit", "volume": "volume"}
-        if kind == "position" and name in mapping:
+        if kind in {"position", "derived"} and name in mapping:
             try: return [float(position.get(mapping[name]))]
             except (TypeError, ValueError): return []
-        if kind == "position" and name == "price_open_distance":
+        if kind in {"position", "derived"} and name == "price_open_distance":
             try: return [float(position["current_price"]) - float(position["open_price"])]
             except (KeyError, TypeError, ValueError): return []
-        if kind == "position" and name == "price_sl_distance":
+        if kind in {"position", "derived"} and name == "price_sl_distance":
             try: return [float(position["current_price"]) - float(position["sl"])]
             except (KeyError, TypeError, ValueError): return []
-        if kind == "position" and name == "price_tp_distance":
+        if kind in {"position", "derived"} and name == "price_tp_distance":
             try: return [float(position["current_price"]) - float(position["tp"])]
             except (KeyError, TypeError, ValueError): return []
         return []
@@ -2569,7 +2569,7 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
         condition = node.get("condition") if isinstance(node.get("condition"), dict) else {}
         left_key, right_key = operand_key(condition.get("left")), operand_key(condition.get("right"))
         left, right = operand_values(condition.get("left")), operand_values(condition.get("right"))
-        if left_key and right_key and left and right:
+        if left and right:
             count = min(len(left), len(right))
             left, right = left[-count:], right[-count:]
             relation = ["above" if a > b else "below" if a < b else "equal" for a, b in zip(left, right)]
@@ -2596,7 +2596,7 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
                 expected = "up" if condition.get("direction") == "above" else "down"
                 result = (latest_cross == expected) if condition.get("cross_mode") == "latest" else (cross_up if expected == "up" else cross_down)
             facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_left": a, "latest_right": b, "operator": operator, "condition_result": result, "latest_relation": relation[-1], "relations_oldest_to_latest": recent_relation, "lookback": lookback, "cross_up": cross_up, "cross_down": cross_down, "latest_cross": latest_cross, "cross_events": cross_events})
-        elif left_key and left:
+        elif left:
             facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1]})
     return facts
 
