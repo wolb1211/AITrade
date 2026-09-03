@@ -2474,6 +2474,13 @@ def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators
     }
     if current is not None and position.open_price is not None:
         result["price_open_distance"] = float(current) - float(position.open_price)
+        if position.sl is not None:
+            if str(position.side).upper() == "BUY":
+                result["stop_before_breakeven"] = float(position.sl) < float(position.open_price)
+                result["stop_at_or_beyond_breakeven"] = float(position.sl) >= float(position.open_price)
+            else:
+                result["stop_before_breakeven"] = float(position.sl) > float(position.open_price)
+                result["stop_at_or_beyond_breakeven"] = float(position.sl) <= float(position.open_price)
     if current is not None and position.sl is not None:
         result["price_sl_distance"] = float(current) - float(position.sl)
     if current is not None and position.tp is not None:
