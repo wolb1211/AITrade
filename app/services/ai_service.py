@@ -2132,7 +2132,11 @@ def _custom_runtime_prompt(endpoint: str) -> str:
         "Do not add trend, confirmation, market-structure, score, risk-reward or safety conditions. Do not evaluate or "
         "optimize the strategy. If no explicit "
         "risk condition is met, hold. Use only hold, close, add or modify. Never close or add without a clear rule. "
-        "Indicator arrays are in indicators.values keyed by aliases such as atr14 and ema5, oldest to newest; [-1] "
+        "The computed_facts and position_facts objects are authoritative server-side evaluations of each workflow "
+        "condition and current position. Check every condition fact and follow the workflow branch sequence; never "
+        "stop after evaluating only the first trailing-stop or breakeven rule. A condition_result of true/false is "
+        "the server's result and must not be recomputed or contradicted from raw numbers. Indicator arrays are in "
+        "indicators.values keyed by aliases such as atr14 and ema5, oldest to newest; [-1] "
         "is the latest closed candle. Evaluate crossovers over exactly the user-requested candle window directly from "
         "those arrays, and infer requested candlestick patterns directly from OHLCV. In analysis, summarize each "
         "applicable position rule in short natural Chinese, identify the current user-defined stage when relevant, and "
@@ -2140,7 +2144,8 @@ def _custom_runtime_prompt(endpoint: str) -> str:
         "full arrays, formulas or intermediate calculation steps. "
         "ATR is a price distance, while position.profit is account-currency P/L: never "
         "compare them directly. For ATR-based favorable movement use BUY current_price-open_price and SELL "
-        "open_price-current_price. "
+        "open_price-current_price. Signed distance rules such as SELL current_price-open_price <= -0.5*ATR are valid "
+        "and must be evaluated with their sign; do not replace them with an absolute value. "
         "Preserve the sequence and priority explicitly written by the user. Use observable current position fields to "
         "determine whether a user-defined prior stage has completed. Apply a one-way stop restriction only if the user "
         "explicitly wrote one; otherwise a requested stop may tighten or loosen according to the user's rule. If multiple "
@@ -2516,10 +2521,14 @@ def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dic
     has_trailing_rule = "1 ATR" in rule_text and "当前价格" in rule_text and "0.5 ATR" in rule_text
     target_price: float | None = None
     reason = ""
-    if has_breakeven_rule and facts.get("stop_before_breakeven") and float(facts.get("open_distance_atr") or 0) >= 0.5:
+    open_distance_atr = float(facts.get("open_distance_atr") or 0)
+    sl_distance_atr = float(facts.get("sl_distance_atr") or 0)
+    favorable_half_atr = open_distance_atr >= 0.5 if side == "BUY" else open_distance_atr <= -0.5
+    favorable_one_atr = sl_distance_atr >= 1 if side == "BUY" else sl_distance_atr <= -1
+    if has_breakeven_rule and facts.get("stop_before_breakeven") and favorable_half_atr:
         target_price = float(open_price) + 0.2 if side == "BUY" else float(open_price) - 0.2
         reason = "已满足保本条件，按流程图移动止损"
-    elif has_trailing_rule and facts.get("stop_at_or_beyond_breakeven") and float(facts.get("sl_distance_atr") or 0) >= 1:
+    elif has_trailing_rule and facts.get("stop_at_or_beyond_breakeven") and favorable_one_atr:
         target_price = float(current) - float(atr) * 0.5 if side == "BUY" else float(current) + float(atr) * 0.5
         reason = "已满足 1 ATR 条件，按流程图移动止损"
     if target_price is None:
