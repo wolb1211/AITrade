@@ -2453,6 +2453,11 @@ def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any
 def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict[str, Any]]:
     """Expose confirmed action-node parameters explicitly to the runtime AI."""
     compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
+    if not compiled and isinstance(config.get("workflow"), dict):
+        try:
+            compiled = compile_workflow(config["workflow"])
+        except Exception:  # noqa: BLE001
+            compiled = {}
     stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
     nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
     actions: list[dict[str, Any]] = []
@@ -2521,6 +2526,11 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
     source of truth and visual/AI conditions are intentionally left unresolved.
     """
     compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
+    if not compiled and isinstance(config.get("workflow"), dict):
+        try:
+            compiled = compile_workflow(config["workflow"])
+        except Exception:  # noqa: BLE001
+            compiled = {}
     stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
     nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
     values = indicators.get("values") if isinstance(indicators.get("values"), dict) else {}
