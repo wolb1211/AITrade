@@ -475,7 +475,10 @@ def calculate_indicator_payload(
                 values[f"{spec['alias']}.{_component_name(str(column))}"] = result[column]
     if values.empty:
         return {"order": "oldest_to_latest", "timestamps": [], "values": {}}
-    valid = values.dropna(how="all").tail(max(10, min(int(output_count or 100), 300)))
+    # The caller derives this window from the workflow conditions. Keep a
+    # small minimum for crossover comparisons instead of always sending 10+
+    # historical values for every indicator.
+    valid = values.dropna(how="all").tail(max(3, min(int(output_count or 100), 300)))
     compact_values = {
         column: [_compact_number(item) for item in valid[column].tolist()]
         for column in valid.columns

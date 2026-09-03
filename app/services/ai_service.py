@@ -505,8 +505,8 @@ class AiDecisionClient:
         request_payload: OpenEvaluateRequest,
     ) -> AiCallResult | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        indicator_count = max(20, min(int(config.get("indicator_output_count") or 100), 300))
         candle_count = max(10, min(int(config.get("open_requested_kline_count") or config.get("open_kline_count") or 100), 1000))
+        indicator_count = _workflow_history_count(config, "open")
         indicators = calculate_indicator_payload(
             request_payload.candles,
             list(config.get("open_indicators") or []),
@@ -561,8 +561,8 @@ class AiDecisionClient:
         request_payload: PositionEvaluateRequest,
     ) -> AiCallResult | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        indicator_count = max(20, min(int(config.get("indicator_output_count") or 100), 300))
         candle_count = max(10, min(int(config.get("position_requested_kline_count") or config.get("position_kline_count") or 100), 1000))
+        indicator_count = _workflow_history_count(config, "position")
         indicators = calculate_indicator_payload(
             request_payload.candles,
             list(config.get("position_indicators") or []),
@@ -2704,6 +2704,41 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
         elif left:
             facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1]})
     return facts
+
+
+def _workflow_history_count(config: dict[str, Any], stage_name: str) -> int:
+    """Return the smallest useful indicator history for the confirmed graph.
+
+    The old runtime always sent 100 values for every indicator, even when a
+    graph only needed the latest crossover.  Derive the output window from
+    condition lookbacks/counts and indicator periods, with a small safety
+    buffer for crossover comparisons.
+    """
+    compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
+    stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
+    nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
+    needed = 3
+
+    def walk(value: Any) -> None:
+        nonlocal needed
+        if isinstance(value, dict):
+            kind = str(value.get("kind") or "")
+            if kind in {"cross", "comparison", "consecutive", "indicator_trend", "candle_pattern", "market_structure", "breakout", "atr_distance"}:
+                needed = max(needed, int(value.get("lookback") or 1), int(value.get("count") or 1))
+            if kind == "indicator":
+                params = value.get("params") if isinstance(value.get("params"), dict) else {}
+                needed = max(needed, int(params.get("length") or 1))
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(nodes)
+    # Keep enough points to show the requested comparisons while avoiding the
+    # previous 100-value payload.  Indicator calculations still use all EA
+    # candles internally; this only limits values serialized to the model.
+    return max(3, min(needed + 2, 60))
 
 
 def _custom_runtime_template(value: Any) -> str:
