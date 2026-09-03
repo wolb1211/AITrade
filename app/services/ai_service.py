@@ -2545,22 +2545,29 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
     def operand_values(operand: Any) -> list[float]:
         if not isinstance(operand, dict): return []
         kind, name = operand.get("kind"), str(operand.get("name") or "")
-        if kind == "indicator": return nums(operand_key(operand))
+        def transform(values: list[float]) -> list[float]:
+            try:
+                multiplier = float(operand.get("multiplier") or 1)
+                addend = float(operand.get("addend") or 0)
+                return [value * multiplier + addend for value in values]
+            except (TypeError, ValueError):
+                return values
+        if kind == "indicator": return transform(nums(operand_key(operand)))
         if kind == "constant":
-            try: return [float(operand.get("value"))]
+            try: return transform([float(operand.get("value"))])
             except (TypeError, ValueError): return []
         mapping = {"open_price": "open_price", "current_price": "current_price", "sl": "sl", "tp": "tp", "profit": "profit", "volume": "volume"}
         if kind in {"position", "derived"} and name in mapping:
-            try: return [float(position.get(mapping[name]))]
+            try: return transform([float(position.get(mapping[name]))])
             except (TypeError, ValueError): return []
         if kind in {"position", "derived"} and name == "price_open_distance":
-            try: return [float(position["current_price"]) - float(position["open_price"])]
+            try: return transform([float(position["current_price"]) - float(position["open_price"])])
             except (KeyError, TypeError, ValueError): return []
         if kind in {"position", "derived"} and name == "price_sl_distance":
-            try: return [float(position["current_price"]) - float(position["sl"])]
+            try: return transform([float(position["current_price"]) - float(position["sl"])])
             except (KeyError, TypeError, ValueError): return []
         if kind in {"position", "derived"} and name == "price_tp_distance":
-            try: return [float(position["current_price"]) - float(position["tp"])]
+            try: return transform([float(position["current_price"]) - float(position["tp"])])
             except (KeyError, TypeError, ValueError): return []
         return []
 
