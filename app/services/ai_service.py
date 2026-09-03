@@ -1108,6 +1108,8 @@ class AiDecisionClient:
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
             content = _apply_workflow_action_defaults(endpoint, user_payload, content)
+            if endpoint == "position":
+                content = _apply_workflow_position_defaults(user_payload, content)
             response_preview = _with_indicator_request_preview(
                 _format_response_preview(raw=response_content, parsed=content),
                 user_payload,
@@ -2466,6 +2468,7 @@ def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators
         atr = None
     result: dict[str, Any] = {
         "side": position.side,
+        "ticket": str(position.ticket),
         "open_price": position.open_price,
         "current_price": current,
         "sl": position.sl,
@@ -2494,6 +2497,38 @@ def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators
         result["threshold_0_5_atr"] = atr * 0.5
         result["threshold_1_atr"] = atr
     return result
+
+
+def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dict[str, Any]) -> dict[str, Any]:
+    """Execute an explicit, satisfied trailing-stop rule when AI says hold."""
+    if not isinstance(content, dict) or content.get("action") not in {None, "", "hold"}:
+        return content
+    facts = user_payload.get("position_facts")
+    actions = user_payload.get("workflow_actions")
+    if not isinstance(facts, dict) or not isinstance(actions, list):
+        return content
+    side = str(facts.get("side") or "").upper()
+    current, open_price, atr = facts.get("current_price"), facts.get("open_price"), facts.get("atr14_latest")
+    if side not in {"BUY", "SELL"} or not isinstance(current, (int, float)) or not isinstance(open_price, (int, float)) or not isinstance(atr, (int, float)) or atr <= 0:
+        return content
+    rule_text = " ".join(str(item.get("stop_loss_rule") or "") for item in actions if isinstance(item, dict) and item.get("kind") == "modify_sl")
+    has_breakeven_rule = "0.5 ATR" in rule_text and "开仓价" in rule_text
+    has_trailing_rule = "1 ATR" in rule_text and "当前价格" in rule_text and "0.5 ATR" in rule_text
+    target_price: float | None = None
+    reason = ""
+    if has_breakeven_rule and facts.get("stop_before_breakeven") and float(facts.get("open_distance_atr") or 0) >= 0.5:
+        target_price = float(open_price) + 0.2 if side == "BUY" else float(open_price) - 0.2
+        reason = "已满足保本条件，按流程图移动止损"
+    elif has_trailing_rule and facts.get("stop_at_or_beyond_breakeven") and float(facts.get("sl_distance_atr") or 0) >= 1:
+        target_price = float(current) - float(atr) * 0.5 if side == "BUY" else float(current) + float(atr) * 0.5
+        reason = "已满足 1 ATR 条件，按流程图移动止损"
+    if target_price is None:
+        return content
+    if side == "BUY" and facts.get("sl") is not None:
+        target_price = max(target_price, float(facts["sl"]))
+    if side == "SELL" and facts.get("sl") is not None:
+        target_price = min(target_price, float(facts["sl"]))
+    return {**content, "action": "modify", "ticket": facts.get("ticket"), "sl": target_price, "reason": reason, "analysis": reason}
 
 
 def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict[str, Any]]:
