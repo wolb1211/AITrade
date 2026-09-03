@@ -595,6 +595,7 @@ class AiDecisionClient:
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
                 "computed_facts": _workflow_computed_facts(config, "position", indicators, {"position": ([item.model_dump(mode="json") for item in request_payload.positions] or [{}])[0]}),
+                "position_facts": _position_runtime_facts(request_payload, indicators),
                 "workflow_actions": _workflow_action_specs(config, "position"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
@@ -2450,6 +2451,44 @@ def _apply_position_template_guardrails(template: str, specs: list[dict[str, Any
     return f"{cleaned}\n\n{guardrails}".strip()
 
 
+def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators: dict[str, Any]) -> dict[str, Any]:
+    positions = request_payload.positions
+    if not positions:
+        return {}
+    position = positions[0]
+    current = position.current_price
+    if current is None:
+        current = request_payload.bid if str(position.side).upper() == "BUY" else request_payload.ask
+    atr_values = (indicators.get("values") or {}).get("atr14", []) if isinstance(indicators.get("values"), dict) else []
+    try:
+        atr = float(atr_values[-1]) if atr_values else None
+    except (TypeError, ValueError):
+        atr = None
+    result: dict[str, Any] = {
+        "side": position.side,
+        "open_price": position.open_price,
+        "current_price": current,
+        "sl": position.sl,
+        "tp": position.tp,
+        "profit": position.profit,
+    }
+    if current is not None and position.open_price is not None:
+        result["price_open_distance"] = float(current) - float(position.open_price)
+    if current is not None and position.sl is not None:
+        result["price_sl_distance"] = float(current) - float(position.sl)
+    if current is not None and position.tp is not None:
+        result["price_tp_distance"] = float(current) - float(position.tp)
+    if atr is not None:
+        result["atr14_latest"] = atr
+        if "price_open_distance" in result:
+            result["open_distance_atr"] = result["price_open_distance"] / atr if atr else None
+        if "price_sl_distance" in result:
+            result["sl_distance_atr"] = result["price_sl_distance"] / atr if atr else None
+        result["threshold_0_5_atr"] = atr * 0.5
+        result["threshold_1_atr"] = atr
+    return result
+
+
 def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict[str, Any]]:
     """Expose confirmed action-node parameters explicitly to the runtime AI."""
     compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
@@ -2940,7 +2979,8 @@ def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) 
     indicators = user_payload.get("indicators")
     computed_facts = user_payload.get("computed_facts")
     workflow_actions = user_payload.get("workflow_actions")
-    if not isinstance(indicators, dict) and not computed_facts and not workflow_actions:
+    position_facts = user_payload.get("position_facts")
+    if not isinstance(indicators, dict) and not computed_facts and not workflow_actions and not position_facts:
         return preview
     snapshot_data: dict[str, Any] = {}
     if isinstance(indicators, dict) and indicators.get("recent_values"):
@@ -2949,6 +2989,8 @@ def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) 
         snapshot_data["computed_facts"] = computed_facts
     if isinstance(workflow_actions, list) and workflow_actions:
         snapshot_data["workflow_actions"] = workflow_actions
+    if isinstance(position_facts, dict) and position_facts:
+        snapshot_data["position_facts"] = position_facts
     if not snapshot_data:
         return preview
     snapshot = json.dumps(snapshot_data, ensure_ascii=False, separators=(",", ":"))
