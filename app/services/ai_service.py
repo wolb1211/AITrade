@@ -507,9 +507,12 @@ class AiDecisionClient:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
         candle_count = max(10, min(int(config.get("open_requested_kline_count") or config.get("open_kline_count") or 100), 1000))
         indicator_count = _workflow_history_count(config, "open")
+        visual_stage = _runtime_compiled_stage(config, "open")
+        indicator_specs = visual_stage.get("indicators", []) if visual_stage is not None else list(config.get("open_indicators") or [])
+        user_rule = "已确认的开仓流程图" if visual_stage is not None else config.get("open_logic", "")
         indicators = calculate_indicator_payload(
             request_payload.candles,
-            list(config.get("open_indicators") or []),
+            indicator_specs,
             output_count=indicator_count,
         )
         return self._chat_json(
@@ -519,7 +522,7 @@ class AiDecisionClient:
             user_payload={
                 "task": "custom_strategy_open_decision",
                 "strategy_name": deployment.get("strategy_name", ""),
-                "user_rule": config.get("open_logic", ""),
+                "user_rule": user_rule,
                 "prompt_template": _custom_runtime_template(config.get("open_prompt_template", "")),
                 "data_convention": {
                     "order": "oldest_to_latest",
@@ -563,9 +566,12 @@ class AiDecisionClient:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
         candle_count = max(10, min(int(config.get("position_requested_kline_count") or config.get("position_kline_count") or 100), 1000))
         indicator_count = _workflow_history_count(config, "position")
+        visual_stage = _runtime_compiled_stage(config, "position")
+        indicator_specs = visual_stage.get("indicators", []) if visual_stage is not None else list(config.get("position_indicators") or [])
+        user_rule = "已确认的持仓风控流程图" if visual_stage is not None else config.get("position_logic", "")
         indicators = calculate_indicator_payload(
             request_payload.candles,
-            list(config.get("position_indicators") or []),
+            indicator_specs,
             output_count=indicator_count,
         )
         return self._chat_json(
@@ -575,7 +581,7 @@ class AiDecisionClient:
             user_payload={
                 "task": "custom_strategy_position_decision",
                 "strategy_name": deployment.get("strategy_name", ""),
-                "user_rule": config.get("position_logic", ""),
+                "user_rule": user_rule,
                 "prompt_template": _custom_runtime_template(config.get("position_prompt_template", "")),
                 "data_convention": {
                     "order": "oldest_to_latest",
@@ -2757,6 +2763,13 @@ def _workflow_history_count(config: dict[str, Any], stage_name: str) -> int:
     # previous 100-value payload.  Indicator calculations still use all EA
     # candles internally; this only limits values serialized to the model.
     return max(3, min(needed + 2, 60))
+
+
+def _runtime_compiled_stage(config: dict[str, Any], stage_name: str) -> dict[str, Any] | None:
+    """Return a confirmed visual stage, if this deployment has one."""
+    compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else None
+    stage = compiled.get(stage_name) if isinstance(compiled, dict) else None
+    return stage if isinstance(stage, dict) and isinstance(stage.get("nodes"), dict) else None
 
 
 def _custom_runtime_template(value: Any) -> str:
