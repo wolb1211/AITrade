@@ -171,7 +171,22 @@ class UserAuthService:
                 next_open_logic != str(previous_config.get("open_logic") or "")
                 or next_position_logic != str(previous_config.get("position_logic") or "")
             )
-            if logic_changed or payload.get("compiled_config") is not None:
+            # A visual graph can change while the legacy text rules remain
+            # unchanged. Recompile whenever the client submits a workflow so
+            # indicators/unsupported conditions cannot remain stale.
+            if isinstance(payload.get("workflow"), dict):
+                if self.ai_client is None:
+                    raise AuthError("custom_strategy_compile_unavailable", 503)
+                try:
+                    compiled = self.ai_client.compile_custom_workflow(
+                        payload["workflow"],
+                        open_logic=next_open_logic,
+                        position_logic=next_position_logic,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    raise AuthError("invalid_custom_strategy_workflow") from exc
+                payload = {**payload, "_compiled_config": compiled}
+            elif logic_changed or payload.get("compiled_config") is not None:
                 if self.ai_client is None:
                     raise AuthError("custom_strategy_compile_unavailable", 503)
                 try:
