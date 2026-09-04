@@ -2586,7 +2586,7 @@ def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict
 
 def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any], content: dict[str, Any]) -> dict[str, Any]:
     """Fill explicit workflow price targets when the model omits them."""
-    if endpoint != "open" or not isinstance(content, dict) or content.get("sl") not in (None, ""):
+    if endpoint != "open" or not isinstance(content, dict):
         return content
     direction = str(content.get("direction") or "").lower()
     actions = user_payload.get("workflow_actions")
@@ -2617,6 +2617,8 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
             if raw_value is not None:
                 values.append(float(raw_value))
         if values:
+            # An explicit workflow candle stop is authoritative; replace any
+            # stale or incorrectly calculated model value.
             content["sl"] = max(values) if target["kind"] == "recent_high" else min(values)
             content.setdefault("reason", "已按流程图止损规则设置保护价")
     except (TypeError, ValueError, KeyError):
@@ -2767,6 +2769,18 @@ def _workflow_history_count(config: dict[str, Any], stage_name: str) -> int:
 
 def _runtime_compiled_stage(config: dict[str, Any], stage_name: str) -> dict[str, Any] | None:
     """Return a confirmed visual stage, if this deployment has one."""
+    # The editable workflow is the source of truth. Recompile it at runtime
+    # so an older persisted compiled_workflow can never shadow a newly saved
+    # graph shown in Admin.
+    workflow = config.get("workflow")
+    if isinstance(workflow, dict):
+        try:
+            compiled = compile_workflow(workflow)
+            stage = compiled.get(stage_name)
+            if isinstance(stage, dict) and isinstance(stage.get("nodes"), dict):
+                return stage
+        except Exception:  # noqa: BLE001
+            pass
     compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else None
     stage = compiled.get(stage_name) if isinstance(compiled, dict) else None
     return stage if isinstance(stage, dict) and isinstance(stage.get("nodes"), dict) else None
