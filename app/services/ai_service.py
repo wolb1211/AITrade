@@ -1054,10 +1054,7 @@ class AiDecisionClient:
                         "AI decision JSON recovered locally: %s",
                         f"{type(parse_exc).__name__}: {parse_exc}; response_preview={_preview_text(original_response_content)}",
                     )
-                    response_preview = _with_indicator_request_preview(
-                        _format_response_preview(raw=original_response_content, parsed=recovered),
-                        user_payload,
-                    )
+                    response_preview = _format_response_preview(raw=original_response_content, parsed=recovered)
                     cache_id = self._save_cache_result(
                         cache_key=cache_key,
                         cache_ttl_seconds=cache_ttl_seconds,
@@ -1117,10 +1114,7 @@ class AiDecisionClient:
             content = _apply_workflow_action_defaults(endpoint, user_payload, content)
             if endpoint == "position":
                 content = _apply_workflow_position_defaults(user_payload, content)
-            response_preview = _with_indicator_request_preview(
-                _format_response_preview(raw=response_content, parsed=content),
-                user_payload,
-            )
+            response_preview = _format_response_preview(raw=response_content, parsed=content)
             cache_id = self._save_cache_result(
                 cache_key=cache_key,
                 cache_ttl_seconds=cache_ttl_seconds,
