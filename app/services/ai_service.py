@@ -938,6 +938,7 @@ class AiDecisionClient:
             system_prompt=system_prompt,
             user_payload=user_payload,
             model=model,
+            user_image_url=user_image_url,
         )
         cached = self.store.get_ai_response_cache(cache_key)
         if cached is not None:
@@ -1171,6 +1172,7 @@ class AiDecisionClient:
         system_prompt: str,
         user_payload: dict[str, Any],
         model: dict[str, Any],
+        user_image_url: str = "",
     ) -> str:
         is_custom = bool(model.get("is_custom"))
         scope = "official"
@@ -1190,6 +1192,10 @@ class AiDecisionClient:
                 literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
             ),
             "user_payload": user_payload,
+            # Screenshot bytes are part of the request semantics. Include a
+            # digest rather than the base64 itself so different chart images
+            # cannot reuse a previous strategy result during the cache TTL.
+            "image_sha256": sha256(str(user_image_url or "").encode("utf-8")).hexdigest() if user_image_url else "",
             "temperature": 0,
             "max_tokens": _max_tokens_for_endpoint(endpoint),
             "strict_json": bool(model.get("strict_json", True)),
