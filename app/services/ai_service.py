@@ -3073,7 +3073,9 @@ def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = N
         parts.append(f"原始返回:\n{_preview_text(raw, 1600)}")
     if parsed is not None:
         parts.append(f"解析结果:\n{_preview_text(json.dumps(parsed, ensure_ascii=False), 1600)}")
-    return "\n\n".join(parts)[:3200]
+    # Keep the complete structured response in the admin preview; the UI
+    # already provides a scrollable container.
+    return "\n\n".join(parts)[:30000]
 
 
 def _format_request_snapshot(
@@ -3116,7 +3118,9 @@ def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) 
     if not snapshot_data:
         return preview
     snapshot = json.dumps(snapshot_data, ensure_ascii=False, separators=(",", ":"))
-    return f"请求指标快照:\n{snapshot}\n\n{preview}"[:4000]
+    # Request bodies can contain candle arrays and workflow definitions. Do
+    # not cut them at 4k, otherwise diagnostics appear to be malformed.
+    return f"请求指标快照:\n{snapshot}\n\n{preview}"[:30000]
 
 
 def _screenshot_ai_metadata(value: Any) -> dict[str, Any]:
