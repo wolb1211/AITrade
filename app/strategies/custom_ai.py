@@ -13,6 +13,7 @@ from app.services.custom_rule_engine import (
     evaluate_position_rule_plan,
     normalize_rule_plan,
 )
+from app.services.custom_workflow import compile_workflow
 from app.strategies.pa_agent_lite import _position_size_lot
 
 
@@ -24,6 +25,8 @@ class CustomAiStrategy:
 
     def evaluate_open(self, request: OpenEvaluateRequest, deployment: dict[str, Any]) -> TradeDecision:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        if not _workflow_ready(config, "open"):
+            return self._hold(request, "该自定义策略尚未保存有效的开仓流程图，请重新编辑并保存后再运行")
         data_type = str(config.get("open_data_type") or request.data_type or "kline")
         if data_type in {"kline", "both"} and len(request.candles) < 10:
             return self._hold(request, "K线数量不足，自定义策略至少需要10根已收盘K线")
@@ -87,6 +90,8 @@ class CustomAiStrategy:
     def evaluate_position(self, request: PositionEvaluateRequest, deployment: dict[str, Any]) -> TradeDecision:
         target = request.positions[0]
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        if not _workflow_ready(config, "position"):
+            return self._position_hold(request, target.ticket, "该自定义策略尚未保存有效的风控流程图，请重新编辑并保存后再运行")
         data_type = str(config.get("position_data_type") or request.data_type or "kline")
         if data_type in {"kline", "both"} and len(request.candles) < 10:
             return self._position_hold(request, target.ticket, "K线数量不足，暂不执行持仓操作")
@@ -325,3 +330,16 @@ def _first_positive(payload: dict[str, Any], *keys: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def _workflow_ready(config: dict[str, Any], stage_name: str) -> bool:
+    """Require a valid visual workflow for all newly executed custom strategies."""
+    workflow = config.get("workflow")
+    if not isinstance(workflow, dict):
+        return False
+    try:
+        compiled = compile_workflow(workflow)
+        stage = compiled.get(stage_name)
+        return isinstance(stage, dict) and bool(stage.get("entry_node_id")) and isinstance(stage.get("nodes"), dict) and bool(stage.get("nodes"))
+    except Exception:  # noqa: BLE001
+        return False

@@ -515,6 +515,7 @@ class AiDecisionClient:
             indicator_specs,
             output_count=indicator_count,
         )
+        computed_facts = _workflow_computed_facts(config, "open", indicators, candles=request_payload.candles)
         return self._chat_json(
             deployment=deployment,
             endpoint="open",
@@ -540,8 +541,10 @@ class AiDecisionClient:
                 "equity": request_payload.equity,
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
-                "computed_facts": _workflow_computed_facts(config, "open", indicators),
-                "workflow_actions": _workflow_action_specs(config, "open"),
+                "computed_facts": computed_facts,
+                "workflow_context": _workflow_runtime_context(config, "open", computed_facts),
+                "workflow_actions": _workflow_selected_actions(config, "open", computed_facts),
+                "ai_conditions": _runtime_ai_conditions(config, "open"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "open"),
                 "required_json_schema": {
@@ -574,6 +577,8 @@ class AiDecisionClient:
             indicator_specs,
             output_count=indicator_count,
         )
+        runtime_position = {"position": ([item.model_dump(mode="json") for item in request_payload.positions] or [{}])[0]}
+        computed_facts = _workflow_computed_facts(config, "position", indicators, runtime_position, candles=request_payload.candles)
         return self._chat_json(
             deployment=deployment,
             endpoint="position",
@@ -600,9 +605,11 @@ class AiDecisionClient:
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
                 "candles": _compact_candles(request_payload.candles, limit=candle_count),
                 "indicators": indicators,
-                "computed_facts": _workflow_computed_facts(config, "position", indicators, {"position": ([item.model_dump(mode="json") for item in request_payload.positions] or [{}])[0]}),
+                "computed_facts": computed_facts,
+                "workflow_context": _workflow_runtime_context(config, "position", computed_facts),
                 "position_facts": _position_runtime_facts(request_payload, indicators),
-                "workflow_actions": _workflow_action_specs(config, "position"),
+                "workflow_actions": _workflow_selected_actions(config, "position", computed_facts),
+                "ai_conditions": _runtime_ai_conditions(config, "position"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
                 "required_json_schema": {
@@ -2141,7 +2148,11 @@ def _custom_runtime_prompt(endpoint: str) -> str:
         "The computed_facts and position_facts objects are authoritative server-side evaluations of each workflow "
         "condition and current position. Check every condition fact and follow the workflow branch sequence; never "
         "stop after evaluating only the first trailing-stop or breakeven rule. A condition_result of true/false is "
-        "the server's result and must not be recomputed or contradicted from raw numbers. Indicator arrays are in "
+        "the server's result and must not be recomputed or contradicted from raw numbers. ai_conditions contains "
+        "the exact instructions from explicit AI-condition nodes; evaluate those instructions only with the listed "
+        "data_type and lookback. workflow_context contains "
+        "the path selected by those results; treat selected_actions as the only candidate actions for this request "
+        "and do not choose an unrelated action from the graph. Indicator arrays are in "
         "indicators.values keyed by aliases such as atr14 and ema5, oldest to newest; [-1] "
         "is the latest closed candle. Evaluate crossovers over exactly the user-requested candle window directly from "
         "those arrays, and infer requested candlestick patterns directly from OHLCV. In analysis, summarize each "
@@ -2359,6 +2370,23 @@ def _runtime_visual_conditions(config: dict[str, Any], stage: str) -> list[dict[
     ]
 
 
+def _runtime_ai_conditions(config: dict[str, Any], stage_name: str) -> list[dict[str, Any]]:
+    """Expose explicit AI-condition nodes and their exact user instructions."""
+    stage = _runtime_compiled_stage(config, stage_name) or {}
+    nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
+    result: list[dict[str, Any]] = []
+    for node_id, node in nodes.items():
+        if not isinstance(node, dict) or node.get("type") != "ai_condition":
+            continue
+        result.append({
+            "node_id": str(node.get("id") or node_id),
+            "instruction": str(node.get("instruction") or "").strip(),
+            "data_type": node.get("data_type") or "kline",
+            "lookback": node.get("lookback", 1),
+        })
+    return result
+
+
 def _clean_stage_summary(value: Any) -> str:
     return str(value or "").strip().strip("；;。 ")
 
@@ -2551,13 +2579,10 @@ def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dic
 
 def _workflow_action_specs(config: dict[str, Any], stage_name: str) -> list[dict[str, Any]]:
     """Expose confirmed action-node parameters explicitly to the runtime AI."""
-    compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
-    if not compiled and isinstance(config.get("workflow"), dict):
-        try:
-            compiled = compile_workflow(config["workflow"])
-        except Exception:  # noqa: BLE001
-            compiled = {}
-    stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
+    # Always resolve the editable workflow first.  A stale persisted
+    # compiled_workflow must never be used to calculate facts after a graph
+    # was edited but before an older deployment is refreshed.
+    stage = _runtime_compiled_stage(config, stage_name) or {}
     nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
     actions: list[dict[str, Any]] = []
     for node_id, node in nodes.items():
@@ -2620,7 +2645,7 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
     return content
 
 
-def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any], runtime: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators: dict[str, Any], runtime: dict[str, Any] | None = None, candles: list[Candle] | None = None) -> list[dict[str, Any]]:
     """Derive objective comparison/crossover facts from a compiled workflow.
 
     These facts are advisory context for the model; the workflow remains the
@@ -2674,6 +2699,25 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
         if kind == "constant":
             try: return transform([float(operand.get("value"))])
             except (TypeError, ValueError): return []
+        if kind in {"market_price", "candle"}:
+            # Price/candle operands are scalar values at the latest closed
+            # bar.  Prefer the position snapshot for current_price when it is
+            # available, otherwise use the latest supplied candle.
+            latest = sorted(candles or [], key=lambda item: item.timestamp)[-1] if candles else None
+            name_map = {
+                "current": (position.get("current_price") if position else None),
+                "current_price": (position.get("current_price") if position else None),
+                "open": (latest.open if latest else None),
+                "high": (latest.high if latest else None),
+                "low": (latest.low if latest else None),
+                "close": (latest.close if latest else None),
+                "volume": (latest.volume if latest else None),
+            }
+            value = name_map.get(name.lower())
+            if value is None and name.lower() == "current_price":
+                value = latest.close if latest else None
+            try: return transform([float(value)]) if value is not None else []
+            except (TypeError, ValueError): return []
         mapping = {"open_price": "open_price", "current_price": "current_price", "sl": "sl", "tp": "tp", "profit": "profit", "volume": "volume"}
         if kind in {"position", "derived"} and name in mapping:
             try: return transform([float(position.get(mapping[name]))])
@@ -2692,6 +2736,76 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
     for node in nodes.values():
         if not isinstance(node, dict) or node.get("type") != "condition": continue
         condition = node.get("condition") if isinstance(node.get("condition"), dict) else {}
+        if condition.get("kind") == "candle_pattern":
+            lookback = max(1, int(condition.get("lookback") or 1))
+            pattern = str(condition.get("pattern") or "")
+            sample = sorted(candles or [], key=lambda item: item.timestamp)[-max(lookback, 2):]
+            matched = False
+            resolved = bool(sample)
+            if pattern in {"bullish_engulfing", "bearish_engulfing"} and len(sample) >= 2:
+                for prev, latest in zip(sample, sample[1:]):
+                    prev_bear = prev.close < prev.open
+                    prev_bull = prev.close > prev.open
+                    latest_bull = latest.close > latest.open
+                    latest_bear = latest.close < latest.open
+                    if pattern == "bullish_engulfing":
+                        matched = matched or (prev_bear and latest_bull and latest.open <= prev.close and latest.close >= prev.open)
+                    else:
+                        matched = matched or (prev_bull and latest_bear and latest.open >= prev.close and latest.close <= prev.open)
+            elif pattern in {"bullish_pinbar", "bearish_pinbar", "doji"} and sample:
+                for bar in sample:
+                    body = abs(bar.close - bar.open)
+                    full = max(1e-12, bar.high - bar.low)
+                    upper = bar.high - max(bar.open, bar.close)
+                    lower = min(bar.open, bar.close) - bar.low
+                    if pattern == "doji": matched = matched or body <= full * 0.1
+                    elif pattern == "bullish_pinbar": matched = matched or (lower >= body * 2 and lower >= upper * 1.5)
+                    else: matched = matched or (upper >= body * 2 and upper >= lower * 1.5)
+            elif pattern not in {"bullish_engulfing", "bearish_engulfing", "bullish_pinbar", "bearish_pinbar", "doji"}:
+                resolved = False
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "condition_result": matched if resolved else None, "pattern": pattern, "lookback": lookback, "resolved": resolved})
+            continue
+        # Position side is categorical, not numeric. Resolve it locally so a
+        # BUY/SELL branch can be selected before the request reaches AI.
+        left_operand = condition.get("left") if isinstance(condition.get("left"), dict) else {}
+        right_operand = condition.get("right") if isinstance(condition.get("right"), dict) else {}
+        if left_operand.get("kind") == "position" and left_operand.get("name") == "side" and right_operand.get("kind") == "constant":
+            actual_side = str(position.get("side") or "").upper()
+            expected_side = str(right_operand.get("value") or "").upper()
+            operator = condition.get("operator") or "eq"
+            result = actual_side == expected_side if operator == "eq" else actual_side != expected_side
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_left": actual_side, "latest_right": expected_side, "operator": operator, "condition_result": result, "latest_relation": "equal" if result else "not_equal", "relations_oldest_to_latest": ["equal" if result else "not_equal"], "lookback": 1, "cross_up": False, "cross_down": False, "latest_cross": None, "cross_events": []})
+            continue
+        # Conditions which intentionally require AI/vision or a future
+        # structural detector remain explicit unresolved facts.  This keeps
+        # the workflow path from silently selecting an arbitrary branch.
+        if condition.get("kind") in {"market_structure", "breakout", "position_state", "vision_result", "group"}:
+            # Keep unsupported conditions explicit and provide the exact
+            # workflow specification plus only the evidence relevant to it.
+            # The model may interpret this evidence, but must not invent a
+            # different lookback, direction, or comparison target.
+            unresolved_fact: dict[str, Any] = {
+                "node_id": node.get("id"),
+                "description": condition.get("description") or node.get("label"),
+                "condition_result": None,
+                "kind": condition.get("kind"),
+                "resolved": False,
+                "condition_spec": {
+                    "pattern": condition.get("pattern"),
+                    "direction": condition.get("direction"),
+                    "operator": condition.get("operator"),
+                    "lookback": condition.get("lookback"),
+                    "count": condition.get("count"),
+                    "left": condition.get("left"),
+                    "right": condition.get("right"),
+                },
+            }
+            if candles and condition.get("kind") in {"market_structure", "breakout"}:
+                ordered = sorted(candles, key=lambda item: item.timestamp)
+                window = max(1, int(condition.get("lookback") or condition.get("count") or 1))
+                unresolved_fact["candle_evidence"] = _compact_candles(ordered[-window:], limit=window)
+            facts.append(unresolved_fact)
+            continue
         left_key, right_key = operand_key(condition.get("left")), operand_key(condition.get("right"))
         left, right = operand_values(condition.get("left")), operand_values(condition.get("right"))
         if left and right:
@@ -2717,12 +2831,36 @@ def _workflow_computed_facts(config: dict[str, Any], stage_name: str, indicators
             operator = condition.get("operator") or "gt"
             a, b = left[-1], right[-1]
             result = {"gt": a > b, "gte": a >= b, "lt": a < b, "lte": a <= b, "eq": a == b, "neq": a != b}.get(operator)
+            if condition.get("kind") == "consecutive":
+                count_needed = max(1, int(condition.get("count") or condition.get("lookback") or 1))
+                pairs = list(zip(left[-count_needed:], right[-count_needed:]))
+                comparator = {
+                    "gt": lambda x, y: x > y, "gte": lambda x, y: x >= y,
+                    "lt": lambda x, y: x < y, "lte": lambda x, y: x <= y,
+                    "eq": lambda x, y: x == y, "neq": lambda x, y: x != y,
+                }.get(operator, lambda x, y: False)
+                result = len(pairs) >= count_needed and all(comparator(x, y) for x, y in pairs)
+            if condition.get("kind") == "indicator_trend":
+                count_needed = max(2, int(condition.get("count") or condition.get("lookback") or 2))
+                series = left[-count_needed:]
+                if len(series) < count_needed:
+                    result = False
+                elif condition.get("direction") == "down":
+                    result = all(series[index] < series[index - 1] for index in range(1, len(series)))
+                else:
+                    result = all(series[index] > series[index - 1] for index in range(1, len(series)))
             if condition.get("kind") == "cross":
                 expected = "up" if condition.get("direction") == "above" else "down"
                 result = (latest_cross == expected) if condition.get("cross_mode") == "latest" else (cross_up if expected == "up" else cross_down)
             facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_left": a, "latest_right": b, "operator": operator, "condition_result": result, "latest_relation": relation[-1], "relations_oldest_to_latest": recent_relation, "lookback": lookback, "cross_up": cross_up, "cross_down": cross_down, "latest_cross": latest_cross, "cross_events": cross_events})
         elif left:
-            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1]})
+            result = None
+            if condition.get("kind") == "indicator_trend":
+                count_needed = max(2, int(condition.get("count") or condition.get("lookback") or 2))
+                series = left[-count_needed:]
+                if len(series) >= count_needed:
+                    result = all(series[index] < series[index - 1] for index in range(1, len(series))) if condition.get("direction") == "down" else all(series[index] > series[index - 1] for index in range(1, len(series)))
+            facts.append({"node_id": node.get("id"), "description": condition.get("description") or node.get("label"), "latest_value": left[-1], "condition_result": result, "lookback": int(condition.get("lookback") or condition.get("count") or 1)})
     return facts
 
 
@@ -2734,8 +2872,15 @@ def _workflow_history_count(config: dict[str, Any], stage_name: str) -> int:
     condition lookbacks/counts and indicator periods, with a small safety
     buffer for crossover comparisons.
     """
-    compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else {}
-    stage = compiled.get(stage_name) if isinstance(compiled.get(stage_name), dict) else {}
+    stage = _runtime_compiled_stage(config, stage_name) or {}
+    # Legacy natural-language strategies have no visual stage. Preserve
+    # their established payload size for backwards compatibility; the
+    # compact window applies only once a workflow is present.
+    if not stage and not isinstance(config.get("workflow"), dict):
+        try:
+            return max(3, min(int(config.get("indicator_output_count") or 100), 1000))
+        except (TypeError, ValueError):
+            return 100
     nodes = stage.get("nodes") if isinstance(stage.get("nodes"), dict) else {}
     needed = 3
 
@@ -2778,6 +2923,60 @@ def _runtime_compiled_stage(config: dict[str, Any], stage_name: str) -> dict[str
     compiled = config.get("compiled_workflow") if isinstance(config.get("compiled_workflow"), dict) else None
     stage = compiled.get(stage_name) if isinstance(compiled, dict) else None
     return stage if isinstance(stage, dict) and isinstance(stage.get("nodes"), dict) else None
+
+
+def _workflow_runtime_context(config: dict[str, Any], stage_name: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize the confirmed graph path for the runtime model."""
+    stage = _runtime_compiled_stage(config, stage_name)
+    if stage is None:
+        return {}
+    nodes = stage.get("nodes") or {}
+    transitions = stage.get("transitions") or {}
+    results = {str(item.get("node_id")): item.get("condition_result") for item in facts if isinstance(item, dict)}
+    path: list[str] = []
+    actions: list[dict[str, Any]] = []
+    current = str(stage.get("entry_node_id") or "")
+    visited: set[str] = set()
+    unresolved = False
+    while current and current not in visited and current in nodes:
+        visited.add(current)
+        path.append(current)
+        node = nodes[current]
+        if node.get("type") == "action":
+            action = node.get("action") if isinstance(node.get("action"), dict) else {}
+            actions.append({
+                "node_id": current,
+                "kind": action.get("kind"),
+                "entry_mode": action.get("entry_mode"),
+                "target": action.get("target"),
+                "stop_loss": action.get("stop_loss"),
+                "take_profit": action.get("take_profit"),
+                "volume": action.get("volume"),
+                "description": action.get("description") or node.get("label"),
+            })
+            break
+        branch = "next"
+        if node.get("type") in {"condition", "ai_condition"}:
+            result = results.get(current)
+            if result is None:
+                unresolved = True
+                break
+            branch = "yes" if result else "no"
+        current = str((transitions.get(current) or {}).get(branch) or "")
+    if current and current not in nodes:
+        unresolved = True
+    return {"path_node_ids": path, "selected_actions": actions, "unresolved": unresolved}
+
+
+def _workflow_selected_actions(config: dict[str, Any], stage_name: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only the action on a resolved structured path when possible."""
+    context = _workflow_runtime_context(config, stage_name, facts)
+    selected = context.get("selected_actions") if isinstance(context, dict) else None
+    if isinstance(selected, list) and selected:
+        return selected
+    # AI conditions may leave the path unresolved; retain legacy action
+    # visibility for those strategies until the condition is evaluated.
+    return _workflow_action_specs(config, stage_name)
 
 
 def _custom_runtime_template(value: Any) -> str:
