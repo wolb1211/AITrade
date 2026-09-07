@@ -2617,8 +2617,25 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
     if not target:
         rule = str(selected.get("stop_loss_rule") or "") if isinstance(selected, dict) else ""
         match = re.search(r"recent_(high|low)\s*\(\s*(\d+)\s*\)", rule, re.IGNORECASE)
+        if not match:
+            match = re.search(r"(?:highest_high|recent[_ ]high|highest)[^0-9]{0,12}(\d+)", rule, re.IGNORECASE)
+            if match:
+                match = ("recent_high", match.group(1))
+        if not match:
+            match = re.search(r"(?:lowest_low|recent[_ ]low|lowest)[^0-9]{0,12}(\d+)", rule, re.IGNORECASE)
+            if match:
+                match = ("recent_low", match.group(1))
+        if not match:
+            # The editor may persist the human-readable Chinese rule instead
+            # of the normalized recent_high()/recent_low() expression.
+            match = re.search(r"(?:最近|近)\s*(\d+)\s*根?(?:已?收盘)?K?线?\s*(?:的)?\s*(最高|最低|高点|低点)", rule, re.IGNORECASE)
+            if match:
+                match = ("recent_high" if match.group(2) in {"最高", "高点"} else "recent_low", match.group(1))
         if match:
-            target = {"kind": f"recent_{match.group(1).lower()}", "lookback": int(match.group(2))}
+            if isinstance(match, tuple):
+                target = {"kind": match[0], "lookback": int(match[1])}
+            else:
+                target = {"kind": f"recent_{match.group(1).lower()}", "lookback": int(match.group(2))}
     if target and target.get("kind") == "formula" and target.get("formula_base") in {"recent_high", "recent_low"}:
         # The visual editor stores a candle extreme with optional fixed/ATR
         # adjustment as a formula target. Normalize that representation to
