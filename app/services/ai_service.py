@@ -2614,6 +2614,7 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
         return content
     selected = next((item for item in actions if isinstance(item, dict) and item.get("kind") == ("open_buy" if direction == "buy" else "open_sell")), None)
     target = selected.get("stop_loss") if isinstance(selected, dict) and isinstance(selected.get("stop_loss"), dict) else None
+    explicit_stop_configured = bool(target) or bool(str(selected.get("stop_loss_rule") or "").strip()) if isinstance(selected, dict) else False
     if not target:
         rule = str(selected.get("stop_loss_rule") or "") if isinstance(selected, dict) else ""
         match = re.search(r"recent_(high|low)\s*\(\s*(\d+)\s*\)", rule, re.IGNORECASE)
@@ -2646,6 +2647,11 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
             "lookback": target.get("lookback") or 1,
         }
     if not target or target.get("kind") not in {"recent_high", "recent_low"}:
+        if explicit_stop_configured:
+            content["should_open"] = False
+            content["sl"] = None
+            content["reason"] = "流程图止损规则无法计算出有效价格，本次禁止开仓"
+            content["analysis"] = content["reason"]
         return content
     try:
         lookback = max(1, int(target.get("lookback") or 1))
@@ -2680,8 +2686,17 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
                 stop -= adjustment
             content["sl"] = stop
             content.setdefault("reason", "已按流程图止损规则设置保护价")
+        elif explicit_stop_configured:
+            content["should_open"] = False
+            content["sl"] = None
+            content["reason"] = "流程图止损规则缺少足够K线数据，本次禁止开仓"
+            content["analysis"] = content["reason"]
     except (TypeError, ValueError, KeyError):
-        pass
+        if explicit_stop_configured:
+            content["should_open"] = False
+            content["sl"] = None
+            content["reason"] = "流程图止损规则计算失败，本次禁止开仓"
+            content["analysis"] = content["reason"]
     return content
 
 
