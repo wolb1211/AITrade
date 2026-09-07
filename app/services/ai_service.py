@@ -2619,6 +2619,15 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
         match = re.search(r"recent_(high|low)\s*\(\s*(\d+)\s*\)", rule, re.IGNORECASE)
         if match:
             target = {"kind": f"recent_{match.group(1).lower()}", "lookback": int(match.group(2))}
+    if target and target.get("kind") == "formula" and target.get("formula_base") in {"recent_high", "recent_low"}:
+        # The visual editor stores a candle extreme with optional fixed/ATR
+        # adjustment as a formula target. Normalize that representation to
+        # the same absolute stop price as the shorthand recent_high/low form.
+        target = {
+            **target,
+            "kind": str(target.get("formula_base")),
+            "lookback": target.get("lookback") or 1,
+        }
     if not target or target.get("kind") not in {"recent_high", "recent_low"}:
         return content
     try:
@@ -2638,7 +2647,21 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
         if values:
             # An explicit workflow candle stop is authoritative; replace any
             # stale or incorrectly calculated model value.
-            content["sl"] = max(values) if target["kind"] == "recent_high" else min(values)
+            stop = max(values) if target["kind"] == "recent_high" else min(values)
+            # Apply an explicit fixed/ATR adjustment if the editor supplied
+            # one.  For the common recent-high/low stop this is zero.
+            adjustment_kind = str(target.get("adjustment_kind") or "fixed")
+            adjustment = float(target.get("adjustment_value") or 0)
+            if adjustment_kind == "atr":
+                atr_values = (user_payload.get("indicators") or {}).get("values", {}).get("atr14", [])
+                if isinstance(atr_values, list) and atr_values:
+                    adjustment *= float(atr_values[-1])
+            operation = str(target.get("operation") or "none")
+            if operation == "add":
+                stop += adjustment
+            elif operation == "subtract":
+                stop -= adjustment
+            content["sl"] = stop
             content.setdefault("reason", "已按流程图止损规则设置保护价")
     except (TypeError, ValueError, KeyError):
         pass
