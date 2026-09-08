@@ -2502,7 +2502,17 @@ def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators
     current = position.current_price
     if current is None:
         current = request_payload.bid if str(position.side).upper() == "BUY" else request_payload.ask
-    atr_values = (indicators.get("values") or {}).get("atr14", []) if isinstance(indicators.get("values"), dict) else []
+    indicator_values = indicators.get("values") if isinstance(indicators.get("values"), dict) else {}
+    atr_values = indicator_values.get("atr14", [])
+    if not atr_values:
+        # The visual editor commonly aliases ATR(14) as atr_14_value or
+        # atr14_value. Treat these as the same indicator for signed distance
+        # and breakeven/trailing calculations.
+        for alias, values in indicator_values.items():
+            normalized = str(alias).replace("_", "").lower()
+            if normalized.startswith("atr14"):
+                atr_values = values
+                break
     try:
         atr = float(atr_values[-1]) if atr_values else None
     except (TypeError, ValueError):
