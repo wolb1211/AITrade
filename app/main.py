@@ -28,6 +28,7 @@ from app.store import MySQLStore, SqliteStore
 from app.strategies.pa_agent_lite import PaAgentLiteStrategy
 from app.strategies.pa_mock import PaMockStrategy
 from app.strategies.custom_ai import CustomAiStrategy
+from app.strategies.turtle_agent import TurtleTrendStrategy
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -57,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     strategies = [
         PaMockStrategy(),
         PaAgentLiteStrategy(ai_client),
+        TurtleTrendStrategy(),
         CustomAiStrategy(ai_client),
     ]
     service = DecisionService(store, {strategy.code: strategy for strategy in strategies})

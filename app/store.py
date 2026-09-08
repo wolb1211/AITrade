@@ -1378,6 +1378,25 @@ class SqliteStore:
                 now,
             ),
         )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO official_ai_strategies (
+                id, code, name, badge, version, status, summary,
+                open_logic, position_logic, open_data_type, open_kline_count,
+                position_data_type, position_kline_count, call_mode, call_value,
+                default_config_json, enabled, sort, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ofs_gl_trend_v1", "GL_TREND_V1", "GL趋势策略", "GainLab", "1.0", "active",
+                "当前周期趋势突破策略：服务端计算通道、ATR、仓位和风险，AI仅作为可选执行确认。",
+                "收盘价突破前20根K线最高价开多，跌破前20根K线最低价开空。",
+                "达到2ATR保护止损或突破反向10根K线通道时离场。",
+                "kline", 30, "kline", 30, "bar", 1,
+                json.dumps({"entry_period": 20, "exit_period": 10, "atr_period": 20, "risk_fraction": 0.01, "max_units": 4, "add_step_atr": 0.5, "stop_atr": 2.0}, ensure_ascii=False),
+                1, 20, now, now,
+            ),
+        )
 
     def ensure_demo_deployment(self, raw_key: str) -> None:
         key_hash = hash_deployment_key(raw_key)
@@ -6596,6 +6615,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_history_indexes()
         self._ensure_mysql_ai_usage_columns()
         self._ensure_mysql_official_strategy_columns()
+        self._ensure_mysql_gl_trend_strategy_seed()
         self._ensure_mysql_ai_template_endpoint_seed()
         self._ensure_existing_users()
         self._backfill_ai_usage_monthly_summaries()
@@ -7010,6 +7030,29 @@ class MySQLStore(SqliteStore):
             for column, statement in migrations.items():
                 if column not in columns:
                     connection.execute(statement)
+
+    def _ensure_mysql_gl_trend_strategy_seed(self) -> None:
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT IGNORE INTO official_ai_strategies (
+                    id, code, name, badge, version, status, summary,
+                    open_logic, position_logic, open_data_type, open_kline_count,
+                    position_data_type, position_kline_count, call_mode, call_value,
+                    default_config_json, enabled, sort, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    "ofs_gl_trend_v1", "GL_TREND_V1", "GL趋势策略", "GainLab", "1.0", "active",
+                    "当前周期趋势突破策略：服务端计算通道、ATR、仓位和风险，AI仅作为可选执行确认。",
+                    "收盘价突破前20根K线最高价开多，跌破前20根K线最低价开空。",
+                    "达到2ATR保护止损或突破反向10根K线通道时离场。",
+                    "kline", 30, "kline", 30, "bar", 1,
+                    json.dumps({"entry_period": 20, "exit_period": 10, "atr_period": 20, "risk_fraction": 0.01, "max_units": 4, "add_step_atr": 0.5, "stop_atr": 2.0}, ensure_ascii=False),
+                    1, 20, now, now,
+                ),
+            )
 
     def _ensure_mysql_history_indexes(self) -> None:
         with self._connect() as connection:
