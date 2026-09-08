@@ -2553,9 +2553,19 @@ def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dic
     current, open_price, atr = facts.get("current_price"), facts.get("open_price"), facts.get("atr14_latest")
     if side not in {"BUY", "SELL"} or not isinstance(current, (int, float)) or not isinstance(open_price, (int, float)) or not isinstance(atr, (int, float)) or atr <= 0:
         return content
-    rule_text = " ".join(str(item.get("stop_loss_rule") or "") for item in actions if isinstance(item, dict) and item.get("kind") == "modify_sl")
+    modify_actions = [item for item in actions if isinstance(item, dict) and item.get("kind") == "modify_sl"]
+    rule_text = " ".join(str(item.get("stop_loss_rule") or "") for item in modify_actions)
     has_breakeven_rule = "0.5 ATR" in rule_text and "开仓价" in rule_text
     has_trailing_rule = "1 ATR" in rule_text and "当前价格" in rule_text and "0.5 ATR" in rule_text
+    for item in modify_actions:
+        target = item.get("target") if isinstance(item.get("target"), dict) else {}
+        base = str(target.get("formula_base") or "")
+        adjustment_kind = str(target.get("adjustment_kind") or "")
+        adjustment_value = float(target.get("adjustment_value") or 0)
+        if base == "entry_price" and adjustment_kind == "fixed" and abs(adjustment_value) > 0:
+            has_breakeven_rule = True
+        if base == "current_price" and adjustment_kind == "atr" and abs(adjustment_value or float(target.get("atr_multiplier") or 0)) > 0:
+            has_trailing_rule = True
     target_price: float | None = None
     reason = ""
     open_distance_atr = float(facts.get("open_distance_atr") or 0)
