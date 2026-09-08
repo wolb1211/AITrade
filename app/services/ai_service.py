@@ -539,8 +539,8 @@ class AiDecisionClient:
                 "spread_points": request_payload.spread_points,
                 "balance": request_payload.balance,
                 "equity": request_payload.equity,
-                "candles": _compact_candles(request_payload.candles, limit=candle_count),
-                "indicators": indicators,
+                "candles": _compact_candles(request_payload.candles, limit=indicator_count if visual_stage is not None else candle_count, include_timestamp=False if visual_stage is not None else True),
+                "indicators": _compact_workflow_indicators(indicators, limit=indicator_count) if visual_stage is not None else indicators,
                 "computed_facts": computed_facts,
                 "workflow_context": _workflow_runtime_context(config, "open", computed_facts),
                 "workflow_actions": _workflow_selected_actions(config, "open", computed_facts),
@@ -604,8 +604,8 @@ class AiDecisionClient:
                 "balance": request_payload.balance,
                 "equity": request_payload.equity,
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
-                "candles": _compact_candles(request_payload.candles, limit=candle_count),
-                "indicators": indicators,
+                "candles": _compact_candles(request_payload.candles, limit=indicator_count if visual_stage is not None else candle_count, include_timestamp=False if visual_stage is not None else True),
+                "indicators": _compact_workflow_indicators(indicators, limit=indicator_count) if visual_stage is not None else indicators,
                 "computed_facts": computed_facts,
                 "workflow_context": _workflow_runtime_context(config, "position", computed_facts),
                 "position_facts": _position_runtime_facts(request_payload, indicators),
@@ -3173,19 +3173,25 @@ def _max_tokens_for_endpoint(endpoint: str) -> int:
         return 1000
     return 500
 
-def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any]]:
+def _compact_candles(candles: list[Candle], *, limit: int, include_timestamp: bool = True) -> list[dict[str, Any]]:
     ordered = sorted(candles, key=lambda candle: candle.timestamp)[-limit:]
-    return [
-        {
-            "t": candle.timestamp,
-            "o": candle.open,
-            "h": candle.high,
-            "l": candle.low,
-            "c": candle.close,
-            "v": candle.volume,
-        }
-        for candle in ordered
-    ]
+    result = []
+    for candle in ordered:
+        item = {"o": candle.open, "h": candle.high, "l": candle.low, "c": candle.close, "v": candle.volume}
+        if include_timestamp:
+            item["t"] = candle.timestamp
+        result.append(item)
+    return result
+
+
+def _compact_workflow_indicators(indicators: dict[str, Any], *, limit: int) -> dict[str, Any]:
+    """Serialize only the necessary indicator window for a visual workflow."""
+    values = indicators.get("values") if isinstance(indicators, dict) and isinstance(indicators.get("values"), dict) else {}
+    compact_values: dict[str, list[Any]] = {}
+    for alias, series in values.items():
+        if isinstance(series, list):
+            compact_values[str(alias)] = series[-limit:]
+    return {"order": "oldest_to_latest", "values": compact_values}
 
 
 def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
