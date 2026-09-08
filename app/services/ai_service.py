@@ -3017,7 +3017,33 @@ def _workflow_runtime_context(config: dict[str, Any], stage_name: str, facts: li
                 unresolved = True
                 break
             branch = "yes" if result else "no"
-        current = str((transitions.get(current) or {}).get(branch) or "")
+        transition_map = transitions.get(current) or {}
+        next_node = transition_map.get(branch)
+        if not next_node:
+            # Older editor builds used boolean/Chinese handle names while
+            # the current editor uses yes/no. Accept all persisted aliases so
+            # a valid graph does not become an unresolved path at runtime.
+            aliases = (
+                ("true", "是", "on_yes", "success")
+                if branch == "yes" else
+                ("false", "否", "on_no", "failure")
+            )
+            for alias in aliases:
+                if transition_map.get(alias):
+                    next_node = transition_map[alias]
+                    break
+        if not next_node:
+            # React Flow handle ids have also appeared as ``yes-*``/``no-*``
+            # in older saved graphs. Match the semantic branch suffix while
+            # keeping the exact key preferred above.
+            for handle, candidate in transition_map.items():
+                normalized = str(handle).strip().lower().replace("_", "-")
+                if (branch == "yes" and (normalized.startswith("yes-") or normalized.endswith("-yes"))) or (branch == "no" and (normalized.startswith("no-") or normalized.endswith("-no"))):
+                    next_node = candidate
+                    break
+        if not next_node and node.get("type") != "action":
+            unresolved = True
+        current = str(next_node or "")
     if current and current not in nodes:
         unresolved = True
     return {"path_node_ids": path, "selected_actions": actions, "unresolved": unresolved}
