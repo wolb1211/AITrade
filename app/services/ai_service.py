@@ -544,6 +544,7 @@ class AiDecisionClient:
                 "computed_facts": computed_facts,
                 "workflow_context": _workflow_runtime_context(config, "open", computed_facts),
                 "workflow_actions": _workflow_selected_actions(config, "open", computed_facts),
+                "workflow_all_actions": _workflow_action_specs(config, "open"),
                 "ai_conditions": _runtime_ai_conditions(config, "open"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "open"),
@@ -609,6 +610,7 @@ class AiDecisionClient:
                 "workflow_context": _workflow_runtime_context(config, "position", computed_facts),
                 "position_facts": _position_runtime_facts(request_payload, indicators),
                 "workflow_actions": _workflow_selected_actions(config, "position", computed_facts),
+                "workflow_all_actions": _workflow_action_specs(config, "position"),
                 "ai_conditions": _runtime_ai_conditions(config, "position"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
@@ -2546,7 +2548,7 @@ def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dic
     if not isinstance(content, dict) or content.get("action") not in {None, "", "hold", "modify"}:
         return content
     facts = user_payload.get("position_facts")
-    actions = user_payload.get("workflow_actions")
+    actions = user_payload.get("workflow_all_actions") or user_payload.get("workflow_actions")
     if not isinstance(facts, dict) or not isinstance(actions, list):
         return content
     side = str(facts.get("side") or "").upper()
@@ -2618,7 +2620,7 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
     if endpoint != "open" or not isinstance(content, dict):
         return content
     direction = str(content.get("direction") or "").lower()
-    actions = user_payload.get("workflow_actions")
+    actions = user_payload.get("workflow_all_actions") or user_payload.get("workflow_actions")
     candles = user_payload.get("candles")
     if direction not in {"buy", "sell"} or not isinstance(actions, list) or not isinstance(candles, list):
         return content
