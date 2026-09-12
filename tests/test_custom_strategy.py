@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +16,6 @@ from app.models import (
 from app.services.ai_service import AiCallResult, AiDecisionClient
 from app.services.ai_service import (
     _custom_runtime_prompt,
-    _custom_strategy_stage_compile_prompt,
     _json_api_system_prompt,
 )
 from app.services.custom_indicators import (
@@ -30,6 +28,7 @@ from app.services.custom_indicators import (
 )
 from app.store import SqliteStore
 from app.strategies.custom_ai import CustomAiStrategy
+from workflow_fixture import minimal_workflow, workflow_with_ema
 
 
 def _candles(count: int = 360) -> list[Candle]:
@@ -139,16 +138,6 @@ def test_custom_json_prompt_contains_no_generic_market_analysis_requirements() -
     assert "never put step-by-step reasoning" in prompt
     assert "analysis must be a clear, natural and compact Chinese strategy explanation" in prompt
     assert "identify the exact unmet condition" in prompt
-
-
-def test_custom_position_compile_prompt_preserves_staged_stop_rules() -> None:
-    prompt = _custom_strategy_stage_compile_prompt("position")
-
-    assert "explicit stage conditions" in prompt
-    assert "earlier stage is completed" in prompt
-    assert "Never flatten a user-defined sequence" in prompt
-    assert "Do not invent a default priority" in prompt
-    assert "or any indicator, threshold, stage, trigger or risk rule" in prompt
 
 
 def test_custom_position_runtime_prompt_prevents_completed_stage_reentry() -> None:
@@ -280,7 +269,7 @@ def test_custom_position_stop_follows_ai_rule_without_direction_override(
     request.positions[0].sl = current_sl
     strategy = CustomAiStrategy(_PositionModifyAi(requested_sl))
 
-    decision = strategy.evaluate_position(request, {"config": {}})
+    decision = strategy.evaluate_position(request, {"config": {"workflow": minimal_workflow()}})
 
     assert decision.action == "MODIFY_SL"
     assert decision.sl == requested_sl
@@ -293,7 +282,7 @@ def test_custom_position_modify_preserves_existing_tp() -> None:
     request.positions[0].tp = 1950.0
     strategy = CustomAiStrategy(_PositionModifyAi(1934.0))
 
-    decision = strategy.evaluate_position(request, {"config": {}})
+    decision = strategy.evaluate_position(request, {"config": {"workflow": minimal_workflow()}})
 
     assert decision.action == "MODIFY_SL"
     assert decision.sl == 1934.0
@@ -304,7 +293,7 @@ def test_custom_strategy_can_open_from_candlestick_rule_and_partial_close() -> N
     strategy = CustomAiStrategy(_FakeAiClient())  # type: ignore[arg-type]
     deployment = {
         "strategy_name": "K线形态策略",
-        "config": {"fixed_volume": 0.1, "position_size_mode": "fixed", "allow_add": True, "max_positions": 3},
+        "config": {"fixed_volume": 0.1, "position_size_mode": "fixed", "allow_add": True, "max_positions": 3, "workflow": minimal_workflow()},
     }
     opened = strategy.evaluate_open(_open_request(), deployment)
     assert opened.action == "BUY"
@@ -348,6 +337,7 @@ def test_open_stop_uses_ai_result_without_local_natural_language_override() -> N
             "fixed_volume": 0.1,
             "position_size_mode": "fixed",
             "open_logic": "EMA5上穿EMA30开多，止损在最近5根K线的低点",
+            "workflow": minimal_workflow(),
         },
     }
 
@@ -371,6 +361,7 @@ def test_server_does_not_parse_natural_language_to_override_missing_stop() -> No
             "fixed_volume": 0.1,
             "position_size_mode": "fixed",
             "open_logic": "满足形态时开多，止损使用外部指标确认价",
+            "workflow": minimal_workflow(),
         },
     }
 
@@ -383,7 +374,7 @@ def test_server_does_not_parse_natural_language_to_override_missing_stop() -> No
 def test_add_uses_user_lot_or_open_sizing_default_and_partial_close_never_guesses() -> None:
     deployment = {
         "strategy_name": "加减仓测试",
-        "config": {"fixed_volume": 0.1, "position_size_mode": "fixed", "allow_add": True, "max_positions": 3},
+        "config": {"fixed_volume": 0.1, "position_size_mode": "fixed", "allow_add": True, "max_positions": 3, "workflow": minimal_workflow()},
     }
     explicit = CustomAiStrategy(_PositionResultAiClient({
         "action": "add", "direction": "buy", "lot": 0.2, "sl": 1920, "reason": "前一单两倍加仓",
@@ -430,6 +421,7 @@ def test_runtime_payload_contains_closed_candles_and_calculated_indicators(tmp_p
                     {"name": "ema", "source": "close", "params": {"length": 20}, "alias": "ema20"},
                 ],
                 "indicator_output_count": 100,
+                "workflow": workflow_with_ema(),
             },
         },
         request_payload=_open_request(),
@@ -438,7 +430,10 @@ def test_runtime_payload_contains_closed_candles_and_calculated_indicators(tmp_p
     assert len(payload["candles"]) == 100
     assert [item["t"] for item in payload["candles"]] == sorted(item["t"] for item in payload["candles"])
     assert payload["candles"][-1]["t"] == max(item.timestamp for item in _open_request().candles)
-    assert len(payload["indicators"]["timestamps"]) == 100
+    # The indicator window is derived from the confirmed graph instead of a fixed
+    # 100 values, so only ordering and presence are asserted here.
+    assert payload["indicators"]["timestamps"]
+    assert payload["indicators"]["timestamps"] == sorted(payload["indicators"]["timestamps"])
     assert payload["data_convention"]["last_item"] == "latest_closed_candle"
 
 
@@ -550,43 +545,6 @@ def test_compilation_keeps_supported_visual_conditions_out_of_unsupported_count(
     assert len(normalized["visual_conditions"]) == 2
 
 
-def test_custom_strategy_compiles_open_and_position_with_separate_calls(tmp_path: Path) -> None:
-    store = SqliteStore(tmp_path / "custom-split-compile.db")
-    store.initialize()
-    client = AiDecisionClient(store)
-    endpoints: list[str] = []
-
-    def fake_chat_json(**kwargs: Any) -> AiCallResult:
-        endpoint = str(kwargs["endpoint"])
-        endpoints.append(endpoint)
-        if endpoint == "compile_open":
-            return AiCallResult(content={
-                "summary": "EMA交叉开仓",
-                "prompt_template": "EMA5上穿EMA30开多，下破开空。",
-                "indicators": [{"name": "ema", "params": {"length": 5}}, {"name": "ema", "params": {"length": 30}}],
-                "data_type": "kline", "unsupported_indicators": [], "warnings": [],
-            }, usage=UsageSummary(ai_called=True))
-        return AiCallResult(content={
-            "summary": "ATR移动止损与EMA反向平仓",
-            "prompt_template": "按ATR移动止损，EMA反向交叉时平仓。",
-            "indicators": [{"name": "atr", "params": {"length": 14}}],
-            "data_type": "kline", "unsupported_indicators": [], "warnings": [],
-        }, usage=UsageSummary(ai_called=True))
-
-    client._chat_json = fake_chat_json  # type: ignore[method-assign]
-    compiled = client.compile_custom_strategy({
-        "config": {
-            "open_logic": "EMA5上穿EMA30开多，下破开空",
-            "position_logic": "按ATR移动止损，EMA5和EMA30反向交叉时平仓",
-        },
-    })
-    assert endpoints == ["compile_open", "compile_position"]
-    assert {item["alias"] for item in compiled["open_indicators"]} == {"ema5", "ema30"}
-    assert {item["alias"] for item in compiled["position_indicators"]} == {"atr14", "ema5", "ema30"}
-    assert "开仓：EMA交叉开仓" in compiled["summary"]
-    assert "持仓风控：ATR移动止损与EMA反向平仓" in compiled["summary"]
-
-
 def test_split_compile_selects_the_corresponding_custom_model(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "custom-split-model.db")
     store.initialize()
@@ -595,8 +553,8 @@ def test_split_compile_selects_the_corresponding_custom_model(tmp_path: Path) ->
         "open_ai_mode": "custom", "open_ai_base_url": "https://open.example/v1", "open_ai_model": "open-model", "open_ai_key": "open-key",
         "position_ai_mode": "custom", "position_ai_base_url": "https://position.example/v1", "position_ai_model": "position-model", "position_ai_key": "position-key",
     }}
-    assert client._select_model(deployment, "compile_open")["model"] == "open-model"  # type: ignore[index]
-    assert client._select_model(deployment, "compile_position")["model"] == "position-model"  # type: ignore[index]
+    assert client._select_model(deployment, "workflow_open")["model"] == "open-model"  # type: ignore[index]
+    assert client._select_model(deployment, "workflow_pos")["model"] == "position-model"  # type: ignore[index]
 
 
 def test_position_template_normalizes_atr_units_and_filters_internal_notes(tmp_path: Path) -> None:

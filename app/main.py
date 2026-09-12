@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
@@ -37,8 +38,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     logging.basicConfig(level=logging.INFO)
     mt5_log = logging.getLogger("gainlab.mt5.validation")
     if not mt5_log.handlers:
-        file_handler = logging.FileHandler(
+        file_handler = RotatingFileHandler(
             resolved.database_path.parent / "mt5_validation_errors.log",
+            maxBytes=2_000_000,
+            backupCount=2,
             encoding="utf-8",
         )
         file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -55,12 +58,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     else:
         store = SqliteStore(resolved.database_path)
     ai_client = AiDecisionClient(store, timeout=resolved.ai_timeout)
+    # PA_MOCK_V1 is the original placeholder strategy behind the local demo
+    # deployment (gl_demo_pa_key). It runs no AI analysis and only a minimal
+    # stop/target check, so its engine is registered outside production only.
+    # The demo deployment record is gated on the environment for the same
+    # reason, and neither change alters development or demo behaviour.
     strategies = [
-        PaMockStrategy(),
         PaAgentLiteStrategy(ai_client),
-        TurtleTrendStrategy(),
+        TurtleTrendStrategy(ai_client),
         CustomAiStrategy(ai_client),
     ]
+    if resolved.environment == "production":
+        logging.getLogger("gainlab.strategy").info(
+            "PA_MOCK_V1 engine is not registered in production"
+        )
+    else:
+        strategies.insert(0, PaMockStrategy())
     service = DecisionService(store, {strategy.code: strategy for strategy in strategies})
     auth_service = UserAuthService(store, resolved, EmailService(resolved), ai_client=ai_client)
 
@@ -132,13 +145,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         exc: RequestValidationError,
     ) -> JSONResponse:
         raw_body = (await request.body()).decode("utf-8", errors="replace")
-        message = {
-            "path": str(request.url.path),
-            "method": request.method,
-            "errors": exc.errors(),
-            "body": raw_body,
-        }
-        mt5_log.warning("request validation failed: %s", json.dumps(message, ensure_ascii=False))
+        # Only the failing locations are logged. The raw body used to be written
+        # here as well, which stored deployment keys, account logins and base64
+        # screenshots in runtime/mt5_validation_errors.log, and the pydantic
+        # error objects carry the offending input values too.
+        mt5_log.warning(
+            "request validation failed: %s",
+            json.dumps(
+                {
+                    "path": str(request.url.path),
+                    "method": request.method,
+                    "body_bytes": len(raw_body.encode("utf-8")),
+                    "errors": [
+                        {
+                            "loc": [str(part) for part in (item.get("loc") or [])],
+                            "type": item.get("type"),
+                            "msg": item.get("msg"),
+                        }
+                        for item in exc.errors()
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
         return JSONResponse(
             status_code=422,
             content={

@@ -167,36 +167,23 @@ class UserAuthService:
             previous_config = dict(previous.get("config") or {})
             next_open_logic = str(payload.get("open_logic", previous_config.get("open_logic") or "")).strip()
             next_position_logic = str(payload.get("position_logic", previous_config.get("position_logic") or "")).strip()
-            logic_changed = (
-                next_open_logic != str(previous_config.get("open_logic") or "")
-                or next_position_logic != str(previous_config.get("position_logic") or "")
-            )
-            # A visual graph can change while the legacy text rules remain
-            # unchanged. Recompile whenever the client submits a workflow so
-            # indicators/unsupported conditions cannot remain stale.
-            if isinstance(payload.get("workflow"), dict):
+            submitted_workflow = payload.get("workflow")
+            # The graph is the executable contract: recompile whenever the client
+            # submits one. Text-only edits no longer drive runtime behaviour, so
+            # they are stored as draft text without triggering a compilation.
+            if submitted_workflow is not None:
+                if not isinstance(submitted_workflow, dict):
+                    raise AuthError("invalid_custom_strategy_workflow")
                 if self.ai_client is None:
                     raise AuthError("custom_strategy_compile_unavailable", 503)
                 try:
                     compiled = self.ai_client.compile_custom_workflow(
-                        payload["workflow"],
+                        submitted_workflow,
                         open_logic=next_open_logic,
                         position_logic=next_position_logic,
                     )
                 except (RuntimeError, ValueError) as exc:
                     raise AuthError("invalid_custom_strategy_workflow") from exc
-                payload = {**payload, "_compiled_config": compiled}
-            elif logic_changed or payload.get("compiled_config") is not None:
-                if self.ai_client is None:
-                    raise AuthError("custom_strategy_compile_unavailable", 503)
-                try:
-                    compiled = self.ai_client.normalize_custom_strategy_compilation(
-                        payload.get("compiled_config"),
-                        open_logic=next_open_logic,
-                        position_logic=next_position_logic,
-                    )
-                except RuntimeError as exc:
-                    raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
                 payload = {**payload, "_compiled_config": compiled}
         try:
             deployment = self.store.update_user_deployment_settings(
@@ -206,49 +193,6 @@ class UserAuthService:
             )
         except RuntimeError as exc:
             self._raise_store_error(exc)
-        if deployment.get("strategy_code") == "CUSTOM_AI_V1" and self.ai_client is not None:
-            config = dict(deployment.get("config") or {})
-            open_logic = str(config.get("open_logic") or "").strip()
-            position_logic = str(config.get("position_logic") or "").strip()
-            if len(open_logic) < 5 or len(position_logic) < 5:
-                raise AuthError("custom_strategy_logic_required")
-            previous_config = dict(previous.get("config") or {}) if previous else {}
-            logic_changed = (
-                open_logic != str(previous_config.get("open_logic") or "")
-                or position_logic != str(previous_config.get("position_logic") or "")
-            )
-            if logic_changed and "_compiled_config" not in payload:
-                selected_data = {
-                    f"{prefix}_{field}": config.get(f"{prefix}_{field}")
-                    for prefix in ("open", "position")
-                    for field in ("data_type", "kline_count", "requested_kline_count")
-                }
-                compiled = self.ai_client.compile_custom_strategy(deployment)
-                config.update(compiled)
-                for prefix in ("open", "position"):
-                    selected_type = str(selected_data.get(f"{prefix}_data_type") or "kline")
-                    selected_count = int(
-                        selected_data.get(f"{prefix}_requested_kline_count")
-                        or selected_data.get(f"{prefix}_kline_count")
-                        or 100
-                    )
-                    required_count = int(compiled.get(f"{prefix}_kline_count") or 100)
-                    config[f"{prefix}_data_type"] = selected_type
-                    config[f"{prefix}_requested_kline_count"] = selected_count
-                    config[f"{prefix}_indicator_kline_count"] = required_count
-                    config[f"{prefix}_kline_count"] = (
-                        max(selected_count, required_count) if selected_type in {"kline", "both"} else 1
-                    )
-                deployment = self.store.upsert_web_deployment(
-                    str(config.get("deployment_key") or ""),
-                    user_id=str(user["id"]),
-                    strategy_code="CUSTOM_AI_V1",
-                    strategy_name=str(deployment.get("strategy_name") or "自定义策略"),
-                    status=str(deployment.get("status") or "active"),
-                    symbol=str(deployment.get("symbol") or "*"),
-                    timeframe=str(deployment.get("timeframe") or "*"),
-                    config=config,
-                )
         return {"id": deployment["id"], "updated_at": deployment["updated_at"]}
 
     def preview_custom_strategy(self, token: str, *, payload: dict[str, Any]) -> dict[str, Any]:
@@ -363,8 +307,9 @@ class UserAuthService:
         open_logic = str(payload.get("open_logic") or "").strip()
         position_logic = str(payload.get("position_logic") or "").strip()
         ea_description = str(payload.get("ea_description") or "").strip()
-        if is_custom_strategy and (len(open_logic) < 5 or len(position_logic) < 5):
-            raise AuthError("custom_strategy_logic_required")
+        # open_logic / position_logic are stored verbatim as the draft text the
+        # user may reuse when asking AI to draw a graph. They carry no runtime
+        # meaning and are not validated: a hand-drawn graph needs no description.
         if len(ea_description) > 1000:
             raise AuthError("invalid_strategy_description")
         custom_data: dict[str, Any] = {}
@@ -452,46 +397,29 @@ class UserAuthService:
             "allow_add": bool(payload.get("allow_add", default_config.get("allow_add_position", False))),
             "ai_user_configured": True,
         })
+        # The visual workflow is the only executable contract. A custom strategy
+        # without a confirmed workflow could never produce a decision, so it is
+        # rejected here instead of being stored as an active deployment that only
+        # ever holds. Natural-language text is kept as the draft source for
+        # generating a workflow, never as a runtime rule.
         visual_compilation: dict[str, Any] | None = None
-        if is_custom_strategy and payload.get("workflow") is not None:
+        if is_custom_strategy:
+            if not isinstance(payload.get("workflow"), dict):
+                raise AuthError("custom_strategy_workflow_required")
             if self.ai_client is None:
                 raise AuthError("custom_strategy_compile_unavailable", 503)
             try:
                 visual_compilation = self.ai_client.compile_custom_workflow(
-                    payload.get("workflow"),
+                    payload["workflow"],
                     open_logic=open_logic,
                     position_logic=position_logic,
                 )
             except (RuntimeError, ValueError) as exc:
                 raise AuthError("invalid_custom_strategy_workflow") from exc
         if preview_only:
-            if not is_custom_strategy or self.ai_client is None:
+            if not is_custom_strategy or self.ai_client is None or visual_compilation is None:
                 raise AuthError("custom_strategy_compile_unavailable", 503)
-            if visual_compilation is not None:
-                self._apply_custom_compilation(config, visual_compilation, custom_data)
-                fields = (
-                    "summary", "open_prompt_template", "position_prompt_template",
-                    "open_indicators", "position_indicators", "open_rule_plan", "position_rule_plan",
-                    "rule_engine_version", "open_kline_count",
-                    "position_kline_count", "open_requested_kline_count",
-                    "position_requested_kline_count", "open_indicator_kline_count",
-                    "position_indicator_kline_count", "open_data_type", "position_data_type",
-                    "unsupported_indicators", "unsupported_conditions", "unsupported_condition_count",
-                    "visual_conditions", "warnings", "prompt_version", "compile_status",
-                )
-                return {key: config[key] for key in fields}
-            temporary = {
-                "id": "",
-                "user_id": str(user["id"]),
-                "strategy_code": strategy_code,
-                "strategy_name": str(payload.get("name") or "自定义策略").strip(),
-                "config": config,
-            }
-            try:
-                compiled = self.ai_client.compile_custom_strategy(temporary)
-            except RuntimeError as exc:
-                raise AuthError(str(exc) or "custom_strategy_compile_failed", 502) from exc
-            self._apply_custom_compilation(config, compiled, custom_data)
+            self._apply_custom_compilation(config, visual_compilation, custom_data)
             fields = (
                 "summary", "open_prompt_template", "position_prompt_template",
                 "open_indicators", "position_indicators", "open_rule_plan", "position_rule_plan",
@@ -505,22 +433,10 @@ class UserAuthService:
             return {key: config[key] for key in fields}
 
         if is_custom_strategy:
-            if self.ai_client is None:
-                raise AuthError("custom_strategy_compile_unavailable", 503)
-            if visual_compilation is not None:
-                self._apply_custom_compilation(config, visual_compilation, custom_data)
-                config["workflow"] = visual_compilation["workflow"]
-                config["compiled_workflow"] = visual_compilation["compiled_workflow"]
-            else:
-                try:
-                    compiled = self.ai_client.normalize_custom_strategy_compilation(
-                        payload.get("compiled_config"),
-                        open_logic=open_logic,
-                        position_logic=position_logic,
-                    )
-                except RuntimeError as exc:
-                    raise AuthError(str(exc) or "invalid_custom_strategy_compilation") from exc
-                self._apply_custom_compilation(config, compiled, custom_data)
+            assert visual_compilation is not None
+            self._apply_custom_compilation(config, visual_compilation, custom_data)
+            config["workflow"] = visual_compilation["workflow"]
+            config["compiled_workflow"] = visual_compilation["compiled_workflow"]
         raw_key = "gl_" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")
         config["deployment_key"] = raw_key
         deployment = self.store.upsert_web_deployment(

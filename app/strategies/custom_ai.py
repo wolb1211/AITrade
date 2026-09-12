@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -15,6 +16,8 @@ from app.services.custom_rule_engine import (
 )
 from app.services.custom_workflow import compile_workflow
 from app.strategies.pa_agent_lite import _position_size_lot
+
+logger = logging.getLogger(__name__)
 
 
 class CustomAiStrategy:
@@ -339,7 +342,15 @@ def _workflow_ready(config: dict[str, Any], stage_name: str) -> bool:
         return False
     try:
         compiled = compile_workflow(workflow)
-        stage = compiled.get(stage_name)
-        return isinstance(stage, dict) and bool(stage.get("entry_node_id")) and isinstance(stage.get("nodes"), dict) and bool(stage.get("nodes"))
     except Exception:  # noqa: BLE001
+        # The user only sees "save the workflow again", so the underlying compile
+        # error has to stay observable in the server log.
+        logger.warning("custom strategy workflow failed to compile", exc_info=True)
         return False
+    stage = compiled.get(stage_name)
+    return (
+        isinstance(stage, dict)
+        and bool(stage.get("entry_node_id"))
+        and isinstance(stage.get("nodes"), dict)
+        and bool(stage.get("nodes"))
+    )

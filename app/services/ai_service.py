@@ -30,10 +30,15 @@ from app.store import SqliteStore
 
 logger = logging.getLogger(__name__)
 
-_VISION_TEST_IMAGE_PNG_DATA_URL = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAgAAAAEACAIAAABK8lkwAAAGw0lEQVR42u3ZgbWqMBBFUYugl3Rl4xahFiCIqCGZu8+aAv5/yuwEL3dJUmQXfwJJAoAkCQCSJABIkgAgSQKAJAkAkiQASJIAIEkCgCQJAJIkAEiSACBJAoAkCQCSJABIkgAgSQKAJAkAkiQASJIAIEkCgCQJAJIkAEgSACRJAJAkAUCSBABJEgAkSQCQJAFAkgQASRIAJEkAkCQBQJIEAEkSACRJAJAkAUCSBABJEgAkSQCQJAFAkgQASRIAJEkAkCQBQJIAIEkCgCQJAJIkAEiSACBJAoD6tSyLP4IkABRc7r/KH9O3Qt0CgIZ+tv2pfUnk+QLA9M/zrTVfVl8YAQAABR/j537/fkgAAAEAABM8wD/Z+N944AMCgAAAgH7PbYelfwADHxkABAD964k9ce/vl8DHN/7XqV1v5sQBgD5Y/UPt/Z0S+CgBYACgyqsfAwAwAABA9OrHAAAMAAAQvfoxAAADAB1/LAus/m0GfOgAMADwQBZf/RgAgAGA3j+NhVf/BgO+BgAAAAAc/FvOuAoAwADAQxi3+l0FAGAA4AlM3/4MAIABgO3fGMAAAAAAAEHPnr2/wYCvCgAAAADbnwECAAAA4LWP10ECAAAAYPszQAAAAABsfwYIAAAAgPf+fg8QAAAAANufAQIAAABg+zNAAAAAAGx/BggAAACA7c8AAAAAAACw/RkAAFsYAACw/RkAAMAAAAAAAAwAACA7c8AABgAAMD2ZwAADAAAsPZQWdA9DbDNAQAAADj+uwQIAAAAgO3PAAEAAADw8seLIAEAAABw/HcJEAAAAADHf5cAAAAAAABw/HcJAAAAAAAAx3+XAAAYAADA8d8lAAAGAABw/HcJAIABAAAc/10CAGAAAADHf5cAABgAZALg+O8SAAADgHQArF2XAAAYAADAAAAABgDVAbD9GQAAAwAAWLgAAIABQAwAfv71UzAADADSAbBqXQIAYAAAAAMAABgAVAfA+x9vgQBgAJAOgCXrEgAAAwAAGAAAwAAAAAYAADAAKAmAHwD8DAAAA4B0AKxXlwAAGAAAwAAAAAYAADAAAIABAAAMAABgAFAHAL8A+x0YAAYA6QBYrC4BADAAAIABAAAMAABgAAAAAwAAGAAAwAAAAAYAADAAAIABAAAMAABgAAAAAwAAGAAAwAAAAAYAAAAAAABgAAAAAAAAAAYAAAAAAGx/wwAAAAAADDC2PwAAAAAAGAAAAAAAAIABAAAAAAAAGAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYAAAAAAAAAAGAAAAAAAAYAAAAAbMuf0BAAAAAMAlwPFfAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAEAAPwO7BdgABgAAMAlwPEfAAYAAAAAAABgAAAASxYAADAAyASAAX4AAIABQBYALgGO/wAwAAAAAAAAAAOAVAAY4P0PAAwAsgBwCXD8B4ABAAAAAAAAGACEAcAA2x8ABgAAAAAAAGAAkAoAA/z8CwADgCwAXAIc/wFgAAAABjj+A8AAIAwAlwDHfwAYAACAAY7/ADAACAPAJcDxHwAGAABggOM/AAwAwgBwCXD8B4ABAAAY4PgPAAOAMABcAhz/AWAAAAAGOP4DwAAgDAAG2P4AMADIBcCLIC9/AGAAAAAGOP4DwAAgDAAG2P4AMADIBYABtj8ADAAAAAAAAMAAIPvpsrJtfwAYADDA2P4AMABggLH9AWAAwABj+wPAAIABxvYHAAAAwABj+wMAAACo97BZ6we2PwAAAAAAMMD2FwAAAAAG2P4CAAAA4PcA7/0FAAAAgAG2vwAAAAB4HeS1jwAAAAAwwPYXAAAAAAbY/gIAAAAw5HOYvPptfwAAAACuAg7+AgAAAOAq4OAvAAAAABiw+gUAAAAg68mswcDL/5ePGwAGAKrMgNUPAAMAxTFg9QPAAEBxDFj9ADAAAMB/GRhNgrV/pI9vlq+TxgkA+uC5HXDvW/0AEADU+wE+d+nb+wAQAAAwymPcYeNb/QAQAAAw5fO8f7/b+74wAgAAPNuWvi+JPF8AiHnU/TElAaAgEv4IkgAgSQKAJAkAkiQASJIAIEkCgCQJAJIkAEgSACRJAJAkAUCSBABJEgAkSQCQJAFAkgQASRIAJEkAkCQBQJIEAEkSACRJAJAkAUCSBABJEgAkSQCQJAFAkgQASRIAJEkAkCQBQJIAIEkCgCQJAJIkAEiSACBJAoAkCQCSJABIkgAgSQKAJAkAkiQASJIAIEkCgCQJAJIkAEiSACBJAoAkCQCSJABIkgAgSVrtAc9vTv8fmHypAAAAAElFTkSuQmCC"
-)
+# The JSON repair call is a small reformatting task (max_tokens=700), so it gets a
+# much shorter timeout than a full decision call. That is what makes the worst
+# case of the longest call chain predictable: PA runs two stages and each stage
+# may be followed by one repair, so the ceiling is
+#   2 x ai_timeout + 2 x REPAIR_TIMEOUT_SECONDS
+# which must stay under the EA's own HTTP timeout (currently 120s). A test
+# asserts that arithmetic so a future value change cannot silently break it.
+REPAIR_TIMEOUT_SECONDS = 10.0
+
 
 # JPEG is accepted more consistently than PNG data URLs by OpenAI-compatible gateways.
 _VISION_TEST_IMAGE_DATA_URL = (
@@ -48,11 +53,103 @@ class AiCallResult:
     usage: UsageSummary
 
 
+def _cached_input_tokens(usage_payload: dict[str, Any], prompt_tokens: int) -> int:
+    """Extract provider prompt-cache hits from an OpenAI-compatible usage block.
+
+    DeepSeek reports ``prompt_cache_hit_tokens``/``prompt_cache_miss_tokens``;
+    OpenAI-style gateways nest ``cached_tokens`` under
+    ``prompt_tokens_details``. Value is clamped to ``prompt_tokens`` so a
+    misreporting gateway can never produce a negative miss count.
+    """
+    if not isinstance(usage_payload, dict) or prompt_tokens <= 0:
+        return 0
+    raw = usage_payload.get("prompt_cache_hit_tokens")
+    if raw is None:
+        details = usage_payload.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            raw = details.get("cached_tokens")
+    try:
+        cached = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(cached, prompt_tokens))
+
+
 class AiDecisionClient:
     def __init__(self, store: SqliteStore, *, timeout: float = 20.0) -> None:
         self.store = store
         self.timeout = timeout
         self._cache_locks = tuple(Lock() for _ in range(64))
+
+    def pa_open_diagnosis(
+        self,
+        *,
+        deployment: dict[str, Any],
+        request_payload: OpenEvaluateRequest,
+        features: dict[str, Any],
+    ) -> AiCallResult | None:
+        """Stage 1 of the PA Agent flow: classify the market, choose no trade yet.
+
+        Runs before the order stage so the decision stage receives a stated
+        market read instead of having to derive one and pick a price in the
+        same breath. The diagnosis never carries a price or an order.
+        """
+        return self._chat_json(
+            deployment=deployment,
+            endpoint="pa_diag",
+            system_prompt=_pa_diagnosis_system_prompt(),
+            user_payload={
+                "task": "market_diagnosis",
+                "strategy_name": deployment["strategy_name"],
+                "symbol": request_payload.symbol,
+                "timeframe": request_payload.timeframe,
+                "bid": request_payload.bid,
+                "ask": request_payload.ask,
+                "spread_points": request_payload.spread_points,
+                "market_regime": {
+                    "cycle_position": features.get("cycle_position"),
+                    "background_direction": features.get("background_direction"),
+                    "recent_direction": features.get("recent_direction"),
+                    "trend_relationship": features.get("trend_relationship"),
+                    "recent_spike": features.get("recent_spike"),
+                    "market_phase": features.get("market_phase"),
+                    "transition_risk": features.get("transition_risk"),
+                    "climax_risk": features.get("climax_risk"),
+                    "always_in": features.get("always_in"),
+                    "barbwire_score": features.get("barbwire_score"),
+                    "swing_structure": features.get("swing_structure"),
+                    "above_ema": features.get("above_ema"),
+                },
+                "patterns": features.get("detected_patterns"),
+                "pattern_details": {
+                    "wedge_type": features.get("wedge_type"),
+                    "triangle_type": features.get("triangle_type"),
+                    "double_structure": features.get("double_structure"),
+                    "mtr_candidate": features.get("mtr_candidate"),
+                    "final_flag_candidate": features.get("final_flag_candidate"),
+                },
+                "signal_bar": {
+                    "type": features.get("signal_bar_type"),
+                    "quality": features.get("signal_bar_quality"),
+                    "follow_through": features.get("follow_through"),
+                },
+                "bar_by_bar_summary": features.get("bar_by_bar"),
+                "atr": features.get("atr14"),
+                "recent_candles": _compact_candles(request_payload.candles, limit=40),
+                "required_json_schema": {
+                    "cycle": "one of spike|micro_channel|tight_channel|normal_channel|broad_channel|trending_tr|trading_range|extreme_tr",
+                    "probabilities": "object with all eight cycle keys, integer 0-100, summing to 100",
+                    "direction": "bullish|bearish|neutral",
+                    "gates": {
+                        "gate1_no_trade_environment": {"passed": "boolean", "reason": "short Chinese"},
+                        "gate2_direction_clear": {"passed": "boolean", "reason": "short Chinese"},
+                        "gate3_extreme_location": {"passed": "boolean", "reason": "short Chinese"},
+                        "gate4_stop_definable": {"passed": "boolean", "reason": "short Chinese"},
+                    },
+                    "reasoning": "Chinese explanation, 80-300 characters",
+                },
+            },
+        )
 
     def pa_open_decision(
         self,
@@ -60,6 +157,8 @@ class AiDecisionClient:
         deployment: dict[str, Any],
         request_payload: OpenEvaluateRequest,
         features: dict[str, Any],
+        diagnosis: dict[str, Any] | None = None,
+        strategy_text: str = "",
     ) -> AiCallResult | None:
         return self._chat_json(
             deployment=deployment,
@@ -70,6 +169,7 @@ class AiDecisionClient:
                 "strategy_name": deployment["strategy_name"],
                 "strategy_summary": deployment["config"].get("summary", ""),
                 "open_logic": deployment["config"].get("open_logic", ""),
+                "strategy_library": strategy_text,
                 "symbol": request_payload.symbol,
                 "timeframe": request_payload.timeframe,
                 "account": request_payload.account.model_dump(mode="json"),
@@ -79,7 +179,7 @@ class AiDecisionClient:
                 "balance": request_payload.balance,
                 "equity": request_payload.equity,
                 "features": features,
-                "stage1_market_diagnosis": {
+                "stage1_market_diagnosis": diagnosis or {
                     "market_regime": {
                         "cycle_position": features.get("cycle_position"),
                         "background_direction": features.get("background_direction"),
@@ -105,33 +205,41 @@ class AiDecisionClient:
                         "follow_through": features.get("follow_through"),
                     },
                     "bar_by_bar_summary": features.get("bar_by_bar"),
-                    "program_recommendation": {
-                        "bias": features.get("setup_bias"),
-                        "score": features.get("setup_score"),
-                        "setup": features.get("setup_name"),
-                        "setup_code": features.get("setup_code"),
-                        "score_components": features.get("setup_components"),
-                        "long_score": features.get("long_score"),
-                        "short_score": features.get("short_score"),
-                        "score_margin": features.get("score_margin"),
-                        "candidate_direction": features.get("server_candidate_direction"),
-                        "structure_stop": features.get("server_structure_sl"),
-                        "minimum_risk_reward": features.get("server_min_risk_reward"),
-                        "rule": (
-                            "The server candidate direction is fixed. AI may approve that direction or reject the trade, "
-                            "but must never reverse it. The final server also preserves the structure stop and minimum risk-reward."
-                        ),
-                    },
-                    "risk_notes": [
-                        "Avoid trading when barbwire_candidate is true unless breakout/retest or failed-breakout reversal is clear.",
-                        "If opening, use sl_distance_price and tp_distance_price; keep stops outside structure and spread noise.",
-                        "For testing this strategy, do not require perfect breakout only; high-quality pullback or failed-breakout reversal is acceptable.",
-                    ],
                 },
+                # Always sent: the diagnosis stage replaces the block above, but
+                # the server's own candidate must survive into the order stage.
+                "program_recommendation": {
+                    "bias": features.get("setup_bias"),
+                    "score": features.get("setup_score"),
+                    "setup": features.get("setup_name"),
+                    "setup_code": features.get("setup_code"),
+                    "score_components": features.get("setup_components"),
+                    "long_score": features.get("long_score"),
+                    "short_score": features.get("short_score"),
+                    "score_margin": features.get("score_margin"),
+                    "candidate_direction": features.get("server_candidate_direction"),
+                    "structure_stop": features.get("server_structure_sl"),
+                    "atr": features.get("atr14"),
+                    "minimum_risk_reward": features.get("server_min_risk_reward"),
+                    "rule": (
+                        "The server candidate direction is fixed. AI may approve that direction or reject the trade, "
+                        "but must never reverse it. The final server also preserves the structure stop and minimum risk-reward."
+                    ),
+                },
+                "risk_notes": [
+                    "Avoid trading when barbwire_candidate is true unless breakout/retest or failed-breakout reversal is clear.",
+                    "Keep stops outside structure and spread noise; the server rejects stops that are too tight.",
+                    "Do not require a perfect breakout; a high-quality pullback or failed-breakout reversal is acceptable.",
+                ],
                 "recent_candles": _compact_candles(request_payload.candles, limit=40),
                 "required_json_schema": {
-                    "should_open": "boolean",
+                    "order_type": "市价单|限价单|突破单|不下单",
                     "direction": "buy|sell|null",
+                    "entry_price": "absolute price the order should use; required for 限价单 and 突破单",
+                    "sl_price": "absolute stop-loss price",
+                    "tp_price": "absolute take-profit price",
+                    "estimated_win_rate": "integer 0-100",
+                    "should_open": "boolean",
                     "confidence": "0..1 number",
                     "lot": "number, default 0.01",
                     "sl_distance_price": "positive price distance from entry",
@@ -140,119 +248,6 @@ class AiDecisionClient:
                     "analysis": "detailed final Chinese market explanation",
                 },
             },
-        )
-
-    def compile_custom_strategy(self, deployment: dict[str, Any]) -> dict[str, Any]:
-        """Turn the user's natural-language rules into a reusable runtime definition."""
-        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        open_logic = str(config.get("open_logic") or "").strip()
-        position_logic = str(config.get("position_logic") or "").strip()
-        open_result = self._chat_json(
-            deployment=deployment,
-            endpoint="compile_open",
-            system_prompt=_custom_strategy_stage_compile_prompt("open"),
-            user_payload={
-                "task": "compile_custom_open_strategy",
-                "stage": "open",
-                "user_logic": open_logic,
-                "available_indicators": public_indicator_catalog(),
-                "rules": {
-                    "candlestick_patterns": "Do not create indicators for candlestick patterns; runtime supplies OHLCV arrays.",
-                    "unsupported_indicator": "Put indicators outside available_indicators into unsupported_indicators.",
-                    "indicators": "Include every explicitly referenced built-in indicator and every period, such as EMA5 and EMA30.",
-                    "data_type": "Use kline unless the rule explicitly requires a chart image or an unsupported custom indicator.",
-                    "execution": "Preserve entry direction, trigger, stop-loss and take-profit rules without inventing conditions.",
-                },
-            },
-        )
-        position_result = self._chat_json(
-            deployment=deployment,
-            endpoint="compile_position",
-            system_prompt=_custom_strategy_stage_compile_prompt("position"),
-            user_payload={
-                "task": "compile_custom_position_strategy",
-                "stage": "position",
-                "user_logic": position_logic,
-                "available_indicators": public_indicator_catalog(),
-                "runtime_data_contract": {
-                    "positions": {
-                        "fields": ["ticket", "side", "volume", "open_price", "current_price", "profit", "sl", "tp"],
-                        "profit": "Account-currency P/L. Never compare it with ATR or another price distance.",
-                        "favorable_price_move": "BUY: current_price - open_price; SELL: open_price - current_price.",
-                    },
-                    "indicators": (
-                        "indicators.values is a map of alias arrays such as atr14, ema5 and ema30. Arrays are oldest "
-                        "to newest; [-1] is the latest closed candle and [-2] is the previous closed candle."
-                    ),
-                    "atr": "ATR is a price distance calculated from high, low and close; it is not account-currency profit.",
-                },
-                "rules": {
-                    "candlestick_patterns": "Do not create indicators for candlestick patterns; runtime supplies OHLCV arrays.",
-                    "unsupported_indicator": "Put indicators outside available_indicators into unsupported_indicators.",
-                    "indicators": "Include every explicitly referenced built-in indicator and every period, even when also used for opening.",
-                    "data_type": "Use kline unless the rule explicitly requires a chart image or an unsupported custom indicator.",
-                    "execution": "Do not invent new action types. Position actions are hold, close, add, modify.",
-                    "staged_rules": (
-                        "Preserve temporal words such as first, once, then, after, thereafter, already and not-yet. "
-                        "Compile sequential stop rules into mutually exclusive stages. A completed earlier stage must "
-                        "not become eligible again when the user says so; determine completion from observable position "
-                        "fields referenced by the user's rule instead of inventing persistent state."
-                    ),
-                    "add_volume": (
-                        "If position rules request adding but do not define a lot calculation, preserve the add condition, "
-                        "state in the position template that lot must be null so the server uses the opening sizing algorithm, "
-                        "and add a Chinese warning explaining this default. If a calculation is defined, preserve it exactly."
-                    ),
-                    "partial_close": (
-                        "If position rules request partial close without a percentage or explicit volume, add a Chinese warning "
-                        "asking the user to specify it. The runtime template must hold instead of guessing a close volume."
-                    ),
-                },
-            },
-        )
-        open_content = open_result.content if open_result is not None else {}
-        position_content = position_result.content if position_result is not None else {}
-        open_prompt = str(
-            open_content.get("prompt_template") or open_content.get("open_prompt_template") or ""
-        ).strip() if isinstance(open_content, dict) else ""
-        position_prompt = str(
-            position_content.get("prompt_template") or position_content.get("position_prompt_template") or ""
-        ).strip() if isinstance(position_content, dict) else ""
-        if not open_prompt or not position_prompt:
-            raise RuntimeError("custom_strategy_compile_failed")
-        open_summary = _clean_stage_summary(open_content.get("summary"))
-        position_summary = _clean_stage_summary(position_content.get("summary"))
-        combined = {
-            "summary": "；".join(filter(None, (
-                f"开仓：{open_summary}" if open_summary else "",
-                f"持仓风控：{position_summary}" if position_summary else "",
-            ))),
-            "open_prompt_template": open_prompt,
-            "position_prompt_template": position_prompt,
-            "open_indicators": open_content.get("indicators") or open_content.get("open_indicators") or [],
-            "position_indicators": position_content.get("indicators") or position_content.get("position_indicators") or [],
-            "open_rule_plan": open_content.get("rule_plan") or open_content.get("open_rule_plan") or {},
-            "position_rule_plan": position_content.get("rule_plan") or position_content.get("position_rule_plan") or {},
-            "open_data_type": config.get("open_data_type") or open_content.get("data_type") or open_content.get("open_data_type") or "kline",
-            "position_data_type": config.get("position_data_type") or position_content.get("data_type") or position_content.get("position_data_type") or "kline",
-            "unsupported_indicators": [
-                *_as_list(open_content.get("unsupported_indicators")),
-                *_as_list(position_content.get("unsupported_indicators")),
-            ],
-            "unsupported_conditions": [
-                *_stage_unsupported_conditions(open_content.get("unsupported_conditions"), "open"),
-                *_stage_unsupported_conditions(position_content.get("unsupported_conditions"), "position"),
-            ],
-            "visual_conditions": [
-                *_stage_unsupported_conditions(open_content.get("visual_conditions"), "open"),
-                *_stage_unsupported_conditions(position_content.get("visual_conditions"), "position"),
-            ],
-            "warnings": [*_as_list(open_content.get("warnings")), *_as_list(position_content.get("warnings"))],
-        }
-        return self.normalize_custom_strategy_compilation(
-            combined,
-            open_logic=open_logic,
-            position_logic=position_logic,
         )
 
     def generate_custom_workflow_stage(
@@ -508,8 +503,13 @@ class AiDecisionClient:
         candle_count = max(10, min(int(config.get("open_requested_kline_count") or config.get("open_kline_count") or 100), 1000))
         indicator_count = _workflow_history_count(config, "open")
         visual_stage = _runtime_compiled_stage(config, "open")
-        indicator_specs = visual_stage.get("indicators", []) if visual_stage is not None else list(config.get("open_indicators") or [])
-        user_rule = "已确认的开仓流程图" if visual_stage is not None else config.get("open_logic", "")
+        # The confirmed graph is the only executable contract: a custom strategy
+        # reaching here without one is a server-side inconsistency, not a case to
+        # silently fall back to natural-language text.
+        if visual_stage is None:
+            raise RuntimeError("custom_strategy_workflow_missing")
+        indicator_specs = visual_stage.get("indicators", [])
+        user_rule = "已确认的开仓流程图"
         indicators = calculate_indicator_payload(
             request_payload.candles,
             indicator_specs,
@@ -570,8 +570,10 @@ class AiDecisionClient:
         candle_count = max(10, min(int(config.get("position_requested_kline_count") or config.get("position_kline_count") or 100), 1000))
         indicator_count = _workflow_history_count(config, "position")
         visual_stage = _runtime_compiled_stage(config, "position")
-        indicator_specs = visual_stage.get("indicators", []) if visual_stage is not None else list(config.get("position_indicators") or [])
-        user_rule = "已确认的持仓风控流程图" if visual_stage is not None else config.get("position_logic", "")
+        if visual_stage is None:
+            raise RuntimeError("custom_strategy_workflow_missing")
+        indicator_specs = visual_stage.get("indicators", [])
+        user_rule = "已确认的持仓风控流程图"
         indicators = calculate_indicator_payload(
             request_payload.candles,
             indicator_specs,
@@ -896,27 +898,102 @@ class AiDecisionClient:
                     "risk_rules": [
                         "Close if current position conflicts with a strong opposite setup.",
                         "Modify stop when profit exists and structure allows a tighter protective stop.",
-                        "Add only when setup_score is high and direction matches the position plan.",
+                        "This strategy never pyramids: it holds one position at a time, so never request add.",
                     ],
                     "execution_constraints": {
-                        "allow_add": bool(deployment["config"].get("allow_add")),
-                        "max_positions": int(deployment["config"].get("max_positions") or 1),
+                        "pyramiding": False,
                         "current_positions": len(request_payload.positions),
-                        "rule": "Never request add when allow_add is false or current_positions reached max_positions.",
+                        "rule": "One position at a time. The only allowed actions are hold, close and modify.",
                     },
                 },
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
                 "recent_candles": _compact_candles(request_payload.candles, limit=40),
                 "required_json_schema": {
-                    "action": "hold|close|add|modify",
+                    "action": "hold|close|modify",
                     "ticket": "ticket string when action targets an existing position",
-                    "direction": "buy|sell|null, required for add",
+                    "direction": "buy|sell|null",
                     "confidence": "0..1 number",
-                    "lot": "number for add",
                     "sl": "new stop loss price or null",
                     "tp": "new take profit price or null",
                     "reason": "short Chinese reason",
                     "analysis": "detailed final Chinese position and risk explanation",
+                },
+            },
+        )
+
+    def turtle_position_review(
+        self,
+        *,
+        deployment: dict[str, Any],
+        request_payload: PositionEvaluateRequest,
+        signal: dict[str, Any],
+    ) -> AiCallResult | None:
+        """One review per position poll: proactive exit and add-on verdict.
+
+        The deterministic strategy has already produced every order parameter and
+        keeps a protective stop and an exit channel in force.  AI is asked two
+        questions only: whether to close the basket *before* those triggers fire,
+        and whether an add-on candidate may be executed.  It can change no order
+        parameter and can never block protective position management.
+        """
+        return self._chat_json(
+            deployment=deployment,
+            endpoint="position",
+            system_prompt=_turtle_position_review_prompt(),
+            user_payload={
+                "task": "turtle_position_review",
+                "strategy_name": deployment.get("strategy_name", "GL趋势策略"),
+                "symbol": request_payload.symbol,
+                "timeframe": request_payload.timeframe,
+                "account": request_payload.account.model_dump(mode="json"),
+                "bid": request_payload.bid,
+                "ask": request_payload.ask,
+                "signal": signal,
+                "recent_candles": _compact_candles(request_payload.candles, limit=20),
+                "required_json_schema": {
+                    "close_now": "boolean",
+                    "allow_add": "boolean",
+                    "risk_level": "low|medium|high",
+                    "confidence": "0..1 number",
+                    "reason": "short Chinese reason",
+                },
+            },
+        )
+
+    def turtle_open_risk_decision(
+        self,
+        *,
+        deployment: dict[str, Any],
+        request_payload: OpenEvaluateRequest,
+        signal: dict[str, Any],
+    ) -> AiCallResult | None:
+        """Use AI as a risk gate for a new Turtle/GL entry.
+
+        The deterministic strategy has already produced the direction, entry,
+        protective stop and volume.  AI may flag a concrete danger, but it can
+        neither change order parameters nor veto a usable setup by default.
+        """
+        return self._chat_json(
+            deployment=deployment,
+            endpoint="open",
+            system_prompt=_turtle_open_risk_system_prompt(),
+            user_payload={
+                "task": "turtle_open_risk_filter",
+                "strategy_name": deployment.get("strategy_name", "GL趋势策略"),
+                "symbol": request_payload.symbol,
+                "timeframe": request_payload.timeframe,
+                "account": request_payload.account.model_dump(mode="json"),
+                "bid": request_payload.bid,
+                "ask": request_payload.ask,
+                "spread_points": request_payload.spread_points,
+                "balance": request_payload.balance,
+                "equity": request_payload.equity,
+                "signal": signal,
+                "recent_candles": _compact_candles(request_payload.candles, limit=20),
+                "required_json_schema": {
+                    "allow_open": "boolean",
+                    "risk_level": "low|medium|high",
+                    "reason": "short Chinese reason",
                 },
             },
         )
@@ -1007,7 +1084,7 @@ class AiDecisionClient:
         final_system_prompt = _json_api_system_prompt(
             endpoint,
             system_prompt,
-            literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
+            literal_user_rules=_uses_literal_user_rules(deployment),
         )
         request_snapshot = _format_request_snapshot(
             model=model,
@@ -1018,8 +1095,10 @@ class AiDecisionClient:
         response_content = ""
         raw_response = ""
         usage = UsageSummary(ai_called=True)
+        elapsed_ms = 0
 
         try:
+            call_started = perf_counter()
             raw_response = self._post_chat_completion(
                 base_url=str(model["provider_base_url"]),
                 api_key=str(model["provider_api_key"]),
@@ -1030,8 +1109,14 @@ class AiDecisionClient:
                 strict_json=bool(model.get("strict_json", True)),
                 user_image_url=user_image_url,
             )
+            elapsed_ms = max(1, round((perf_counter() - call_started) * 1000))
             parsed = json.loads(raw_response)
             choice = (parsed.get("choices") or [{}])[0]
+            choice = choice if isinstance(choice, dict) else {}
+            # "length" means the provider stopped at the output limit, so the
+            # answer is incomplete by definition. Reasoning models hit this most:
+            # their thinking is charged against the same budget as the answer.
+            finish_reason = str(choice.get("finish_reason") or "").strip().lower()
             message_payload = choice.get("message") if isinstance(choice, dict) else {}
             if not isinstance(message_payload, dict):
                 message_payload = {}
@@ -1045,11 +1130,47 @@ class AiDecisionClient:
                     f"raw_preview={_preview_text(raw_response)}"
                 )
             usage_payload = parsed.get("usage") or {}
+            if not isinstance(usage_payload, dict):
+                usage_payload = {}
+            prompt_tokens = int(usage_payload.get("prompt_tokens") or 0)
+            if not usage_payload.get("total_tokens") and not prompt_tokens:
+                # Some aggregating gateways answer without a usage block. The
+                # call then bills zero to the customer while the platform still
+                # pays for it, so surface it instead of failing silently.
+                logger.warning(
+                    "AI provider returned no usage block; this call cannot be billed: endpoint=%s model=%s",
+                    endpoint,
+                    model_id,
+                )
             usage = UsageSummary(
                 ai_called=True,
-                input_tokens=int(usage_payload.get("prompt_tokens") or 0),
+                input_tokens=prompt_tokens,
                 output_tokens=int(usage_payload.get("completion_tokens") or 0),
                 charged_points=int(usage_payload.get("total_tokens") or 0),
+                elapsed_ms=elapsed_ms,
+                cached_input_tokens=_cached_input_tokens(usage_payload, prompt_tokens),
+            )
+            max_tokens = _max_tokens_for_endpoint(endpoint)
+            truncated = finish_reason == "length"
+            if truncated:
+                logger.warning(
+                    "AI output truncated at max_tokens: endpoint=%s model=%s completion_tokens=%s max_tokens=%s",
+                    endpoint,
+                    model_id,
+                    usage.output_tokens,
+                    max_tokens,
+                )
+            preview_note = "\n\n".join(
+                part
+                for part in (
+                    _elapsed_note(elapsed_ms),
+                    _truncation_note(
+                        truncated=truncated,
+                        completion_tokens=usage.output_tokens,
+                        max_tokens=max_tokens,
+                    ),
+                )
+                if part
             )
             try:
                 content = _extract_json_object(response_content, endpoint=endpoint)
@@ -1061,7 +1182,9 @@ class AiDecisionClient:
                         "AI decision JSON recovered locally: %s",
                         f"{type(parse_exc).__name__}: {parse_exc}; response_preview={_preview_text(original_response_content)}",
                     )
-                    response_preview = _format_response_preview(raw=original_response_content, parsed=recovered)
+                    response_preview = _format_response_preview(
+                        raw=original_response_content, parsed=recovered, note=preview_note
+                    )
                     cache_id = self._save_cache_result(
                         cache_key=cache_key,
                         cache_ttl_seconds=cache_ttl_seconds,
@@ -1115,13 +1238,16 @@ class AiDecisionClient:
                         success=False,
                         is_custom=is_custom,
                         error_message=message[:1000],
-                        response_preview=_format_response_preview(raw=original_response_content or response_content),
+                        response_preview=_format_response_preview(
+                            raw=original_response_content or response_content,
+                            note=preview_note,
+                        ),
                     )
                     return AiCallResult(content=_fallback_decision(endpoint, "AI未返回有效JSON，保守观望"), usage=usage)
             content = _apply_workflow_action_defaults(endpoint, user_payload, content)
             if endpoint == "position":
                 content = _apply_workflow_position_defaults(user_payload, content)
-            response_preview = _format_response_preview(raw=response_content, parsed=content)
+            response_preview = _format_response_preview(raw=response_content, parsed=content, note=preview_note)
             cache_id = self._save_cache_result(
                 cache_key=cache_key,
                 cache_ttl_seconds=cache_ttl_seconds,
@@ -1196,7 +1322,7 @@ class AiDecisionClient:
             "system_prompt": _json_api_system_prompt(
                 endpoint,
                 system_prompt,
-                literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
+                literal_user_rules=_uses_literal_user_rules(deployment),
             ),
             "user_payload": user_payload,
             # Screenshot bytes are part of the request semantics. Include a
@@ -1233,7 +1359,7 @@ class AiDecisionClient:
             system_prompt=_json_api_system_prompt(
                 endpoint,
                 system_prompt,
-                literal_user_rules=_uses_literal_user_rules(deployment, endpoint),
+                literal_user_rules=_uses_literal_user_rules(deployment),
             ),
             user_prompt=prompt,
         )
@@ -1290,7 +1416,9 @@ class AiDecisionClient:
 
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        prefix = "open" if endpoint in {"open", "compile", "compile_open", "workflow_open"} else "position"
+        # pa_diag is stage 1 of the open flow: it must use the same model the
+        # user configured for opening, not the position model.
+        prefix = "open" if endpoint in {"open", "workflow_open", "pa_diag"} else "position"
         if str(config.get(f"{prefix}_ai_mode") or "official") == "custom":
             base_url = str(config.get(f"{prefix}_ai_base_url") or config.get(f"{prefix}_ai_provider") or "").strip()
             model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
@@ -1314,7 +1442,7 @@ class AiDecisionClient:
                 return configured_endpoint
         official_strategy = self.store.get_official_ai_strategy(str(deployment.get("strategy_code") or ""))
         if official_strategy is not None:
-            endpoint_key = "open_ai_endpoint_id" if endpoint == "open" else "position_ai_endpoint_id"
+            endpoint_key = f"{prefix}_ai_endpoint_id"
             configured_endpoint_id = str(config.get(f"{prefix}_ai_endpoint_id") or official_strategy.get(endpoint_key) or "").strip()
             if configured_endpoint_id:
                 configured_endpoint = self.store.get_private_ai_endpoint(configured_endpoint_id)
@@ -1341,7 +1469,9 @@ class AiDecisionClient:
         user_image_url: str = "",
         max_tokens: int,
         strict_json: bool = True,
+        timeout: float | None = None,
     ) -> str:
+        call_timeout = self.timeout if timeout is None else float(timeout)
         normalized_base_url = base_url.strip().rstrip("/")
         url = normalized_base_url if normalized_base_url.lower().endswith("/chat/completions") else f"{normalized_base_url}/chat/completions"
         user_content: str | list[dict[str, Any]] = user_prompt
@@ -1391,7 +1521,7 @@ class AiDecisionClient:
                 },
             )
             try:
-                with request.urlopen(req, timeout=self.timeout) as response:
+                with request.urlopen(req, timeout=call_timeout) as response:
                     return response.read().decode("utf-8")
             except error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
@@ -1408,9 +1538,9 @@ class AiDecisionClient:
                 suffix = f"; previous compatibility error: {compatibility_errors[0]}" if compatibility_errors else ""
                 raise RuntimeError(f"AI provider HTTP {exc.code}: {detail[:500]}; url={url}{suffix}") from exc
             except TimeoutError as exc:
-                raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+                raise TimeoutError(f"AI provider timeout after {call_timeout:g}s: model={model}, url={url}") from exc
             except SocketTimeout as exc:
-                raise TimeoutError(f"AI provider timeout after {self.timeout:g}s: model={model}, url={url}") from exc
+                raise TimeoutError(f"AI provider timeout after {call_timeout:g}s: model={model}, url={url}") from exc
             except error.URLError as exc:
                 raise RuntimeError(f"AI provider connection failed: {exc.reason}; model={model}, url={url}") from exc
 
@@ -1452,6 +1582,7 @@ class AiDecisionClient:
             user_prompt=response_content[:6000],
             max_tokens=700,
             strict_json=strict_json,
+            timeout=REPAIR_TIMEOUT_SECONDS,
         )
         parsed = json.loads(raw_response)
         choice = (parsed.get("choices") or [{}])[0]
@@ -1499,12 +1630,15 @@ class AiDecisionClient:
                 "timeframe": str(request_payload.get("timeframe") or "").upper(),
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "elapsed_ms": usage.elapsed_ms,
                 "total_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens,
                 "official_tokens": 0 if is_custom else usage.charged_points or usage.input_tokens + usage.output_tokens,
                 "custom_tokens": usage.charged_points or usage.input_tokens + usage.output_tokens if is_custom else 0,
                 "billing_source": "custom" if is_custom else "official",
                 "input_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "input", self.store),
                 "output_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "output", self.store),
+                "cache_input_price_snapshot": 0 if is_custom else model_price(provider_id, model_id, "cache_input", self.store),
                 "success": success,
                 "provider_called": provider_called,
                 "response_source": response_source or ("provider" if success else "fallback"),
@@ -1520,8 +1654,25 @@ def model_price(provider_id: str, model_id: str, price_type: str, store: SqliteS
     endpoint = store.get_private_ai_endpoint(model_id) or store.get_private_ai_endpoint(provider_id)
     if endpoint is None:
         return "0"
+    if price_type == "cache_input":
+        # Unconfigured cache price falls back to the normal input price so the
+        # charge for an endpoint that never set one is unchanged.
+        return str(
+            endpoint.get("cache_input_price_per_million")
+            or endpoint.get("input_price_per_million")
+            or "0"
+        )
     field = "input_price_per_million" if price_type == "input" else "output_price_per_million"
     return str(endpoint.get(field) or "0")
+
+
+# Shared rule: the customer reads reason/analysis as proof of what the AI said,
+# so the model must not echo the payload's own field names back in English.
+_PLAIN_CHINESE_RULE = (
+    "Write reason and analysis in plain Chinese trading language only. Never output internal field names, "
+    "JSON keys, snake_case identifiers, or English parameter names (write 浮盈ATR倍数, not favorable_atr); "
+    "refer to concepts by their Chinese trading names instead. "
+)
 
 
 def _pa_system_prompt() -> str:
@@ -1531,11 +1682,72 @@ def _pa_system_prompt() -> str:
         "Do not output thoughts, reasoning process, markdown, code fences, prefixes, suffixes, or prose outside JSON. "
         "Analyze silently. Put the final useful explanation inside the JSON fields reason and analysis. "
         "If uncertain, weak, conflicting, or unsafe, choose no-open or hold. "
-        "Open endpoint keys: should_open, direction, confidence, lot, sl_distance_price, tp_distance_price, reason, analysis. "
+        "Open endpoint keys: order_type, direction, entry_price, sl_price, tp_price, estimated_win_rate, lot, "
+        "should_open, confidence, sl_distance_price, tp_distance_price, reason, analysis. "
         "Position endpoint keys: action, ticket, direction, confidence, lot, sl, tp, reason, analysis. "
+        "The position endpoint may only answer hold, close or modify: this strategy holds one position at "
+        "a time and never pyramids, so add is not an available action. "
         "reason must be Chinese, concrete, <=60 Chinese characters. "
         "analysis must be Chinese, 120-300 Chinese characters, with market structure, setup score, price/risk context, and action rationale. "
-        "Never invent prices. Use price distances for open SL/TP."
+        "Never invent prices. Use price distances for open SL/TP. "
+        f"{_PLAIN_CHINESE_RULE}"
+    )
+
+
+def _pa_diagnosis_system_prompt() -> str:
+    return (
+        "You are the GainLab PA Agent market diagnosis stage. Return only one compact JSON object. "
+        "First character must be { and last character must be }. "
+        "Do not output thoughts, reasoning process, markdown, code fences, prefixes, suffixes, or prose outside JSON. "
+        "You describe the market only: you never output prices, orders or buy/sell actions. "
+        "Keys: cycle, probabilities, direction, gates, reasoning. "
+        "cycle must be exactly one of: spike, micro_channel, tight_channel, normal_channel, broad_channel, "
+        "trending_tr, trading_range, extreme_tr. "
+        "probabilities must contain all eight cycle keys with integer values 0-100 summing to 100, and cycle must be "
+        "the argmax (ties resolved in the order listed above). "
+        "direction is one of bullish, bearish, neutral and must be an independent judgement, not derived from cycle. "
+        "gates must contain gate1_no_trade_environment, gate2_direction_clear, gate3_extreme_location and "
+        "gate4_stop_definable, each an object with a boolean passed and a short Chinese reason. "
+        "reasoning must be Chinese, 80-300 Chinese characters, explaining the cycle evidence and the expected transition. "
+        f"{_PLAIN_CHINESE_RULE}"
+    )
+
+
+def _turtle_position_review_prompt() -> str:
+    return (
+        "You are the GainLab GL Trend position reviewer. Return only one compact JSON object. "
+        "The server manages the position deterministically and you must not interfere with that: it keeps a "
+        "basket-wide protective stop in force as the backstop, it moves the stop to break-even and trails it to "
+        "lock in part of the profit, and it closes at an opposite exit channel. Never suggest a stop level, a "
+        "trailing distance, a direction, a price or a volume. "
+        "You answer exactly two questions. "
+        "close_now: should the server close the WHOLE position right now, before any of those triggers fire? "
+        "Answer true when either (a) the move has already run far enough that taking the profit now is better than "
+        "giving it back, or (b) the current state looks like a genuine reversal or exhaustion. "
+        "Declining is safe because the protective stop stays in force, so only answer true when you can name a "
+        "concrete reason. "
+        "allow_add: may the server execute the add-on candidate if one is present? Approve by default: the add-on "
+        "only has to be acceptable, not ideal. "
+        "Use risk_level high only for a specific, nameable danger. "
+        "Do not answer true merely because the trend is unclear or you would have picked a different entry. "
+        "Required keys: close_now (boolean), allow_add (boolean), risk_level (low|medium|high), confidence (0..1), "
+        "reason (short Chinese text). "
+        f"{_PLAIN_CHINESE_RULE}"
+    )
+
+
+def _turtle_open_risk_system_prompt() -> str:
+    return (
+        "You are the GainLab GL Trend strategy entry risk gate. Return only one compact JSON object. "
+        "The server has already calculated the strategy direction, entry price, protective stop, ATR, and position size. "
+        "Your only job is to flag a concrete danger that makes this entry a bad idea right now. "
+        "Approve by default: the setup only has to be acceptable, not ideal. "
+        "Use risk_level high only for a specific, nameable danger, such as an exhausted or overextended move right at the "
+        "entry, an extreme volatility spike, or a violent opposite reaction on the latest bars. "
+        "Do not use medium or high merely because the trend is unclear, the setup is imperfect, or you would have picked a "
+        "different entry. Never propose a different direction, price, stop or volume. "
+        "Required keys: allow_open (boolean), risk_level (low|medium|high), reason (short Chinese text). "
+        f"{_PLAIN_CHINESE_RULE}"
     )
 
 
@@ -1783,26 +1995,6 @@ def _explicit_recent_extreme_stop_rule(
     return ""
 
 
-def _workflow_stage_compact_contract(stage: str) -> dict[str, Any]:
-    return {
-        "root": {"entry_node_id": "entry id", "data_requirements": "copy supplied value", "nodes": "array", "edges": "array"},
-        "node_types": {
-            "entry": {"id": "ASCII id", "type": "entry", "stage": stage, "label": "Chinese label"},
-            "condition": {"id": "ASCII id", "type": "condition", "label": "Chinese label", "condition": "valid condition object"},
-            "ai_condition": {"id": "ASCII id", "type": "ai_condition", "label": "Chinese label", "instruction": "exact open rule", "data_type": "kline|screenshot|both"},
-            "action": {"id": "ASCII id", "type": "action", "label": "Chinese label", "action": {"kind": "allowed stage action"}},
-        },
-        "edges": {"fields": ["id", "source", "target", "source_handle"], "handles": "entry:next; condition/ai_condition:yes and no"},
-        "graph_rules": [
-            "entry has exactly one next edge",
-            "every condition has exactly one yes and one no edge",
-            "every node is reachable from entry",
-            "every branch ends at an action",
-            "action nodes have no outgoing edge",
-        ],
-    }
-
-
 def _workflow_source_rules(user_logic: str) -> list[str]:
     """Split author text into stable rules while keeping each rule's wording intact."""
     parts = re.split(r"(?:\r?\n)+|[。；;]+", str(user_logic or ""))
@@ -1989,22 +2181,6 @@ def _workflow_stage_from_classified_rules(
     }
 
 
-def _custom_workflow_rule_classification_prompt(stage: str) -> str:
-    allowed = "open_buy, open_sell, no_action" if stage == "open" else (
-        "close_all, close_partial, add_buy, add_sell, modify_sl, modify_tp, cancel_pending, hold"
-    )
-    return (
-        "Classify each supplied trading rule by its explicit resulting action. Return only one compact JSON object "
-        "with shape {\"rules\":[{\"rule_index\":1,\"label\":\"short Chinese label\","
-        "\"action_kind\":\"allowed kind\"}]}. Include every source rule exactly once and preserve source order. "
-        "rule_index must be copied exactly; never merge, split, rewrite or add a rule. Classify only the explicit action, "
-        "not the condition. A full close is close_all, partial close is close_partial, moving/changing stop loss is "
-        "modify_sl, changing take profit is modify_tp, adding long/short is add_buy/add_sell, cancelling a pending order "
-        "is cancel_pending, and an explicit no-operation is hold/no_action according to stage. Never infer an action that "
-        f"the source text does not state. Allowed action kinds for this stage: {allowed}."
-    )
-
-
 def _custom_workflow_stage_generation_prompt(stage: str, *, repair: bool = False) -> str:
     stage_title = "开仓" if stage == "open" else "持仓风控"
     allowed_actions = "open_buy, open_sell, no_action" if stage == "open" else (
@@ -2050,62 +2226,6 @@ def _custom_workflow_stage_generation_prompt(stage: str, *, repair: bool = False
         "or hold for position management. Do not invent partial-close volume or add volume. "
         f"{position_rule}"
         f"Only these actions are allowed in this stage: {allowed_actions}."
-    )
-
-
-def _custom_strategy_stage_compile_prompt(stage: str) -> str:
-    common = (
-        "You compile one stage of a user's natural-language trading strategy into a reusable prompt template. "
-        "Analyze only the supplied stage. The user's original rule is the sole source of trading logic. "
-        "Preserve every condition exactly and do not add, optimize, recommend or infer any condition the user did not write. "
-        "Do not add trend, confirmation, score, market-structure, volatility, risk-reward or safety filters. "
-        "Extract every explicitly referenced built-in indicator and period. Candlestick sequences, engulfing, pin bars, "
-        "support, resistance, recent highs and recent lows are inferred directly from OHLCV and are not indicators. "
-        "The template must apply the rule strictly to supplied closed candles and calculated indicator arrays. "
-        "Also produce rule_plan for deterministic execution when every condition and action in this stage can be represented "
-        "by the safe expression language below. rule_plan is {version:1,mode:'deterministic',rules:[...]}; each rule is "
-        "{when:'boolean expression',action:{...},description:'short Chinese rule'}. Preserve the user's rule order. "
-        "Allowed variables: bid, ask, side, open_price, current_price, sl, tp, volume, profit, favorable_move and indicator "
-        "aliases such as ema5, ema30 and atr14. Allowed functions: latest_cross('ema5','ema30',3), "
-        "cross_above('ema5','ema30',3), cross_below('ema5','ema30',3), indicator('ema5',-1), lowest_low(5), "
-        "highest_high(5), consecutive('up',10), pattern('bullish_engulfing',3), pattern('bearish_engulfing',3), "
-        "pattern('bullish_pinbar',3), pattern('bearish_pinbar',3), pattern('doji',3), min, max and abs. "
-        "Expressions may use and/or/not, parentheses, arithmetic and comparisons. String constants BUY and SELL must be quoted. "
-        "latest_cross returns 1 for the most recent upward cross, -1 for downward cross and 0 for none within the window. "
-        "Use exactly the listed variable names; use profit, never current_profit or another synonym. Every position rule that "
-        "mentions a long/BUY position must include side == 'BUY'; every rule that mentions a short/SELL position must include "
-        "side == 'SELL'. A crossover needs at least two values: use window 2 for only the latest crossover, never window 1. "
-        "Open-stage conditions cannot use side or position fields because no position exists before opening. Every open rule's "
-        "when expression must contain the actual user trigger; never replace an EMA crossover with a BUY/SELL side comparison. "
-        "Open action shape: {type:'open',direction:'buy|sell',sl:'expression or null',tp:'expression or null'}. "
-        "Position modify action is {type:'modify',sl:'expression or null',tp:'expression or null',"
-        "sl_constraint:'not_below_current|not_above_current|null'}. If the user says a new stop cannot be below the old "
-        "stop, use not_below_current; if it cannot be above the old stop, use not_above_current. "
-        "All absent optional values must be JSON null without quotation marks, never the strings 'null' or 'none'. "
-        "{type:'close',close_scope:'full|partial',volume:'expression or null'}, or "
-        "{type:'add',direction:'buy|sell',lot:'expression or null',sl:'expression or null',tp:'expression or null'}. "
-        "If any condition is screenshot-based, return rule_plan {version:1,mode:'ai',rules:[]} and list each screenshot "
-        "condition in visual_conditions. If a condition cannot be handled exactly by either the safe expression language "
-        "or the supplied screenshot, return AI mode and list it in unsupported_conditions instead of approximating it. "
-    )
-    if stage == "open":
-        return common + (
-            "Preserve entry direction, trigger, stop-loss and take-profit semantics. Return Chinese summary, template and warnings."
-        )
-    return common + (
-        "Preserve hold, close, add, partial-close and stop modification semantics. Preserve an explicit add-lot formula; "
-        "when add has no sizing formula, declare that server opening sizing is used. Never invent a partial-close amount. "
-        "Preserve temporal and staged semantics expressed by words such as first, once, then, after, thereafter, already "
-        "and not-yet. Convert sequential rules into explicit stage conditions: once the observable current position state "
-        "shows an earlier stage is completed, that stage must not execute again only when this follows from the user's "
-        "wording. Never flatten a user-defined sequence into independent conditions that remain simultaneously eligible. "
-        "Preserve exactly any user-defined action priority and stop direction. Do not invent a default priority, a rule that "
-        "stops may only tighten, or any indicator, threshold, stage, trigger or risk rule. If simultaneous rules conflict "
-        "and give no priority, report that ambiguity in warnings instead of silently choosing a policy. "
-        "Write the template as clear Chinese instructions, not executable code or pseudocode. Follow runtime_data_contract "
-        "exactly. warnings must contain only user-actionable missing, ambiguous, unsupported or conflicting rules; never "
-        "put implementation notes, default data sources, array indexes or normal calculation conventions in warnings. "
-        "Return Chinese summary, template and warnings."
     )
 
 
@@ -2192,33 +2312,6 @@ def _custom_rule_explanation_prompt(endpoint: str) -> str:
     )
 
 
-def _custom_strategy_fallback(open_logic: str, position_logic: str) -> dict[str, Any]:
-    return {
-        "summary": "根据用户自然语言规则，由 AI 结合已收盘 K 线和所需指标执行开仓与持仓风控判断。",
-        "open_prompt_template": (
-            "严格按用户开仓规则判断。必须逐项验证全部条件；K线形态、连续涨跌、近期高低点直接从"
-            "按时间升序提供的OHLCV判断。条件不完整、不明确或数据不足时不开仓。"
-        ),
-        "position_prompt_template": (
-            "严格按用户持仓风控规则判断。只有明确触发规则时才能平仓、加仓或修改止盈止损；"
-            "没有触发时继续持有。"
-        ),
-        "open_indicators": [],
-        "position_indicators": [],
-        "open_data_type": "kline",
-        "position_data_type": "kline",
-        "unsupported_indicators": [],
-        "unsupported_conditions": [],
-        "unsupported_condition_count": 0,
-        "visual_conditions": [],
-        "warnings": [],
-        "prompt_version": 2,
-        "compile_status": "fallback",
-        "open_logic": open_logic,
-        "position_logic": position_logic,
-    }
-
-
 def _rewrite_rule_plan_indicator_aliases(value: Any, specs: list[dict[str, Any]]) -> Any:
     if not isinstance(value, dict):
         return value
@@ -2295,23 +2388,6 @@ def _custom_data_type(value: Any, unsupported: list[str]) -> str:
     return normalized
 
 
-def _as_list(value: Any) -> list[Any]:
-    if isinstance(value, list):
-        return value
-    return [] if value is None or value == "" else [value]
-
-
-def _stage_unsupported_conditions(value: Any, stage: str) -> list[dict[str, Any]]:
-    items = value if isinstance(value, list) else [value] if value else []
-    result: list[dict[str, Any]] = []
-    for item in items:
-        if isinstance(item, dict):
-            result.append({**item, "stage": stage})
-        elif str(item).strip():
-            result.append({"stage": stage, "text": str(item).strip()})
-    return result
-
-
 def _normalize_unsupported_conditions(value: Any) -> list[dict[str, str]]:
     items = value if isinstance(value, list) else [value] if value else []
     result: list[dict[str, str]] = []
@@ -2385,10 +2461,6 @@ def _runtime_ai_conditions(config: dict[str, Any], stage_name: str) -> list[dict
             "lookback": node.get("lookback", 1),
         })
     return result
-
-
-def _clean_stage_summary(value: Any) -> str:
-    return str(value or "").strip().strip("；;。 ")
 
 
 def _extract_explicit_indicator_specs(logic: str) -> list[dict[str, Any]]:
@@ -2987,8 +3059,8 @@ def _custom_runtime_template(value: Any) -> str:
     return template
 
 
-def _uses_literal_user_rules(deployment: dict[str, Any], endpoint: str) -> bool:
-    return endpoint.startswith("compile") or str(deployment.get("strategy_code") or "") == "CUSTOM_AI_V1"
+def _uses_literal_user_rules(deployment: dict[str, Any]) -> bool:
+    return str(deployment.get("strategy_code") or "") == "CUSTOM_AI_V1"
 
 
 def _json_api_system_prompt(
@@ -3003,16 +3075,23 @@ def _json_api_system_prompt(
             "Start with { and end with }. No markdown, code fences, prefix, suffix or prose outside JSON. "
             f"Task: {task_prompt}"
         )
-    if endpoint.startswith("compile"):
+    if endpoint == "pa_diag":
         return (
             "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
-            "Required keys: summary, prompt_template, indicators, rule_plan, data_type, unsupported_indicators, "
-            "visual_conditions, unsupported_conditions, warnings. visual_conditions is an array of "
-            "{text:'exact screenshot-dependent user condition',code:'short visual capability code'}. "
-            "unsupported_conditions is an array of "
-            "{text:'exact unsupported user condition',code:'short capability code',reason:'short Chinese reason'}. "
-            "Use an empty array when every user condition is represented exactly by rule_plan. "
-            "Each indicator item uses {name,source,params,alias}. data_type is kline, screenshot, or both. "
+            "Start with { and end with }. No markdown, no code fences, no prefix, no suffix, no prose outside JSON. "
+            'Required JSON shape: {"cycle":"<one of the eight cycle names>",'
+            '"probabilities":{"spike":0,"micro_channel":0,"tight_channel":0,"normal_channel":0,'
+            '"broad_channel":0,"trending_tr":0,"trading_range":0,"extreme_tr":0},'
+            '"direction":"bullish|bearish|neutral",'
+            '"gates":{"gate1_no_trade_environment":{"passed":false,"reason":""},'
+            '"gate2_direction_clear":{"passed":false,"reason":""},'
+            '"gate3_extreme_location":{"passed":false,"reason":""},'
+            '"gate4_stop_definable":{"passed":false,"reason":""}},'
+            '"reasoning":"Chinese explanation"}'
+            ". "
+            "You only describe the market. Never output prices, order types or buy/sell instructions. "
+            "The eight probability values must sum to 100 and cycle must be the largest of them. "
+            "Never copy placeholder text such as cycle, reason, or .... "
             f"Task: {task_prompt}"
         )
     schema = (
@@ -3055,6 +3134,7 @@ def _json_api_system_prompt(
         "reason: Chinese, concrete, <=60 Chinese characters. "
         "analysis: Chinese, 120-300 Chinese characters, include market structure, setup_score, price/risk context, and action rationale. "
         "Never copy placeholder text such as reason, analysis, or .... "
+        f"{_PLAIN_CHINESE_RULE}"
         f"Task: {task_prompt}"
     )
 
@@ -3062,12 +3142,12 @@ def _json_api_system_prompt(
 def _max_tokens_for_endpoint(endpoint: str) -> int:
     if endpoint.startswith("workflow_"):
         return 6000
-    if endpoint.startswith("compile"):
-        return 2400
-    if endpoint == "open":
-        return 1000
-    if endpoint == "position":
-        return 1000
+    if endpoint in {"open", "position", "pa_diag"}:
+        # 3000 rather than 1000: reasoning models charge their thinking against
+        # this same budget, and at 1000 they ran out before writing any JSON.
+        # A higher ceiling costs nothing on its own because the model still stops
+        # when it is finished; it only stops truncating the answers that need it.
+        return 3000
     return 500
 
 def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any]]:
@@ -3109,7 +3189,72 @@ def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
     return parsed
 
 
+# Field names the model sees in the payload. Models frequently echo them back in
+# English inside otherwise-Chinese prose ("favorable_atr仅0.91"), and the customer
+# reads that text as proof of what the AI actually said, so known names are
+# rendered in Chinese instead of leaking a snake_case identifier into the panel.
+_INTERNAL_FIELD_NAMES: dict[str, str] = {
+    "bar_by_bar_summary": "逐棒分析",
+    "bar_by_bar": "逐棒分析",
+    "protective_stop_levels": "保护性止损位",
+    "protective_stop": "保护性止损",
+    "trend_relationship": "趋势关系",
+    "background_direction": "背景方向",
+    "signal_bar_quality": "信号棒质量",
+    "detected_patterns": "识别形态",
+    "transition_risk": "转换风险",
+    "recent_direction": "近期方向",
+    "recent_candles": "近期K线",
+    "recent_spike": "近期急速行情",
+    "position_summary": "持仓汇总",
+    "bars_since_open": "持仓K线数",
+    "climax_risk": "高潮风险",
+    "market_phase": "市场阶段",
+    "cycle_position": "周期位置",
+    "range_position": "区间位置",
+    "favorable_atr": "浮盈ATR倍数",
+    "entry_analysis": "入场分析",
+    "add_candidate": "加仓候选",
+    "swing_direction": "回调方向",
+    "donchian_direction": "突破方向",
+    "setup_score": "形态评分",
+    "setup_name": "形态名称",
+    "follow_through": "跟随情况",
+    "close_now": "是否立即平仓",
+    "risk_level": "风险等级",
+    "allow_open": "开仓许可",
+    "allow_add": "加仓许可",
+    "always_in": "单边状态",
+    "stop_atr": "止损ATR倍数",
+    "max_units": "最大持仓数",
+    "units_open": "已持仓数",
+}
+
+# Longest first so "bar_by_bar_summary" wins over "bar_by_bar". The lookarounds
+# replace \b, which fails next to CJK characters (the common real-world case).
+_FIELD_NAME_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])("
+    + "|".join(re.escape(name) for name in sorted(_INTERNAL_FIELD_NAMES, key=len, reverse=True))
+    + r")(?![A-Za-z0-9_])"
+)
+
+
+def _scrub_internal_field_names(text: str) -> str:
+    """Replace echoed payload field names with Chinese before anything is shown."""
+    if not text:
+        return text
+    return _FIELD_NAME_PATTERN.sub(lambda match: _INTERNAL_FIELD_NAMES[match.group(1)], text)
+
+
 def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") -> None:
+    if endpoint == "pa_diag":
+        # The diagnosis stage carries no reason/analysis fields. Injecting the
+        # generic placeholders here would put text in the call log that the
+        # model never produced, which is exactly what the log is meant to prove.
+        reasoning = parsed.get("reasoning")
+        if isinstance(reasoning, str):
+            parsed["reasoning"] = _scrub_internal_field_names(reasoning)
+        return
     reason = str(parsed.get("reason") or "").strip()
     analysis = str(parsed.get("analysis") or "").strip()
     placeholder_reasons = {
@@ -3146,8 +3291,8 @@ def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") ->
         reason = reason[:90]
     if len(analysis) < 16:
         analysis = default_analysis
-    parsed["reason"] = reason[:120]
-    parsed["analysis"] = analysis[:800]
+    parsed["reason"] = _scrub_internal_field_names(reason[:120])
+    parsed["analysis"] = _scrub_internal_field_names(analysis[:800])
 
 
 def _recover_decision_from_text(content: str, *, endpoint: str = "") -> dict[str, Any] | None:
@@ -3259,8 +3404,35 @@ def _scan_json_object(value: str, start: int) -> str | None:
     return None
 
 
-def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = None) -> str:
+def _elapsed_note(elapsed_ms: int) -> str:
+    """Timing line for the call detail.
+
+    A single-threaded EA is idle for exactly this long on each check, so the
+    number is what decides whether a model is fast enough to keep.
+    """
+    if elapsed_ms <= 0:
+        return ""
+    return f"⏱ 本次 AI 调用耗时 {elapsed_ms / 1000:.1f}s"
+
+
+def _truncation_note(*, truncated: bool, completion_tokens: int, max_tokens: int) -> str:
+    """Marker for a response the provider cut off at the output limit.
+
+    Without it a truncated answer is indistinguishable from a malformed one, and
+    both surface as the same "AI返回格式异常" fallback.
+    """
+    if not truncated:
+        return ""
+    return (
+        f"⚠ 输出被截断（finish_reason=length，输出 {completion_tokens}/{max_tokens} tokens），"
+        "以下内容不完整，解析失败属于截断而非格式错误。"
+    )
+
+
+def _format_response_preview(*, raw: str = "", parsed: dict[str, Any] | None = None, note: str = "") -> str:
     parts: list[str] = []
+    if note:
+        parts.append(note)
     raw = str(raw or "").strip()
     if raw:
         parts.append(f"原始返回:\n{_preview_text(raw, 1600)}")
@@ -3292,30 +3464,6 @@ def _format_request_snapshot(
     return json.dumps(body, ensure_ascii=False, indent=2)
 
 
-def _with_indicator_request_preview(preview: str, user_payload: dict[str, Any]) -> str:
-    indicators = user_payload.get("indicators")
-    computed_facts = user_payload.get("computed_facts")
-    workflow_actions = user_payload.get("workflow_actions")
-    position_facts = user_payload.get("position_facts")
-    if not isinstance(indicators, dict) and not computed_facts and not workflow_actions and not position_facts:
-        return preview
-    snapshot_data: dict[str, Any] = {}
-    if isinstance(indicators, dict) and indicators.get("recent_values"):
-        snapshot_data["recent_values"] = indicators["recent_values"]
-    if isinstance(computed_facts, list) and computed_facts:
-        snapshot_data["computed_facts"] = computed_facts
-    if isinstance(workflow_actions, list) and workflow_actions:
-        snapshot_data["workflow_actions"] = workflow_actions
-    if isinstance(position_facts, dict) and position_facts:
-        snapshot_data["position_facts"] = position_facts
-    if not snapshot_data:
-        return preview
-    snapshot = json.dumps(snapshot_data, ensure_ascii=False, separators=(",", ":"))
-    # Request bodies can contain candle arrays and workflow definitions. Do
-    # not cut them at 4k, otherwise diagnostics appear to be malformed.
-    return f"请求指标快照:\n{snapshot}\n\n{preview}"[:30000]
-
-
 def _screenshot_ai_metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -3326,6 +3474,16 @@ def _screenshot_ai_metadata(value: Any) -> dict[str, Any]:
     }
 
 def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
+    if endpoint == "pa_diag":
+        # Diagnosis carries no order; an empty diagnosis lets the order stage
+        # fall back to the server's own feature-based market read.
+        return {
+            "cycle": None,
+            "probabilities": None,
+            "direction": None,
+            "gates": {},
+            "reasoning": reason,
+        }
     if endpoint == "open":
         return {
             "should_open": False,

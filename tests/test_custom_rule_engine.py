@@ -12,6 +12,7 @@ from app.services.custom_rule_engine import (
     normalize_rule_plan,
 )
 from app.strategies.custom_ai import CustomAiStrategy
+from workflow_fixture import minimal_workflow
 
 
 def _candles() -> list[Candle]:
@@ -259,6 +260,7 @@ def test_custom_strategy_executes_engine_open_action_even_if_explanation_ai_disa
                 "open_indicators": [],
                 "position_size_mode": "fixed",
                 "fixed_volume": 0.1,
+                "workflow": minimal_workflow(),
             }
         },
     )
@@ -285,6 +287,7 @@ def test_custom_strategy_executes_engine_stop_price_even_if_explanation_ai_disag
                     indicator_aliases={"atr14"},
                 ),
                 "position_indicators": [{"name": "atr", "alias": "atr14", "source": "close", "params": {"length": 2}}],
+                "workflow": minimal_workflow(),
             }
         },
     )

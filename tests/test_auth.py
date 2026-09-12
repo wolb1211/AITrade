@@ -9,6 +9,7 @@ import pytest
 from app.config import Settings
 from app.services.auth_service import AuthError, UserAuthService
 from app.store import SqliteStore
+from workflow_fixture import minimal_workflow
 
 
 class FakeEmailService:
@@ -209,7 +210,13 @@ class FakeCustomStrategyCompiler:
         self.compile_calls = 0
         self.workflow_calls: list[dict[str, Any]] = []
 
-    def compile_custom_strategy(self, deployment: dict[str, Any]) -> dict[str, Any]:
+    def compile_custom_workflow(
+        self,
+        workflow: Any,
+        *,
+        open_logic: str,
+        position_logic: str,
+    ) -> dict[str, Any]:
         self.compile_calls += 1
         return {
             "summary": "EMA 均线交叉策略",
@@ -222,9 +229,16 @@ class FakeCustomStrategyCompiler:
             "open_data_type": "kline",
             "position_data_type": "kline",
             "unsupported_indicators": [],
+            "unsupported_conditions": [],
+            "visual_conditions": [],
             "warnings": [],
             "prompt_version": 1,
             "compile_status": "generated",
+            "workflow": workflow,
+            "compiled_workflow": {
+                "open": {"entry_node_id": "open_entry", "nodes": {}, "transitions": {}},
+                "position": {"entry_node_id": "position_entry", "nodes": {}, "transitions": {}},
+            },
         }
 
     def normalize_custom_strategy_compilation(self, content: Any, **_: Any) -> dict[str, Any]:
@@ -265,25 +279,106 @@ def test_custom_strategy_is_previewed_before_key_is_created(tmp_path: Path) -> N
         "id": "aie_custom_preview", "owner_type": "gl", "name": "测试模型", "base_url": "https://example.com/v1",
         "model": "test-model", "api_key": "sk-platform", "enabled": True, "selectable_by_user": True,
     })
+    workflow = {
+        "schema_version": 1,
+        "open": {
+            "entry_node_id": "open_entry",
+            "nodes": [
+                {"id": "open_entry", "type": "entry", "stage": "open", "label": "入口"},
+                {"id": "open_action", "type": "action", "label": "不操作", "action": {"kind": "no_action"}},
+            ],
+            "edges": [
+                {"id": "open_edge", "source": "open_entry", "target": "open_action", "source_handle": "next"},
+            ],
+        },
+        "position": {
+            "entry_node_id": "position_entry",
+            "nodes": [
+                {"id": "position_entry", "type": "entry", "stage": "position", "label": "入口"},
+                {"id": "position_action", "type": "action", "label": "持有", "action": {"kind": "hold"}},
+            ],
+            "edges": [
+                {"id": "position_edge", "source": "position_entry", "target": "position_action", "source_handle": "next"},
+            ],
+        },
+    }
     payload = {
         "strategy_code": "CUSTOM_AI_V1", "name": "均线策略", "ea_description": "EA显示的均线策略说明", "open_logic": "EMA10 上穿 EMA20 时开多",
         "position_logic": "出现反向交叉时平仓，否则继续持有", "open_data_type": "kline", "open_kline_count": 50,
         "position_data_type": "kline", "position_kline_count": 50, "open_ai_mode": "official",
         "open_ai_endpoint_id": endpoint["id"], "position_ai_mode": "official", "position_ai_endpoint_id": endpoint["id"],
         "position_size_mode": "fixed", "fixed_volume": 0.01, "risk_amount": 100, "risk_percent": 1,
-        "max_positions": 1,
+        "max_positions": 1, "workflow": workflow,
     }
     preview = service.preview_custom_strategy(session["token"], payload=payload)
     assert compiler.compile_calls == 1
     assert service.store.list_web_deployments(str(prepared["user_id"])) == []
     assert preview["open_kline_count"] == 80
-    created = service.create_strategy(session["token"], payload={**payload, "compiled_config": preview})
-    assert compiler.compile_calls == 1
+    created = service.create_strategy(session["token"], payload=payload)
+    # Creating always compiles the submitted graph; the compile is local and
+    # does not call an AI model.
+    assert compiler.compile_calls == 2
     assert created["deployment_key"].startswith("gl_")
     saved = service.store.list_web_deployments(str(prepared["user_id"]))[0]
     assert saved["config"]["open_prompt_template"] == preview["open_prompt_template"]
+    assert saved["config"]["workflow"] == workflow
     assert saved["config"]["ea_description"] == "EA显示的均线策略说明"
     assert service.store.get_user_portal_data(prepared["user_id"])["strategies"][0]["ea_description"] == "EA显示的均线策略说明"
+
+
+def test_custom_strategy_requires_a_workflow(tmp_path: Path) -> None:
+    service, email = create_service(tmp_path)
+    service.ai_client = FakeCustomStrategyCompiler()
+    prepared = service.register(email="noworkflow@example.com", password="Password123")
+    session = service.verify_registration(
+        email="noworkflow@example.com", code=email.codes[("noworkflow@example.com", "register")]
+    )
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    with service.store._connect() as connection:
+        connection.execute(
+            "UPDATE users SET vip_level = 1, vip_expires_at = ? WHERE id = ?",
+            (expires_at, prepared["user_id"]),
+        )
+    with pytest.raises(AuthError) as exc_info:
+        service.create_strategy(session["token"], payload={
+            "strategy_code": "CUSTOM_AI_V1", "name": "没有流程图的策略",
+            "open_logic": "EMA10 上穿 EMA20 时开多", "position_logic": "出现反向交叉时平仓",
+            "open_ai_mode": "custom", "open_ai_base_url": "https://example.com/v1",
+            "open_ai_model": "test-model", "open_ai_key": "sk-test",
+            "position_ai_mode": "custom", "position_ai_base_url": "https://example.com/v1",
+            "position_ai_model": "test-model", "position_ai_key": "sk-test",
+        })
+    assert exc_info.value.code == "custom_strategy_workflow_required"
+    assert service.store.list_web_deployments(str(prepared["user_id"])) == []
+
+
+def test_custom_strategy_saves_without_a_text_description(tmp_path: Path) -> None:
+    """The description box is stored verbatim; a hand-drawn graph needs no text."""
+    service, email = create_service(tmp_path)
+    service.ai_client = FakeCustomStrategyCompiler()
+    prepared = service.register(email="nodesc@example.com", password="Password123")
+    session = service.verify_registration(
+        email="nodesc@example.com", code=email.codes[("nodesc@example.com", "register")]
+    )
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    with service.store._connect() as connection:
+        connection.execute(
+            "UPDATE users SET vip_level = 1, vip_expires_at = ? WHERE id = ?",
+            (expires_at, prepared["user_id"]),
+        )
+    created = service.create_strategy(session["token"], payload={
+        "strategy_code": "CUSTOM_AI_V1", "name": "手画流程图策略",
+        "open_logic": "", "position_logic": "",
+        "open_ai_mode": "custom", "open_ai_base_url": "https://example.com/v1",
+        "open_ai_model": "test-model", "open_ai_key": "sk-test",
+        "position_ai_mode": "custom", "position_ai_base_url": "https://example.com/v1",
+        "position_ai_model": "test-model", "position_ai_key": "sk-test",
+        "workflow": minimal_workflow(),
+    })
+    assert created["deployment_key"].startswith("gl_")
+    saved = service.store.list_web_deployments(str(prepared["user_id"]))[0]
+    assert saved["config"]["open_logic"] == ""
+    assert saved["config"]["workflow"] == minimal_workflow()
 
 
 def test_workflow_generation_does_not_create_a_strategy(tmp_path: Path) -> None:

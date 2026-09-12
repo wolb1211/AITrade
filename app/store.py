@@ -179,19 +179,6 @@ def _is_demo_server(server: str) -> bool:
     return any(token in normalized for token in ("demo", "trial", "practice", "模拟", "測試", "测试"))
 
 
-def _extract_profit(payload: dict[str, Any]) -> float:
-    for key in ("profit", "pnl", "net_profit"):
-        value = payload.get(key)
-        if isinstance(value, int | float):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value)
-            except ValueError:
-                continue
-    return 0.0
-
-
 def _deal_net_profit(payload: dict[str, Any]) -> float:
     value = payload.get("net_profit")
     if value is not None:
@@ -552,6 +539,7 @@ class SqliteStore:
                     billing_multiplier REAL NOT NULL DEFAULT 1,
                     input_price_per_million NUMERIC NOT NULL DEFAULT 0,
                     output_price_per_million NUMERIC NOT NULL DEFAULT 0,
+                    cache_input_price_per_million NUMERIC NOT NULL DEFAULT 0,
                     supports_vision INTEGER NOT NULL DEFAULT 0,
                     vision_test_status TEXT NOT NULL DEFAULT 'untested',
                     vision_tested_at TEXT NOT NULL DEFAULT '',
@@ -590,12 +578,15 @@ class SqliteStore:
                     timeframe TEXT NOT NULL DEFAULT '',
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    elapsed_ms INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0,
                     official_tokens INTEGER NOT NULL DEFAULT 0,
                     custom_tokens INTEGER NOT NULL DEFAULT 0,
                     billing_source TEXT NOT NULL DEFAULT '',
                     input_price_snapshot NUMERIC NOT NULL DEFAULT 0,
                     output_price_snapshot NUMERIC NOT NULL DEFAULT 0,
+                    cache_input_price_snapshot NUMERIC NOT NULL DEFAULT 0,
                     charged_amount NUMERIC NOT NULL DEFAULT 0,
                     balance_after NUMERIC,
                     success INTEGER NOT NULL DEFAULT 1,
@@ -629,6 +620,7 @@ class SqliteStore:
                     cache_hits INTEGER NOT NULL DEFAULT 0,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                     provider_input_tokens INTEGER NOT NULL DEFAULT 0,
                     provider_output_tokens INTEGER NOT NULL DEFAULT 0,
                     official_tokens INTEGER NOT NULL DEFAULT 0,
@@ -841,6 +833,15 @@ class SqliteStore:
             "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
             ("ai_cache_ttl_seconds", "120", "AI 相同请求缓存秒数", now),
         )
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            (
+                "ai_cache_discount_ratio",
+                "0.75",
+                "供应商缓存命中折扣比例（0-1，用于成本对照表估算，不影响用户计费）",
+                now,
+            ),
+        )
 
         connection.execute(
             "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
@@ -861,13 +862,15 @@ class SqliteStore:
                 INSERT INTO ai_usage_monthly_summaries (
                     user_id, month_key, model_id, provider_id, deployment_id,
                     strategy_code, billing_source, calls, success_calls,
-                    input_tokens, output_tokens, official_tokens, custom_tokens,
+                    input_tokens, output_tokens, cached_input_tokens,
+                    official_tokens, custom_tokens,
                     charged_amount, updated_at
                 )
                 SELECT user_id, SUBSTR(created_at, 1, 7), model_id, MAX(provider_id),
                        deployment_id, MAX(strategy_code), billing_source,
                        COUNT(*), COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                       COALESCE(SUM(cached_input_tokens), 0),
                        COALESCE(SUM(official_tokens), 0), COALESCE(SUM(custom_tokens), 0),
                        COALESCE(SUM(charged_amount), 0), ?
                 FROM ai_usage_logs
@@ -1089,8 +1092,11 @@ class SqliteStore:
             "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
             "response_preview": "ALTER TABLE ai_usage_logs ADD COLUMN response_preview TEXT NOT NULL DEFAULT ''",
             "billing_source": "ALTER TABLE ai_usage_logs ADD COLUMN billing_source TEXT NOT NULL DEFAULT ''",
+            "cached_input_tokens": "ALTER TABLE ai_usage_logs ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
+            "elapsed_ms": "ALTER TABLE ai_usage_logs ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0",
             "input_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN input_price_snapshot NUMERIC NOT NULL DEFAULT 0",
             "output_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN output_price_snapshot NUMERIC NOT NULL DEFAULT 0",
+            "cache_input_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN cache_input_price_snapshot NUMERIC NOT NULL DEFAULT 0",
             "charged_amount": "ALTER TABLE ai_usage_logs ADD COLUMN charged_amount NUMERIC NOT NULL DEFAULT 0",
             "balance_after": "ALTER TABLE ai_usage_logs ADD COLUMN balance_after NUMERIC",
             "provider_called": "ALTER TABLE ai_usage_logs ADD COLUMN provider_called INTEGER NOT NULL DEFAULT 1",
@@ -1112,6 +1118,7 @@ class SqliteStore:
             "cache_hits": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN cache_hits INTEGER NOT NULL DEFAULT 0",
             "provider_input_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_input_tokens INTEGER NOT NULL DEFAULT 0",
             "provider_output_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_output_tokens INTEGER NOT NULL DEFAULT 0",
+            "cached_input_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -1231,6 +1238,7 @@ class SqliteStore:
             "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier REAL NOT NULL DEFAULT 1",
             "input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN input_price_per_million NUMERIC NOT NULL DEFAULT 0",
             "output_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN output_price_per_million NUMERIC NOT NULL DEFAULT 0",
+            "cache_input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN cache_input_price_per_million NUMERIC NOT NULL DEFAULT 0",
             "supports_vision": "ALTER TABLE ai_endpoints ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0",
             "vision_test_status": "ALTER TABLE ai_endpoints ADD COLUMN vision_test_status TEXT NOT NULL DEFAULT 'untested'",
             "vision_tested_at": "ALTER TABLE ai_endpoints ADD COLUMN vision_tested_at TEXT NOT NULL DEFAULT ''",
@@ -1393,7 +1401,7 @@ class SqliteStore:
                 "收盘价突破前20根K线最高价开多，跌破前20根K线最低价开空。",
                 "达到2ATR保护止损或突破反向10根K线通道时离场。",
                 "kline", 30, "kline", 30, "bar", 1,
-                json.dumps({"entry_period": 20, "exit_period": 10, "atr_period": 20, "risk_fraction": 0.01, "max_units": 4, "add_step_atr": 0.5, "stop_atr": 2.0}, ensure_ascii=False),
+                json.dumps({"position_sizing_mode": "fixed", "fixed_lot": 0.01, "risk_mode": "fixed_stop_amount", "max_stop_amount": 100, "risk_percent": 1, "max_positions": 4, "allow_add_position": True}, ensure_ascii=False),
                 1, 20, now, now,
             ),
         )
@@ -2181,84 +2189,6 @@ class SqliteStore:
                 ),
                 reverse=True,
             ),
-        }
-
-    def admin_deployment_history_orders(
-        self,
-        deployment_id: str,
-        *,
-        account_login: str = "",
-        account_server: str = "",
-        symbol: str = "",
-        period: str = "all",
-        page: int = 1,
-        size: int = 50,
-    ) -> dict[str, Any]:
-        page = max(1, int(page or 1))
-        size = max(1, min(500, int(size or 50)))
-        offset = (page - 1) * size
-        _, _, start_ts, end_ts, _ = _period_bounds(period)
-        where = [
-            "deployment_id = ?",
-            "COALESCE(NULLIF(close_time, 0), deal_time) >= ?",
-            "COALESCE(NULLIF(close_time, 0), deal_time) <= ?",
-        ]
-        params: list[Any] = [deployment_id, start_ts, end_ts]
-        if account_login:
-            where.append("account_login = ?")
-            params.append(account_login)
-        if account_server:
-            where.append("(account_server = ? OR account_server = '')")
-            params.append(account_server)
-        if symbol:
-            where.append("symbol = ?")
-            params.append(symbol)
-        where_sql = " AND ".join(where)
-        with self._connect() as connection:
-            total_row = connection.execute(
-                f"SELECT COUNT(*) AS total FROM mt5_history_deals WHERE {where_sql}",
-                params,
-            ).fetchone()
-            rows = connection.execute(
-                f"""
-                SELECT
-                    account_login, account_server, deal_id, order_id, symbol,
-                    mt_type, volume, open_price, close_price, price, profit,
-                    commission, swap, net_profit, open_time, close_time,
-                    deal_time, comment
-                FROM mt5_history_deals
-                WHERE {where_sql}
-                ORDER BY COALESCE(NULLIF(close_time, 0), deal_time) DESC, updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                [*params, size, offset],
-            ).fetchall()
-        orders = []
-        for row in rows:
-            close_price = float(row["close_price"] or row["price"] or 0)
-            close_time = int(row["close_time"] or row["deal_time"] or 0)
-            orders.append(
-                {
-                    "account_login": str(row["account_login"] or ""),
-                    "account_server": str(row["account_server"] or ""),
-                    "order_id": str(row["order_id"] or row["deal_id"] or ""),
-                    "symbol": str(row["symbol"] or ""),
-                    "mt_type": str(row["mt_type"] or ""),
-                    "volume": float(row["volume"] or 0),
-                    "open_price": float(row["open_price"] or 0),
-                    "close_price": close_price,
-                    "profit": float(row["profit"] or 0),
-                    "commission": float(row["commission"] or 0),
-                    "swap": float(row["swap"] or 0),
-                    "net_profit": float(row["net_profit"] or 0),
-                    "open_time": int(row["open_time"] or 0),
-                    "close_time": close_time,
-                    "comment": str(row["comment"] or ""),
-                },
-            )
-        return {
-            "total": int(total_row["total"] or 0) if total_row else 0,
-            "orders": orders,
         }
 
     def admin_ai_strategy_overview(self) -> dict[str, Any]:
@@ -3174,20 +3104,6 @@ class SqliteStore:
             ).fetchone()
         return self._deployment_row(row) if row else None
 
-    def account_matches(
-        self,
-        deployment: dict[str, Any],
-        *,
-        platform: str,
-        login: str,
-        server: str,
-    ) -> bool:
-        return (
-            deployment.get("mt_platform") == platform
-            and deployment.get("mt_login") == login
-            and deployment.get("mt_server") == server
-        )
-
     def get_decision(
         self,
         deployment_id: str,
@@ -3766,6 +3682,11 @@ class SqliteStore:
             if "output_price_per_million" in payload
             else (existing or {}).get("output_price_per_million"),
         )
+        cache_input_price = decimal_string(
+            payload.get("cache_input_price_per_million")
+            if "cache_input_price_per_million" in payload
+            else (existing or {}).get("cache_input_price_per_million"),
+        )
         effective_vision_config = {
             "base_url": payload.get("base_url") if "base_url" in payload else (existing or {}).get("base_url"),
             "model": payload.get("model") if "model" in payload else (existing or {}).get("model"),
@@ -3788,10 +3709,11 @@ class SqliteStore:
                     id, owner_type, user_id, template_code, name, base_url, model,
                     api_key, strict_json, context_window, input_token_rate, output_token_rate,
                     billing_multiplier, input_price_per_million, output_price_per_million,
+                    cache_input_price_per_million,
                     supports_vision, vision_test_status, vision_tested_at, vision_test_error,
                     is_default, enabled, selectable_by_user,
                     sort, remark, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     owner_type = excluded.owner_type,
                     user_id = excluded.user_id,
@@ -3807,6 +3729,7 @@ class SqliteStore:
                     billing_multiplier = excluded.billing_multiplier,
                     input_price_per_million = excluded.input_price_per_million,
                     output_price_per_million = excluded.output_price_per_million,
+                    cache_input_price_per_million = excluded.cache_input_price_per_million,
                     supports_vision = excluded.supports_vision,
                     vision_test_status = excluded.vision_test_status,
                     vision_tested_at = excluded.vision_tested_at,
@@ -3834,6 +3757,7 @@ class SqliteStore:
                     float(payload.get("billing_multiplier") or 1),
                     input_price,
                     output_price,
+                    cache_input_price,
                     1 if supports_vision else 0,
                     vision_test_status,
                     vision_tested_at,
@@ -4178,6 +4102,7 @@ class SqliteStore:
                     "base_url": str(row["base_url"] or ""),
                     "input_price_per_million": decimal_string(row["input_price_per_million"] or 0),
                     "output_price_per_million": decimal_string(row["output_price_per_million"] or 0),
+                    "cache_input_price_per_million": decimal_string(row["cache_input_price_per_million"] or 0),
                     "is_default": bool(row["is_default"]),
                     "official_available": True,
                     "supports_vision": bool(row["supports_vision"]),
@@ -4299,6 +4224,159 @@ class SqliteStore:
                 except (TypeError, ValueError):
                     values["ttl_seconds"] = 120
         return values
+
+    def get_ai_cache_discount_ratio(self) -> str:
+        """How much cheaper a provider's cache-hit input is, as a 0-1 fraction.
+
+        Used only by the cost comparison report: it converts the factual cached
+        token count into an estimated saving. It never affects what a user is
+        charged, which stays at the endpoint's configured input price.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("ai_cache_discount_ratio",),
+            ).fetchone()
+        try:
+            raw = str(row["setting_value"] if row else "").strip()
+            ratio = Decimal(raw)
+        except (TypeError, ValueError, InvalidOperation):
+            ratio = Decimal("0.75")
+        if ratio < 0:
+            ratio = Decimal("0")
+        if ratio > 1:
+            ratio = Decimal("1")
+        return format(ratio, "f")
+
+    def save_ai_cache_discount_ratio(self, ratio: Any) -> str:
+        value = Decimal(decimal_string(ratio))
+        if value < 0 or value > 1:
+            raise RuntimeError("invalid_cache_discount_ratio")
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    "ai_cache_discount_ratio",
+                    format(value, "f"),
+                    "供应商缓存命中折扣比例（0-1，用于成本对照表估算，不影响用户计费）",
+                    now,
+                ),
+            )
+        return format(value, "f")
+
+    def admin_ai_cost_comparison(self, *, months: int = 6) -> dict[str, Any]:
+        """Platform-funded AI cost against the margin kept from prompt caching.
+
+        Everything here is reported per month from the summary table, which is
+        never pruned, so the figures survive the 60-day call-detail retention.
+        Token counts are factual; the money value of the cache saving is an
+        estimate because a provider's real purchase price is not visible to us.
+        """
+        limit = max(1, min(36, int(months or 6)))
+        discount = Decimal(self.get_ai_cache_discount_ratio())
+
+        with self._connect() as connection:
+            summaries = [dict(row) for row in connection.execute(
+                """
+                SELECT month_key, user_id, model_id, calls, input_tokens, output_tokens,
+                       cached_input_tokens, charged_amount
+                FROM ai_usage_monthly_summaries
+                ORDER BY month_key DESC
+                """
+            ).fetchall()]
+            price_rows = connection.execute(
+                "SELECT id, input_price_per_million FROM ai_endpoints"
+            ).fetchall()
+        prices = {
+            str(row["id"]): Decimal(decimal_string(row["input_price_per_million"]))
+            for row in price_rows
+        }
+
+        month_keys = sorted({str(row["month_key"]) for row in summaries}, reverse=True)[:limit]
+        buckets: dict[str, dict[str, Any]] = {
+            key: {
+                "month_key": key,
+                "user_calls": 0,
+                "user_charged": Decimal("0"),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+                "platform_calls": 0,
+                "platform_cost": Decimal("0"),
+                "platform_input_tokens": 0,
+                "estimated_cache_saving": Decimal("0"),
+            }
+            for key in month_keys
+        }
+
+        for row in summaries:
+            month_key = str(row["month_key"])
+            bucket = buckets.get(month_key)
+            if bucket is None:
+                continue
+            is_platform = not str(row["user_id"] or "").strip()
+            calls = int(row["calls"] or 0)
+            input_tokens = int(row["input_tokens"] or 0)
+            cached_tokens = int(row["cached_input_tokens"] or 0)
+            amount = Decimal(decimal_string(row["charged_amount"]))
+
+            if is_platform:
+                # Platform-funded calls: recorded with a cost but never charged
+                # to any balance.
+                bucket["platform_calls"] += calls
+                bucket["platform_cost"] += amount
+                bucket["platform_input_tokens"] += input_tokens
+                continue
+
+            bucket["user_calls"] += calls
+            bucket["user_charged"] += amount
+            bucket["input_tokens"] += input_tokens
+            bucket["output_tokens"] += int(row["output_tokens"] or 0)
+            bucket["cached_input_tokens"] += cached_tokens
+            # Saving = hit tokens x the input price we bill at x the provider's
+            # discount. Falls back to zero when the endpoint no longer exists.
+            unit_price = prices.get(str(row["model_id"] or ""), Decimal("0"))
+            bucket["estimated_cache_saving"] += (
+                Decimal(cached_tokens) * unit_price * discount / Decimal("1000000")
+            )
+
+        result_months: list[dict[str, Any]] = []
+        for key in month_keys:
+            bucket = buckets[key]
+            input_tokens = bucket["input_tokens"]
+            saving = bucket["estimated_cache_saving"].quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+            net = saving - bucket["platform_cost"]
+            result_months.append({
+                "month_key": key,
+                "user_calls": bucket["user_calls"],
+                "user_charged": format(bucket["user_charged"].quantize(Decimal("0.000001")), "f"),
+                "platform_calls": bucket["platform_calls"],
+                "platform_cost": format(bucket["platform_cost"].quantize(Decimal("0.000001")), "f"),
+                "platform_input_tokens": bucket["platform_input_tokens"],
+                "input_tokens": input_tokens,
+                "output_tokens": bucket["output_tokens"],
+                "cached_input_tokens": bucket["cached_input_tokens"],
+                "cache_hit_rate": round(bucket["cached_input_tokens"] / input_tokens, 4) if input_tokens else 0.0,
+                "estimated_cache_saving": format(saving, "f"),
+                "net": format(net.quantize(Decimal("0.000001")), "f"),
+            })
+
+        return {
+            "discount_ratio": format(discount, "f"),
+            "estimate_note": (
+                "token 数为事实数据；金额按当前端点单价估算，供应商实际采购价不可见。"
+                "折扣比例仅用于估算缓存节省，不影响用户计费。"
+            ),
+            "months": result_months,
+        }
 
     def save_ai_cache_settings(self, *, enabled: bool, ttl_seconds: int) -> dict[str, Any]:
         now = utc_now_iso()
@@ -4838,7 +4916,7 @@ class SqliteStore:
         for item in usage:
             for internal_field in ("provider_called", "response_source", "cache_id"):
                 item.pop(internal_field, None)
-            for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount", "balance_after"):
+            for field in ("input_price_snapshot", "output_price_snapshot", "cache_input_price_snapshot", "charged_amount", "balance_after"):
                 item[field] = None if item.get(field) is None else decimal_string(item.get(field))
 
         ledger = self.list_ai_balance_ledger(
@@ -5938,17 +6016,28 @@ class SqliteStore:
         log_id = str(payload.get("id") or f"ailog_{uuid4().hex}")
         input_tokens = int(payload.get("input_tokens") or 0)
         output_tokens = int(payload.get("output_tokens") or 0)
+        cached_input_tokens = max(0, min(int(payload.get("cached_input_tokens") or 0), input_tokens))
         total_tokens = int(payload.get("total_tokens") or (input_tokens + output_tokens))
         billing_source = str(payload.get("billing_source") or "").strip().lower()
         input_price = Decimal(decimal_string(payload.get("input_price_snapshot")))
         output_price = Decimal(decimal_string(payload.get("output_price_snapshot")))
+        cache_input_price = Decimal(decimal_string(payload.get("cache_input_price_snapshot")))
+        if cache_input_price <= 0:
+            # Endpoint never configured a cache-hit price: bill cached tokens at
+            # the normal input price so the charge is unchanged.
+            cache_input_price = input_price
         charged_amount = Decimal("0")
         balance_after: Decimal | None = None
         if billing_source == "official":
+            # Cached prefix tokens are billed at the (discounted) cache-hit price;
+            # everything else at the normal input price.
+            miss_input_tokens = input_tokens - cached_input_tokens
             charged_amount = (
-                (Decimal(input_tokens) * input_price + Decimal(output_tokens) * output_price)
-                / Decimal("1000000")
-            ).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                Decimal(miss_input_tokens) * input_price
+                + Decimal(cached_input_tokens) * cache_input_price
+                + Decimal(output_tokens) * output_price
+            ) / Decimal("1000000")
+            charged_amount = charged_amount.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
         official_tokens = (
             int(payload["official_tokens"])
             if payload.get("official_tokens") is not None
@@ -6009,10 +6098,11 @@ class SqliteStore:
                     provider_id, model_id, account_login, account_server, symbol, timeframe,
                     input_tokens, output_tokens, total_tokens,
                     official_tokens, custom_tokens, billing_source,
-                    input_price_snapshot, output_price_snapshot, charged_amount, balance_after,
+                    cached_input_tokens, elapsed_ms, input_price_snapshot, output_price_snapshot,
+                    cache_input_price_snapshot, charged_amount, balance_after,
                     success, provider_called, response_source, cache_id,
                     error_message, request_snapshot, response_preview, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     log_id,
@@ -6032,8 +6122,11 @@ class SqliteStore:
                     official_tokens,
                     custom_tokens,
                     billing_source,
+                    cached_input_tokens,
+                    int(payload.get("elapsed_ms") or 0),
                     format(input_price, "f"),
                     format(output_price, "f"),
+                    format(cache_input_price, "f"),
                     format(charged_amount, "f"),
                     None if balance_after is None else format(balance_after, "f"),
                     1 if payload.get("success", True) else 0,
@@ -6052,10 +6145,11 @@ class SqliteStore:
                     user_id, month_key, model_id, provider_id, deployment_id,
                     strategy_code, billing_source, calls, success_calls,
                     provider_calls, cache_hits, input_tokens, output_tokens,
+                    cached_input_tokens,
                     provider_input_tokens, provider_output_tokens,
                     official_tokens, custom_tokens,
                     charged_amount, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, month_key, model_id, deployment_id, billing_source) DO UPDATE SET
                     provider_id = excluded.provider_id,
                     strategy_code = excluded.strategy_code,
@@ -6065,6 +6159,7 @@ class SqliteStore:
                     cache_hits = ai_usage_monthly_summaries.cache_hits + excluded.cache_hits,
                     input_tokens = ai_usage_monthly_summaries.input_tokens + excluded.input_tokens,
                     output_tokens = ai_usage_monthly_summaries.output_tokens + excluded.output_tokens,
+                    cached_input_tokens = ai_usage_monthly_summaries.cached_input_tokens + excluded.cached_input_tokens,
                     provider_input_tokens = ai_usage_monthly_summaries.provider_input_tokens + excluded.provider_input_tokens,
                     provider_output_tokens = ai_usage_monthly_summaries.provider_output_tokens + excluded.provider_output_tokens,
                     official_tokens = ai_usage_monthly_summaries.official_tokens + excluded.official_tokens,
@@ -6085,6 +6180,7 @@ class SqliteStore:
                     1 if response_source == "cache" else 0,
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
                     provider_input_tokens,
                     provider_output_tokens,
                     official_tokens,
@@ -6294,16 +6390,6 @@ class SqliteStore:
         )
 
     @staticmethod
-    def _format_symbol_set(symbols: Any) -> str:
-        if not symbols:
-            return ""
-        if isinstance(symbols, set):
-            values = sorted(str(symbol).strip() for symbol in symbols if str(symbol).strip())
-        else:
-            values = [str(symbols).strip()]
-        return ", ".join(values[:4]) + ("..." if len(values) > 4 else "")
-
-    @staticmethod
     def _private_ai_endpoint_row(row: sqlite3.Row | DbRow) -> dict[str, Any]:
         data = dict(row)
         data["enabled"] = bool(data["enabled"])
@@ -6313,6 +6399,7 @@ class SqliteStore:
         data["supports_vision"] = bool(data.get("supports_vision", 0))
         data["input_price_per_million"] = decimal_string(data.get("input_price_per_million"))
         data["output_price_per_million"] = decimal_string(data.get("output_price_per_million"))
+        data["cache_input_price_per_million"] = decimal_string(data.get("cache_input_price_per_million"))
         data["provider_id"] = str(data.get("id") or "")
         data["model_id"] = str(data.get("id") or "")
         data["provider_name"] = str(data.get("name") or "")
@@ -6403,7 +6490,7 @@ class SqliteStore:
         data = dict(row)
         data["success"] = bool(data["success"])
         data["provider_called"] = bool(data.get("provider_called", True))
-        for field in ("input_price_snapshot", "output_price_snapshot", "charged_amount"):
+        for field in ("input_price_snapshot", "output_price_snapshot", "cache_input_price_snapshot", "charged_amount"):
             data[field] = decimal_string(data.get(field))
         data["balance_after"] = None if data.get("balance_after") is None else decimal_string(data.get("balance_after"))
         data["screenshot_preview_id"] = ""
@@ -6869,6 +6956,7 @@ class MySQLStore(SqliteStore):
                     cache_hits BIGINT NOT NULL DEFAULT 0,
                     input_tokens BIGINT NOT NULL DEFAULT 0,
                     output_tokens BIGINT NOT NULL DEFAULT 0,
+                    cached_input_tokens BIGINT NOT NULL DEFAULT 0,
                     provider_input_tokens BIGINT NOT NULL DEFAULT 0,
                     provider_output_tokens BIGINT NOT NULL DEFAULT 0,
                     official_tokens BIGINT NOT NULL DEFAULT 0,
@@ -6919,6 +7007,19 @@ class MySQLStore(SqliteStore):
                 ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
                 """,
                 ("ai_cache_ttl_seconds", "120", "AI 相同请求缓存秒数", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                (
+                    "ai_cache_discount_ratio",
+                    "0.75",
+                    "供应商缓存命中折扣比例（0-1，用于成本对照表估算，不影响用户计费）",
+                    now,
+                ),
             )
 
             connection.execute(
@@ -7049,7 +7150,7 @@ class MySQLStore(SqliteStore):
                     "收盘价突破前20根K线最高价开多，跌破前20根K线最低价开空。",
                     "达到2ATR保护止损或突破反向10根K线通道时离场。",
                     "kline", 30, "kline", 30, "bar", 1,
-                    json.dumps({"entry_period": 20, "exit_period": 10, "atr_period": 20, "risk_fraction": 0.01, "max_units": 4, "add_step_atr": 0.5, "stop_atr": 2.0}, ensure_ascii=False),
+                    json.dumps({"position_sizing_mode": "fixed", "fixed_lot": 0.01, "risk_mode": "fixed_stop_amount", "max_stop_amount": 100, "risk_percent": 1, "max_positions": 4, "allow_add_position": True}, ensure_ascii=False),
                     1, 20, now, now,
                 ),
             )
@@ -7080,8 +7181,11 @@ class MySQLStore(SqliteStore):
             "timeframe": "ALTER TABLE ai_usage_logs ADD COLUMN timeframe VARCHAR(16) NOT NULL DEFAULT '' AFTER symbol",
             "response_preview": "ALTER TABLE ai_usage_logs ADD COLUMN response_preview TEXT NULL AFTER error_message",
             "billing_source": "ALTER TABLE ai_usage_logs ADD COLUMN billing_source VARCHAR(16) NOT NULL DEFAULT '' AFTER custom_tokens",
+            "cached_input_tokens": "ALTER TABLE ai_usage_logs ADD COLUMN cached_input_tokens BIGINT NOT NULL DEFAULT 0 AFTER output_tokens",
+            "elapsed_ms": "ALTER TABLE ai_usage_logs ADD COLUMN elapsed_ms BIGINT NOT NULL DEFAULT 0 AFTER cached_input_tokens",
             "input_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN input_price_snapshot DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER billing_source",
             "output_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN output_price_snapshot DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER input_price_snapshot",
+            "cache_input_price_snapshot": "ALTER TABLE ai_usage_logs ADD COLUMN cache_input_price_snapshot DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER output_price_snapshot",
             "charged_amount": "ALTER TABLE ai_usage_logs ADD COLUMN charged_amount DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER output_price_snapshot",
             "balance_after": "ALTER TABLE ai_usage_logs ADD COLUMN balance_after DECIMAL(18,6) NULL AFTER charged_amount",
             "provider_called": "ALTER TABLE ai_usage_logs ADD COLUMN provider_called TINYINT(1) NOT NULL DEFAULT 1 AFTER success",
@@ -7130,6 +7234,7 @@ class MySQLStore(SqliteStore):
             monthly_migrations = {
                 "provider_calls": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_calls BIGINT NOT NULL DEFAULT 0 AFTER success_calls",
                 "cache_hits": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN cache_hits BIGINT NOT NULL DEFAULT 0 AFTER provider_calls",
+                "cached_input_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN cached_input_tokens BIGINT NOT NULL DEFAULT 0 AFTER output_tokens",
                 "provider_input_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_input_tokens BIGINT NOT NULL DEFAULT 0 AFTER output_tokens",
                 "provider_output_tokens": "ALTER TABLE ai_usage_monthly_summaries ADD COLUMN provider_output_tokens BIGINT NOT NULL DEFAULT 0 AFTER provider_input_tokens",
             }
@@ -7154,6 +7259,7 @@ class MySQLStore(SqliteStore):
             "billing_multiplier": "ALTER TABLE ai_endpoints ADD COLUMN billing_multiplier DOUBLE NOT NULL DEFAULT 1",
             "input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN input_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER billing_multiplier",
             "output_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN output_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER input_price_per_million",
+            "cache_input_price_per_million": "ALTER TABLE ai_endpoints ADD COLUMN cache_input_price_per_million DECIMAL(18,6) NOT NULL DEFAULT 0.000000 AFTER output_price_per_million",
             "supports_vision": "ALTER TABLE ai_endpoints ADD COLUMN supports_vision TINYINT NOT NULL DEFAULT 0",
             "vision_test_status": "ALTER TABLE ai_endpoints ADD COLUMN vision_test_status VARCHAR(16) NOT NULL DEFAULT 'untested'",
             "vision_tested_at": "ALTER TABLE ai_endpoints ADD COLUMN vision_tested_at VARCHAR(40) NOT NULL DEFAULT ''",

@@ -7,8 +7,204 @@ import math
 from typing import Any
 from uuid import uuid4
 
-from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision
+from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision, UsageSummary
 from app.services.ai_service import AiDecisionClient
+from app.strategies import pa_knowledge
+
+# Minimum reward-to-risk the server will accept from an AI-proposed target.
+MIN_RISK_REWARD = 1.8
+
+# Widest stop the strategy will accept *from the model*, as a multiple of ATR.
+# A stop the model places further away than this is not describing the market any
+# more, it is an outsized risk, and the trade is skipped instead of being clamped.
+# The structure stop computed by the strategy is not subject to this cap.
+MAX_STOP_ATR = 4.0
+
+# Fallback risk budget used when the deployment carries no risk amount. Shared
+# by position sizing and by the account-currency safety close so the two can
+# never disagree about how much money was actually at risk.
+DEFAULT_RISK_AMOUNT = 100.0
+
+# AI order wording -> the MT5 order type the EA receives. An empty string means
+# the model declined to place any order.
+_ORDER_TYPE_CODES = {
+    "市价单": "market",
+    "market": "market",
+    "限价单": "limit",
+    "limit": "limit",
+    "突破单": "stop",
+    "stop": "stop",
+    "stop_order": "stop",
+}
+
+# Words that mean the model deliberately placed no order.
+_NO_ORDER_WORDS = frozenset({"不下单", "不交易", "不開單", "none", "no_order", "noorder", "hold", "no"})
+
+_ORDER_TYPE_LABELS = {
+    "market": "市价单",
+    "limit": "限价单",
+    "stop": "突破单",
+}
+
+# Detected price-action pattern -> knowledge-base playbook key. Patterns with no
+# playbook (h1/l1 counts, climax flags) intentionally map to nothing.
+_PATTERN_SETUP_CODES = {
+    "breakout_pullback": "pullback",
+    "breakout_test": "breakout",
+    "breakout_failure": "failed_breakout",
+    "failed_signal": "failed_breakout",
+    "barbwire": "barbwire",
+    "overlap": "barbwire",
+    "always_in": "always_in",
+    "wedge": "wedge",
+    "triangle_ascending": "triangle",
+    "triangle_descending": "triangle",
+    "triangle_symmetrical": "triangle",
+    "double_top_bottom": "double_structure",
+    "mtr": "mtr",
+    "reversal_attempt": "mtr",
+    "final_flag": "final_flag",
+    "h2": "pullback",
+    "l2": "pullback",
+}
+
+
+def _ai_bool(value: Any, default: bool = False) -> bool:
+    """Parse a boolean that came back from the model.
+
+    Models sometimes return the *string* ``"false"``, which is truthy in Python.
+    Reading that as True would open a trade the model explicitly vetoed, so the
+    textual forms are resolved explicitly instead of relying on truthiness.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "是", "对", "开"}:
+        return True
+    if text in {"false", "0", "no", "n", "否", "不", "不下单", ""}:
+        return False
+    return default
+
+
+def _merge_usage(*usages: UsageSummary) -> UsageSummary:
+    """Sum the usage of the two AI stages behind one trade decision."""
+    merged = UsageSummary(ai_called=any(item.ai_called for item in usages))
+    for item in usages:
+        merged.input_tokens += item.input_tokens
+        merged.output_tokens += item.output_tokens
+        merged.charged_points += item.charged_points
+        merged.elapsed_ms += item.elapsed_ms
+        merged.cached_input_tokens += item.cached_input_tokens
+    return merged
+
+
+def _order_type_code(value: Any) -> str:
+    """Map the model's order wording onto an EA order type.
+
+    A value the model omitted or phrased unexpectedly falls back to a market
+    order: ``should_open`` already carries the intent to trade, and that is the
+    behaviour every strategy had before pending orders were supported. Only an
+    explicit "no order" declines.
+    """
+    raw = str(value or "").strip().lower()
+    if raw in _NO_ORDER_WORDS:
+        return ""
+    return _ORDER_TYPE_CODES.get(raw, "market")
+
+
+def _order_type_label(code: str) -> str:
+    return _ORDER_TYPE_LABELS.get(code, "市价单")
+
+
+def _blocking_gate_reason(diagnosis: dict[str, Any]) -> str:
+    """Return a Chinese hold reason when stage 1 explicitly closed a gate.
+
+    Only an explicit ``passed: false`` blocks: a missing or malformed gate must
+    never stop trading, otherwise a chatty model could silently disable the
+    strategy.
+    """
+    cycle = str(diagnosis.get("cycle") or "").strip().lower()
+    if cycle == "extreme_tr":
+        return "阶段一诊断为极端震荡：当前属于无交易环境，本次不下单"
+
+    gates = diagnosis.get("gates")
+    if not isinstance(gates, dict):
+        return ""
+    labels = {
+        "gate1_no_trade_environment": "无交易环境",
+        "gate2_direction_clear": "方向不明确",
+        "gate3_extreme_location": "处于极端位置",
+        "gate4_stop_definable": "止损位置无法定义",
+    }
+    for key, label in labels.items():
+        gate = gates.get(key)
+        if not isinstance(gate, dict):
+            continue
+        if gate.get("passed") is not False:
+            continue
+        reason = str(gate.get("reason") or "").strip()
+        return f"阶段一闸门未通过（{label}）：{reason}" if reason else f"阶段一闸门未通过（{label}），本次不下单"
+    return ""
+
+
+def _knowledge_setup_codes(features: PaFeatureSnapshot) -> tuple[str, ...]:
+    """Map the detected patterns and chosen candidate onto playbook keys."""
+    codes: list[str] = []
+    for pattern in features.detected_patterns:
+        code = _PATTERN_SETUP_CODES.get(str(pattern).strip().lower())
+        if code and code not in codes:
+            codes.append(code)
+    # The selected candidate is the setup most likely to become the trade, so it
+    # is injected first.
+    candidate_code = str(features.setup_code or "").strip().lower()
+    for prefix, code in (
+        ("breakout", "breakout"),
+        ("pullback", "pullback"),
+        ("failed_breakout", "failed_breakout"),
+        ("range", "breakout"),
+        ("trend", "pullback"),
+        ("reversal", "mtr"),
+    ):
+        if candidate_code.startswith(prefix):
+            codes = [code, *(item for item in codes if item != code)]
+            # A breakout or pullback trade lives or dies on its target, so the
+            # measured-move playbook rides along in the second slot.
+            if code in {"breakout", "pullback"} and "measured_move" not in codes:
+                codes.insert(1, "measured_move")
+            break
+    return tuple(codes)
+
+
+def _resolve_entry_price(
+    *,
+    order_type: str,
+    direction: str,
+    market_entry: float,
+    ai_entry: float | None,
+) -> tuple[float, str]:
+    """Validate the AI's entry price against the order type it asked for.
+
+    A pending order whose price is on the wrong side of the market is a
+    contradictory instruction, and silently turning it into a market order would
+    fill at a price the model never asked for. Those are refused instead.
+    """
+    if order_type == "market":
+        return market_entry, ""
+    if ai_entry is None or ai_entry <= 0:
+        return market_entry, f"{_order_type_label(order_type)}缺少有效价格，本次不下单"
+    if order_type == "limit":
+        valid = ai_entry < market_entry if direction == "buy" else ai_entry > market_entry
+        if not valid:
+            return market_entry, "限价单价格在当前价位的不利一侧，本次不下单"
+    else:  # stop / 突破单
+        valid = ai_entry > market_entry if direction == "buy" else ai_entry < market_entry
+        if not valid:
+            return market_entry, "突破单价格尚未越过当前价位，本次不下单"
+    return ai_entry, ""
 
 
 @dataclass(frozen=True)
@@ -89,11 +285,18 @@ class PaFeatureSnapshot:
 
 
 class PaAgentLiteStrategy:
-    """First-party PA strategy inspired by PA Agent's feature-first workflow.
+    """Price-action strategy running the two-stage PA Agent decision flow.
 
-    This is a clean-room implementation for GainLab. It keeps the first version
-    deterministic so MT5, API, and strategy-library routing can be tested before
-    the two-stage AI pipeline is connected.
+    Stage 1 (``pa_open_diagnosis``) classifies the market into one of eight
+    cycle states, reports the state probabilities and closes four gates. Stage 2
+    (``pa_open_decision``) turns that read into one order: market, limit, stop or
+    none, with an entry, a structure stop and a target.
+
+    The deterministic half stays in charge throughout. It picks the candidate
+    direction, computes the structure stop and the minimum risk-reward, sizes the
+    position from the user's configuration, and refuses any order that
+    contradicts them. The AI decides *whether* and *how* to enter, never how much
+    to risk.
     """
 
     code = "PA_AGENT_V1"
@@ -116,14 +319,14 @@ class PaAgentLiteStrategy:
     ) -> TradeDecision:
         features = _compute_features(request.candles)
         if features is None:
-            return _hold(request, self._decision_id(), "PA Agent strategy requires at least 30 candles")
+            return _hold(request, self._decision_id(), _features_unavailable_reason(request.candles))
 
         # Run cheap deterministic filters before AI so routine no-signal bars do not burn tokens.
         if _is_choppy(features):
             return _hold(
                 request,
                 self._decision_id(),
-                "PA Agent detected overlapping range conditions; waiting for cleaner price action",
+                "当前为密集重叠的盘整走势，缺乏方向性，等待更清晰的价格行为",
                 confidence=0.3,
             )
 
@@ -164,11 +367,11 @@ class PaAgentLiteStrategy:
 
         for checked_position in request.positions:
             if max_loss is not None and checked_position.profit <= -max_loss:
-                return _close(request, self._decision_id(), checked_position.ticket, "Position reached configured maximum loss")
+                return _close(request, self._decision_id(), checked_position.ticket, "持仓已达到设定的最大亏损金额，按风控平仓")
             if take_profit is not None and checked_position.profit >= take_profit:
-                return _close(request, self._decision_id(), checked_position.ticket, "Position reached configured profit target")
+                return _close(request, self._decision_id(), checked_position.ticket, "持仓已达到设定的盈利目标，按风控止盈平仓")
         if features is None:
-            return _position_hold(request, self._decision_id(), position.ticket, "PA Agent position strategy requires at least 30 candles")
+            return _position_hold(request, self._decision_id(), position.ticket, _features_unavailable_reason(request.candles))
 
         ai_decision = self._evaluate_position_with_ai(request, deployment, features)
         if ai_decision is not None:
@@ -190,17 +393,17 @@ class PaAgentLiteStrategy:
         if position.side == "BUY" and open_signal == "SELL":
             if _cooldown_blocks_close(request, position, features):
                 return _position_hold(request, self._decision_id(), position.ticket, _cooldown_reason(request, position, features))
-            return _close(request, self._decision_id(), position.ticket, "PA Agent detected opposite bearish price-action setup")
+            return _close(request, self._decision_id(), position.ticket, "检测到与持仓相反的看跌价格行为结构，按策略平仓")
         if position.side == "SELL" and open_signal == "BUY":
             if _cooldown_blocks_close(request, position, features):
                 return _position_hold(request, self._decision_id(), position.ticket, _cooldown_reason(request, position, features))
-            return _close(request, self._decision_id(), position.ticket, "PA Agent detected opposite bullish price-action setup")
+            return _close(request, self._decision_id(), position.ticket, "检测到与持仓相反的看涨价格行为结构，按策略平仓")
 
         protective_stop = _atr_protective_stop(request, position, atr=features.atr14)
         if protective_stop is not None:
             return protective_stop
 
-        return _position_hold(request, self._decision_id(), position.ticket, "PA Agent position management conditions remain valid")
+        return _position_hold(request, self._decision_id(), position.ticket, "持仓管理条件未触发，继续持有")
 
     def _evaluate_open_with_ai(
         self,
@@ -217,28 +420,69 @@ class PaAgentLiteStrategy:
         ai_features.update({
             "server_candidate_direction": expected_direction.lower(),
             "server_structure_sl": local_decision.sl,
-            "server_min_risk_reward": 1.8,
+            "server_min_risk_reward": MIN_RISK_REWARD,
         })
-        result = self.ai_client.pa_open_decision(
+
+        # ── Stage 1: market diagnosis ────────────────────────────────────────
+        # Describes the market and selects the playbooks stage 2 may use. It
+        # never carries a price, so a failed gate stops here and saves a call.
+        diagnosis: dict[str, Any] | None = None
+        usage = UsageSummary()
+        diagnosis_result = self.ai_client.pa_open_diagnosis(
             deployment=deployment,
             request_payload=request,
             features=ai_features,
         )
+        if diagnosis_result is not None:
+            diagnosis = diagnosis_result.content
+            usage = diagnosis_result.usage
+            gate_reason = _blocking_gate_reason(diagnosis)
+            if gate_reason:
+                return _hold(
+                    request,
+                    self._decision_id(),
+                    gate_reason,
+                    confidence=0.32,
+                    usage=usage,
+                )
+
+        strategy_text = pa_knowledge.route(
+            cycle=str((diagnosis or {}).get("cycle") or features.cycle_position),
+            direction=str((diagnosis or {}).get("direction") or expected_direction.lower()),
+            setup_codes=_knowledge_setup_codes(features),
+        )
+
+        # ── Stage 2: order decision ─────────────────────────────────────────
+        result = self.ai_client.pa_open_decision(
+            deployment=deployment,
+            request_payload=request,
+            features=ai_features,
+            diagnosis=diagnosis,
+            strategy_text=strategy_text,
+        )
         if result is None:
             return None
+        usage = _merge_usage(usage, result.usage)
 
         content = result.content
-        reason = _ai_decision_message(content, "AI strategy returned hold")
-        should_open = bool(content.get("should_open", False))
+        stage1_text = _stage1_panel_text(diagnosis)
+        reason = _ai_decision_message(content, "AI 未给出具体理由，按策略规则观望")
+        hold_message = _panel_reason("", content, stage1_text, "AI 未给出具体理由，按策略规则观望")
+        order_type = _order_type_code(content.get("order_type"))
+        should_open = _ai_bool(content.get("should_open"), False)
         direction = str(content.get("direction") or "").strip().lower()
         confidence = _clamp(float(content.get("confidence") or 0.45), 0.0, 1.0)
+        win_rate = _optional_float(content.get("estimated_win_rate"))
+        if win_rate is not None:
+            confidence = _clamp(win_rate / 100.0, 0.0, 1.0)
+
         if not should_open or direction not in {"buy", "sell"}:
             return _hold(
                 request,
                 self._decision_id(),
-                reason or "AI strategy decided to hold",
+                hold_message or "AI 策略选择观望",
                 confidence=confidence,
-                usage=result.usage,
+                usage=usage,
             )
 
         if direction.upper() != expected_direction:
@@ -247,31 +491,84 @@ class PaAgentLiteStrategy:
                 self._decision_id(),
                 "AI返回方向与服务端候选方向冲突，本次不开仓",
                 confidence=min(confidence, 0.45),
-                usage=result.usage,
+                usage=usage,
+            )
+
+        if order_type == "":
+            # An explicit "no order" from the order stage.
+            return _hold(
+                request,
+                self._decision_id(),
+                hold_message or "AI 未给出具体理由，本次不下单",
+                confidence=min(confidence, 0.5),
+                usage=usage,
             )
 
         config = deployment["config"]
         spread_price = abs(request.ask - request.bid)
         min_distance = max(spread_price * 30, features.atr14 * 1.2)
-        ai_sl_distance = _positive_float(content.get("sl_distance_price"), min_distance)
-        ai_tp_distance = _positive_float(content.get("tp_distance_price"), 0.0)
 
         if direction == "buy":
-            entry = request.ask
             action = "BUY"
-            structure_distance = max(entry - float(local_decision.sl or entry), 0.0)
-            sl_distance = max(ai_sl_distance, structure_distance, min_distance)
-            tp_distance = max(ai_tp_distance, sl_distance * 1.8)
-            sl = entry - sl_distance
-            tp = entry + tp_distance
+            market_entry = request.ask
         else:
-            entry = request.bid
             action = "SELL"
-            structure_distance = max(float(local_decision.sl or entry) - entry, 0.0)
-            sl_distance = max(ai_sl_distance, structure_distance, min_distance)
-            tp_distance = max(ai_tp_distance, sl_distance * 1.8)
-            sl = entry + sl_distance
-            tp = entry - tp_distance
+            market_entry = request.bid
+
+        entry, entry_error = _resolve_entry_price(
+            order_type=order_type,
+            direction=direction,
+            market_entry=market_entry,
+            ai_entry=_optional_float(content.get("entry_price")),
+        )
+        if entry_error:
+            return _hold(
+                request,
+                self._decision_id(),
+                entry_error,
+                confidence=min(confidence, 0.4),
+                usage=usage,
+            )
+
+        # Stops are validated against the structure stop the server computed:
+        # AI may widen a stop, never tighten it inside the structure.
+        structure_distance = max(
+            (market_entry - float(local_decision.sl or market_entry)) if direction == "buy"
+            else (float(local_decision.sl or market_entry) - market_entry),
+            0.0,
+        )
+        ai_sl_distance = _positive_float(content.get("sl_distance_price"), min_distance)
+        ai_sl_price = _optional_float(content.get("sl_price"))
+        if ai_sl_price is not None:
+            ai_sl_distance = max(
+                (entry - ai_sl_price) if direction == "buy" else (ai_sl_price - entry),
+                ai_sl_distance,
+            )
+        # Sanity check on what the model asked for. The stop is the only thing
+        # that bounds a trade's loss, so a stop the model placed absurdly far away
+        # is refused rather than clamped: silently widening it would be worse.
+        # Only the model's own figure is checked here; the structure stop comes
+        # from the strategy and is left exactly as it was.
+        if features.atr14 > 0 and ai_sl_distance > features.atr14 * MAX_STOP_ATR:
+            return _hold(
+                request,
+                self._decision_id(),
+                f"AI 给出的止损距离过大（{ai_sl_distance / features.atr14:.1f} 倍 ATR，上限 {MAX_STOP_ATR:g} 倍），本次不开仓",
+                confidence=min(confidence, 0.4),
+                usage=usage,
+            )
+        sl_distance = max(ai_sl_distance, structure_distance, min_distance)
+        sl = entry - sl_distance if direction == "buy" else entry + sl_distance
+
+        ai_tp_distance = _positive_float(content.get("tp_distance_price"), 0.0)
+        ai_tp_price = _optional_float(content.get("tp_price"))
+        if ai_tp_price is not None:
+            ai_tp_distance = max(
+                (ai_tp_price - entry) if direction == "buy" else (entry - ai_tp_price),
+                ai_tp_distance,
+            )
+        tp_distance = max(ai_tp_distance, sl_distance * MIN_RISK_REWARD)
+        tp = entry + tp_distance if direction == "buy" else entry - tp_distance
 
         if config.get("position_size_mode") == "risk":
             lot = _position_size_lot(config, request, entry=entry, sl=sl)
@@ -284,7 +581,7 @@ class PaAgentLiteStrategy:
                 self._decision_id(),
                 "最小交易手数超过当前风险额度，本次不开仓",
                 confidence=min(confidence, 0.45),
-                usage=result.usage,
+                usage=usage,
             )
 
         space_reason = _space_block_reason(features, action, entry)
@@ -292,11 +589,16 @@ class PaAgentLiteStrategy:
             return _hold(
                 request,
                 self._decision_id(),
-                f"AI candidate blocked by space filter: {space_reason}; AI reason={reason}",
+                f"AI 候选被空间过滤否决：{space_reason}；AI 判断：{reason}",
                 confidence=min(confidence, 0.48),
-                usage=result.usage,
+                usage=usage,
             )
 
+        metadata = _setup_metadata(features)
+        metadata["order_type"] = order_type
+        if diagnosis is not None:
+            metadata["stage1_cycle"] = str(diagnosis.get("cycle") or "")
+            metadata["stage1_direction"] = str(diagnosis.get("direction") or "")
         return TradeDecision(
             decision_id=self._decision_id(),
             request_id=request.request_id,
@@ -304,14 +606,14 @@ class PaAgentLiteStrategy:
             action=action,
             symbol=request.symbol,
             confidence=confidence,
-            reason=reason or "AI strategy approved an open order",
+            reason=_panel_reason(_order_type_label(order_type), content, stage1_text, "AI 策略批准开仓"),
             expires_at=self._expires_at(),
             lot=lot,
             entry=entry,
             sl=sl,
             tp=tp,
-            metadata=_setup_metadata(features),
-            usage=result.usage,
+            metadata=metadata,
+            usage=usage,
         )
 
     def _evaluate_position_with_ai(
@@ -332,13 +634,31 @@ class PaAgentLiteStrategy:
 
         content = result.content
         action = str(content.get("action") or "hold").strip().lower()
-        reason = _ai_decision_message(content, "AI position strategy returned hold")
+        reason = _ai_decision_message(content, "AI 未给出具体理由，继续持有")
         confidence = _clamp(float(content.get("confidence") or 0.45), 0.0, 1.0)
-        ticket = str(content.get("ticket") or request.positions[0].ticket)
-        target = next((item for item in request.positions if item.ticket == ticket), request.positions[0])
+
+        requested_ticket = str(content.get("ticket") or "").strip()
+        target = next(
+            (item for item in request.positions if str(item.ticket) == requested_ticket),
+            None,
+        )
+        if target is None:
+            if requested_ticket and len(request.positions) > 1:
+                # The model named a position that is not in this request. Acting
+                # on request.positions[0] would silently manage an unrelated
+                # trade, so refuse rather than guess which one it meant.
+                return _position_hold(
+                    request,
+                    self._decision_id(),
+                    request.positions[0].ticket,
+                    f"AI返回的持仓单号 {requested_ticket} 不在本次持仓列表中，本次不执行任何持仓操作",
+                    confidence=min(confidence, 0.4),
+                    usage=result.usage,
+                )
+            target = request.positions[0]
 
         if action == "close":
-            decision = _close(request, self._decision_id(), target.ticket, reason or "AI strategy requested close")
+            decision = _close(request, self._decision_id(), target.ticket, reason or "AI 建议平仓")
             decision.confidence = confidence
             decision.usage = result.usage
             return decision
@@ -362,7 +682,7 @@ class PaAgentLiteStrategy:
                 request,
                 self._decision_id(),
                 target.ticket,
-                reason or "AI strategy requested stop/take-profit modification",
+                reason or "AI 建议调整止损止盈",
                 sl=sl,
                 tp=tp,
             )
@@ -370,56 +690,15 @@ class PaAgentLiteStrategy:
             decision.usage = result.usage
             return decision
         if action == "add":
-            direction = str(content.get("direction") or "").strip().lower()
-            if direction not in {"buy", "sell"}:
-                return None
-            config = deployment["config"]
-            max_positions = max(1, int(config.get("max_positions") or 1))
-            same_direction = all(item.side.lower() == direction for item in request.positions)
-            if not bool(config.get("allow_add")) or len(request.positions) >= max_positions or not same_direction:
-                return _position_hold(
-                    request,
-                    self._decision_id(),
-                    target.ticket,
-                    "当前策略配置不允许本次加仓，继续持有原仓位",
-                    confidence=min(confidence, 0.45),
-                    usage=result.usage,
-                )
-            spread_price = abs(request.ask - request.bid)
-            min_distance = max(spread_price * 30, features.atr14 * 1.2)
-            if direction == "buy":
-                entry = request.ask
-                sl = entry - min_distance
-                tp = entry + min_distance * 1.8
-                trade_action = "BUY"
-            else:
-                entry = request.bid
-                sl = entry + min_distance
-                tp = entry - min_distance * 1.8
-                trade_action = "SELL"
-            lot = _position_size_lot(config, request, entry=entry, sl=sl)
-            if lot <= 0:
-                return _position_hold(
-                    request,
-                    self._decision_id(),
-                    target.ticket,
-                    "最小交易手数超过当前风险额度，本次不加仓",
-                    confidence=min(confidence, 0.45),
-                    usage=result.usage,
-                )
-            return TradeDecision(
-                decision_id=self._decision_id(),
-                request_id=request.request_id,
-                status="APPROVED",
-                action=trade_action,
-                symbol=request.symbol,
-                confidence=confidence,
-                reason=reason or "AI strategy requested add position",
-                expires_at=self._expires_at(),
-                lot=lot,
-                entry=entry,
-                sl=sl,
-                tp=tp,
+            # This strategy does not pyramid: it holds one position at a time.
+            # The prompt says so, and this branch keeps a stale or creative reply
+            # from being silently reinterpreted as some other action.
+            return _position_hold(
+                request,
+                self._decision_id(),
+                target.ticket,
+                "本策略为单笔持仓，不支持加仓，继续持有原仓位",
+                confidence=min(confidence, 0.45),
                 usage=result.usage,
             )
         if action == "hold":
@@ -427,7 +706,7 @@ class PaAgentLiteStrategy:
                 request,
                 self._decision_id(),
                 target.ticket,
-                reason or "AI strategy decided to hold position",
+                reason or "AI 建议继续持有",
                 confidence=confidence,
                 usage=result.usage,
             )
@@ -438,6 +717,49 @@ def _ai_decision_message(content: dict[str, Any], fallback: str) -> str:
     analysis = str(content.get("analysis") or "").strip()
     reason = str(content.get("reason") or "").strip()
     return (analysis or reason or fallback)[:800]
+
+
+def _stage1_panel_text(diagnosis: dict[str, Any] | None) -> str:
+    """Render the stage-1 market read for the EA panel.
+
+    The diagnosis is a separate, separately billed AI call, so showing it keeps
+    the panel and the two usage-log rows telling the same story instead of
+    leaving the customer to wonder what the second charge bought.
+    """
+    if not diagnosis:
+        return ""
+    cycle = pa_knowledge.cycle_label(str(diagnosis.get("cycle") or ""))
+    direction = pa_knowledge.direction_label(str(diagnosis.get("direction") or ""))
+    if cycle and direction:
+        return f"阶段一：{cycle} / {direction}"
+    if cycle:
+        return f"阶段一：{cycle}"
+    if direction:
+        return f"阶段一：{direction}"
+    return ""
+
+
+def _panel_reason(
+    prefix: str,
+    content: dict[str, Any],
+    stage1: str,
+    fallback: str,
+) -> str:
+    """Compose the one line the EA shows: action, verdict, diagnosis, analysis."""
+    parts: list[str] = []
+    if prefix:
+        parts.append(prefix)
+    short = str(content.get("reason") or "").strip()
+    analysis = str(content.get("analysis") or "").strip()
+    if short:
+        parts.append(short)
+    if stage1:
+        parts.append(stage1)
+    if analysis and analysis != short:
+        parts.append(f"AI 分析：{analysis}")
+    if not parts:
+        parts.append(fallback)
+    return "；".join(parts)[:1200]
 
 
 def _hold(
@@ -580,6 +902,13 @@ def _atr_protective_stop(
     if usage is not None:
         decision.usage = usage
     return decision
+
+
+def _features_unavailable_reason(candles: list[Candle]) -> str:
+    """Explain why features could not be computed, instead of always blaming K 线数量."""
+    if len(candles) < 30:
+        return "行情数据不足：已收盘 K 线少于 30 根，暂不判断入场"
+    return "行情数据异常：当前无法计算波动幅度（ATR 为 0），等待有效行情"
 
 
 def _compute_features(candles: list[Candle]) -> PaFeatureSnapshot | None:
@@ -820,67 +1149,178 @@ def _is_choppy(features: PaFeatureSnapshot) -> bool:
 
 
 def _describe_open(features: PaFeatureSnapshot, direction: str) -> str:
-    side = "bullish" if direction == "BUY" else "bearish"
+    side = "多头" if direction == "BUY" else "空头"
     return (
-        f"PA Agent {side} setup: {features.setup_name}, score={features.setup_score}, "
-        f"breakout={features.breakout}/{features.breakout_event}, "
-        f"cycle={features.cycle_position}, patterns={','.join(features.detected_patterns)}, "
-        f"zone={features.zone}, range_position={features.range_position:.2f}, "
-        f"trend={features.background_direction}/{features.recent_direction}/{features.trend_relationship}, "
-        f"swing={features.swing_structure}, H/L={features.h_count}/{features.l_count}, "
-        f"atr14={features.atr14:.5f}"
+        f"{side}入场形态：{_pa_text(features.setup_name)}，"
+        f"评分 {features.setup_score}/100，"
+        f"周期位置{_pa_text(features.cycle_position)}，"
+        f"价格位于区间{_pa_text(features.zone)}"
     )
+
+
+# Every internal enum that can reach the EA panel. Anything missing here falls
+# back to the raw token, so new enum values must be added to this table.
+_PA_TERMS: dict[str, str] = {
+    # direction and bias
+    "bullish": "多头",
+    "bearish": "空头",
+    "neutral": "中性",
+    "long": "多头",
+    "short": "空头",
+    # price zone inside the recent range
+    "upper": "上部",
+    "middle": "中部",
+    "lower": "下部",
+    # cycle position
+    "spike": "极速行情",
+    "micro_channel": "微型通道",
+    "tight_channel": "窄通道",
+    "normal_channel": "普通通道",
+    "broad_channel": "宽通道",
+    "trending_tr": "趋势型震荡",
+    "trading_range": "震荡区间",
+    "unknown": "状态不明",
+    # relationship between background and recent direction
+    "aligned": "方向一致",
+    "conflict": "方向冲突",
+    "neutral_background": "中性背景",
+    "mixed": "方向混合",
+    # swing structure (HH_HL / LL_LH are shared with other fields, see _swing_text)
+    "HH_HL": "更高的高点配更高的低点",
+    "LL_LH": "更低的高点配更低的低点",
+    "insufficient": "高低点样本不足",
+    # breakout state
+    "up": "向上突破",
+    "down": "向下突破",
+    "none": "无",
+    "no": "无",
+    "breakout_up_retest": "向上突破后回踩",
+    "breakout_down_retest": "向下突破后回踩",
+    "range_breakout_up": "区间向上突破",
+    "range_breakout_down": "区间向下突破",
+    "failed_breakout_up": "向上突破失败",
+    "failed_breakout_down": "向下突破失败",
+    # detected price-action patterns
+    "breakout_test": "边界测试",
+    "breakout_pullback": "突破回踩",
+    "breakout_failure": "突破失败",
+    "failed_signal": "信号失败",
+    "barbwire": "铁丝网整理",
+    "overlap": "密集重叠",
+    "middle_range": "区间中轴",
+    "always_in": "单边持续",
+    "h1": "一次高点尝试",
+    "h2": "二次高点尝试",
+    "l1": "一次低点尝试",
+    "l2": "二次低点尝试",
+    "trend_structure": "趋势结构成立",
+    "wedge": "楔形",
+    "triangle_ascending": "上升三角形",
+    "triangle_descending": "下降三角形",
+    "triangle_symmetrical": "对称三角形",
+    "double_top_bottom": "双顶双底",
+    "mtr": "主要趋势反转候选",
+    "reversal_attempt": "反转尝试",
+    "final_flag": "最终旗形",
+    "climax_triggered": "动能高潮已出现",
+    "climax_warning": "动能高潮预警",
+    "triggered": "已出现",
+    "warning": "预警",
+    "other": "其他形态",
+    # signal bar
+    "trend_bull": "多头趋势棒",
+    "trend_bear": "空头趋势棒",
+    "doji": "十字星",
+    "inside": "内包棒",
+    "strong": "强",
+    "medium": "中等",
+    "weak": "弱",
+    "invalid": "无效",
+    # follow-through
+    "yes": "有跟随",
+    "failed": "跟随失败",
+    "pending": "待确认",
+    # market phase and risk levels
+    "stable": "结构稳定",
+    "transitioning": "结构转换中",
+    "low": "低",
+    "high": "高",
+    # setup names
+    "no qualified PA setup": "未发现符合条件的价格行为形态",
+}
 
 
 def _pa_text(value: str) -> str:
-    translations = {
-        "no qualified PA setup": "未发现符合条件的价格行为形态",
-        "bullish": "多头",
-        "bearish": "空头",
-        "neutral": "中性",
-        "none": "无",
-        "unknown": "未知",
-        "middle": "中部",
-        "upper": "上部",
-        "lower": "下部",
-        "trading_range": "震荡区间",
-        "neutral_background": "中性背景",
-        "mixed": "混合",
-        "up": "向上",
-        "down": "向下",
-        "yes": "是",
-        "no": "否",
-    }
-    return translations.get(value, value)
+    return _PA_TERMS.get(str(value or ""), str(value or ""))
+
+
+# Swing structure needs its own table: "mixed" means something different here
+# than it does for the trend relationship, so a shared key would misrender one.
+_SWING_TERMS: dict[str, str] = {
+    "HH_HL": "更高的高点配更高的低点",
+    "LL_LH": "更低的高点配更低的低点",
+    "mixed": "高低点结构混合",
+    "insufficient": "高低点样本不足",
+}
+
+# Trend relationship reads as a clause, not as a label, so it gets its own table.
+_TREND_TERMS: dict[str, str] = {
+    "aligned": "背景与近期方向一致",
+    "conflict": "背景与近期方向冲突",
+    "neutral_background": "以中性背景为主",
+    "mixed": "背景与近期方向混合",
+}
+
+
+def _swing_text(value: str) -> str:
+    return _SWING_TERMS.get(str(value or ""), "高低点结构不明确")
+
+
+def _trend_text(value: str) -> str:
+    return _TREND_TERMS.get(str(value or ""), "方向结构不明确")
 
 
 def _describe_hold(features: PaFeatureSnapshot) -> str:
-    ema_text = f"{features.ema20:.5f}" if features.ema20 is not None else "n/a"
-    patterns = ",".join(_pa_text(item) for item in features.detected_patterns) or "无"
-    return (
-        f"暂不开仓：当前信号未达到开仓条件，形态={_pa_text(features.setup_name)}，"
-        f"信号评分={features.setup_score}，方向偏向={_pa_text(features.setup_bias)}，"
-        f"突破={_pa_text(features.breakout)}/{_pa_text(features.breakout_event)}，"
-        f"周期位置={_pa_text(features.cycle_position)}，识别形态={patterns}，"
-        f"价格区域={_pa_text(features.zone)}，区间位置={features.range_position:.2f}，"
-        f"EMA20={ema_text}，"
-        f"趋势={_pa_text(features.background_direction)}/{_pa_text(features.recent_direction)}/{_pa_text(features.trend_relationship)}，"
-        f"摆动结构={_pa_text(features.swing_structure)}，盘整度={features.barbwire_score:.2f}"
+    """Panel wording for a no-trade bar, in trading language.
+
+    The raw feature vector stays in the decision metadata; what the customer
+    reads here is the market read behind the decision, not internal tokens.
+    """
+    cycle = _pa_text(features.cycle_position)
+    zone = _pa_text(features.zone)
+    position_pct = _clamp(features.range_position, 0.0, 1.0) * 100
+    parts = [f"暂不开仓：当前处于{cycle}，价格位于区间{zone}（位置约 {position_pct:.0f}%）"]
+
+    pattern_names = list(dict.fromkeys(_pa_text(item) for item in features.detected_patterns if item))
+    if pattern_names:
+        parts.append("识别到" + "、".join(pattern_names[:5]))
+    else:
+        parts.append("未识别到明确的价格行为形态")
+
+    parts.append(
+        f"趋势判断：{_trend_text(features.trend_relationship)}，"
+        f"摆动结构：{_swing_text(features.swing_structure)}"
     )
+
+    quality = f"入场形态评分 {features.setup_score}/100"
+    if features.barbwire_score >= 0.6:
+        quality += f"，盘整度 {features.barbwire_score:.2f} 偏高"
+    parts.append(f"{quality}，未形成可执行的开仓结构")
+    return "；".join(parts)
 
 
 def _trace_summary(features: PaFeatureSnapshot) -> str:
-    gate = (
-        f"gate: data=ok, cycle={features.cycle_position}, "
-        f"direction={features.recent_direction}, always_in={features.always_in}, "
-        f"momentum={'ok' if features.setup_score >= 70 else 'weak'}"
+    """Diagnostic tail for the deterministic fallback decision."""
+    momentum = "动能充足" if features.setup_score >= 70 else "动能不足"
+    return (
+        f"周期位置{_pa_text(features.cycle_position)}，"
+        f"最近方向{_pa_text(features.recent_direction)}，"
+        f"单边状态{_pa_text(features.always_in)}，{momentum}；"
+        f"信号棒{_pa_text(features.signal_bar_quality)}、{_pa_text(features.follow_through)}，"
+        f"阶段{_pa_text(features.market_phase)}，"
+        f"转换风险{_pa_text(features.transition_risk)}，"
+        f"高潮风险{_pa_text(features.climax_risk)}"
     )
-    decision = (
-        f"decision: signal={features.signal_bar_quality}/{features.follow_through}, "
-        f"phase={features.market_phase}, transition={features.transition_risk}, "
-        f"climax={features.climax_risk}, patterns={','.join(features.detected_patterns)}"
-    )
-    return f"{gate}; {decision}"
 
 
 def _space_block_reason(
@@ -900,18 +1340,12 @@ def _space_block_reason(
         distance = resistance - entry
         distance_atr = distance / features.atr14 if features.atr14 > 0 else 99.0
         if distance_atr < hard_min_atr or (distance_atr < min_atr and features.setup_score < 85):
-            return (
-                f"上方阻力空间不足: resistance={resistance:.5f}, "
-                f"distance={distance:.5f}({distance_atr:.2f} ATR)"
-            )
+            return f"上方阻力过近：距离入场约 {distance_atr:.1f} 倍 ATR，做多空间不足"
     if direction == "SELL" and support is not None and support < entry:
         distance = entry - support
         distance_atr = distance / features.atr14 if features.atr14 > 0 else 99.0
         if distance_atr < hard_min_atr or (distance_atr < min_atr and features.setup_score < 85):
-            return (
-                f"下方支撑空间不足: support={support:.5f}, "
-                f"distance={distance:.5f}({distance_atr:.2f} ATR)"
-            )
+            return f"下方支撑过近：距离入场约 {distance_atr:.1f} 倍 ATR，做空空间不足"
     return ""
 
 
@@ -945,10 +1379,11 @@ def _cooldown_reason(
     features: PaFeatureSnapshot,
 ) -> str:
     bars = _bars_since_open(request, int(position.open_time or 0))
+    side = "多单" if str(position.side).upper() == "BUY" else "空单"
     return (
-        f"新单冷却中: opened {bars} bars ago, 暂不主动平仓; "
-        f"side={position.side}, profit={position.profit:.2f}, "
-        f"setup_score={features.setup_score}, bias={features.setup_bias}"
+        f"新开仓冷却中：持仓仅 {bars} 根 K 线，暂不主动平仓；"
+        f"当前为{side}，浮动盈亏 {position.profit:.2f}，"
+        f"入场形态评分 {features.setup_score}/100，尚未出现足够强的反向信号"
     )
 
 
@@ -1072,7 +1507,7 @@ def _position_size_lot(
     if config.get("risk_base_mode") == "balance_percent":
         risk_money = request.balance * _positive_float(config.get("risk_percent"), 1.0) / 100
     else:
-        risk_money = _positive_float(config.get("risk_amount"), 10.0)
+        risk_money = _positive_float(config.get("risk_amount"), DEFAULT_RISK_AMOUNT)
     if risk_money <= 0:
         return fixed_lot
 
@@ -1136,9 +1571,9 @@ def _position_money_limits(
     if config.get("risk_base_mode") == "balance_percent":
         risk_money = request.balance * _positive_float(config.get("risk_percent"), 1.0) / 100
         if risk_money <= 0:
-            risk_money = _positive_float(config.get("risk_amount"), 100.0)
+            risk_money = _positive_float(config.get("risk_amount"), DEFAULT_RISK_AMOUNT)
     else:
-        risk_money = _positive_float(config.get("risk_amount"), 100.0)
+        risk_money = _positive_float(config.get("risk_amount"), DEFAULT_RISK_AMOUNT)
 
     max_loss = abs(risk_money)
     take_profit = max_loss * 1.8

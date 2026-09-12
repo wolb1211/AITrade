@@ -14,6 +14,7 @@ from app.services import screenshot_preview
 from app.services.screenshot_preview import load_preview, prepare_screenshot
 from app.store import SqliteStore
 from app.models import UsageSummary
+from workflow_fixture import minimal_workflow
 
 
 _PNG_BUFFER = BytesIO()
@@ -66,6 +67,7 @@ def test_custom_open_decision_passes_screenshot_to_multimodal_ai(tmp_path: Path)
             "strategy_name": "截图策略",
             "config": {
                 "open_data_type": "screenshot",
+                "workflow": minimal_workflow(),
                 "visual_conditions": [
                     {"stage": "open", "code": "hg_color", "text": "HG颜色"},
                     {"stage": "position", "code": "hg_exit", "text": "HG反转"},

@@ -6,7 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib import error, request
 
-from app.services.ai_service import AiDecisionClient, _vision_test_answer_is_correct
+from app.services.ai_service import AiDecisionClient, _cached_input_tokens, _vision_test_answer_is_correct
 from app.store import SqliteStore
 
 
@@ -458,3 +458,253 @@ def test_ai_client_does_not_cache_executable_trade_action(tmp_path: Path, monkey
     usage = store.list_ai_usage_logs(page=1, size=10, user_id=str(user["id"]))
     assert usage["summary"]["cache_hits"] == 0
     assert usage["summary"]["provider_calls"] == 2
+
+
+def test_cached_input_tokens_reads_both_provider_shapes() -> None:
+    assert _cached_input_tokens({"prompt_cache_hit_tokens": 800, "prompt_tokens": 1000}, 1000) == 800
+    assert _cached_input_tokens({"prompt_tokens_details": {"cached_tokens": 640}}, 1000) == 640
+    # A misreporting gateway must never yield a negative miss count.
+    assert _cached_input_tokens({"prompt_cache_hit_tokens": 5000}, 1000) == 1000
+    assert _cached_input_tokens({"prompt_cache_hit_tokens": -5}, 1000) == 0
+    assert _cached_input_tokens({"prompt_cache_hit_tokens": "1024"}, 2048) == 1024
+    assert _cached_input_tokens({"prompt_cache_hit_tokens": "abc"}, 1000) == 0
+    assert _cached_input_tokens({}, 1000) == 0
+    assert _cached_input_tokens({"prompt_cache_hit_tokens": 800}, 0) == 0
+
+
+def test_cache_hit_tokens_are_charged_at_the_cache_price(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "cache-pricing.db")
+    store.initialize()
+    user = store.save_user({"email": "cache-price@example.com", "status": "active"})
+    store.save_ai_endpoint({
+        "id": "aie_cache_price",
+        "owner_type": "gl",
+        "name": "Cache pricing model",
+        "base_url": "https://example.com/v1",
+        "model": "example-model",
+        "api_key": "sk-cache-price",
+        "is_default": True,
+        "input_price_per_million": "2",
+        "output_price_per_million": "8",
+        "cache_input_price_per_million": "0.5",
+    })
+    client = AiDecisionClient(store)
+    provider_response = json.dumps({
+        "choices": [{"message": {"content": json.dumps({
+            "should_open": False,
+            "direction": None,
+            "confidence": 0.5,
+            "reason": "缓存计费测试",
+            "analysis": "命中前缀缓存的输入 token 应按下调后的价格计费。",
+        }, ensure_ascii=False)}}],
+        "usage": {
+            "prompt_tokens": 10000,
+            "prompt_cache_hit_tokens": 8000,
+            "prompt_cache_miss_tokens": 2000,
+            "completion_tokens": 500,
+            "total_tokens": 10500,
+        },
+    }, ensure_ascii=False)
+    monkeypatch.setattr(client, "_post_chat_completion", lambda **_kwargs: provider_response)
+
+    result = client._chat_json(
+        deployment={"id": "dep_cache_price", "user_id": str(user["id"]), "strategy_code": "PA_AGENT_V1", "config": {}},
+        endpoint="open",
+        system_prompt="test",
+        user_payload={"account": {"login": "123456", "server": "Test"}, "symbol": "XAUUSD", "timeframe": "M5"},
+    )
+
+    assert result is not None
+    assert result.usage.input_tokens == 10000
+    assert result.usage.cached_input_tokens == 8000
+    # miss 2000*2 + cached 8000*0.5 + output 500*8 = 4000 + 4000 + 4000 = 12000 / 1e6
+    assert Decimal(store.get_user(user["id"])["ai_balance"]) == Decimal("-0.012")
+    usage = store.list_ai_usage_logs(page=1, size=10, user_id=str(user["id"]))["list"][0]
+    assert usage["cached_input_tokens"] == 8000
+    assert Decimal(usage["cache_input_price_snapshot"]) == Decimal("0.5")
+    assert Decimal(usage["charged_amount"]) == Decimal("0.012")
+
+
+def test_unset_cache_price_falls_back_to_the_normal_input_price(tmp_path: Path, monkeypatch) -> None:
+    store = SqliteStore(tmp_path / "cache-price-fallback.db")
+    store.initialize()
+    user = store.save_user({"email": "cache-fallback@example.com", "status": "active"})
+    store.save_ai_endpoint({
+        "id": "aie_cache_fallback",
+        "owner_type": "gl",
+        "name": "Cache fallback model",
+        "base_url": "https://example.com/v1",
+        "model": "example-model",
+        "api_key": "sk-cache-fallback",
+        "is_default": True,
+        "input_price_per_million": "2",
+        "output_price_per_million": "8",
+    })
+    client = AiDecisionClient(store)
+    provider_response = json.dumps({
+        "choices": [{"message": {"content": json.dumps({
+            "should_open": False,
+            "direction": None,
+            "confidence": 0.5,
+            "reason": "缓存价格缺省",
+            "analysis": "未配置缓存价时，命中 token 仍按普通输入价计费，账目与改造前一致。",
+        }, ensure_ascii=False)}}],
+        "usage": {
+            "prompt_tokens": 10000,
+            "prompt_cache_hit_tokens": 8000,
+            "completion_tokens": 500,
+            "total_tokens": 10500,
+        },
+    }, ensure_ascii=False)
+    monkeypatch.setattr(client, "_post_chat_completion", lambda **_kwargs: provider_response)
+
+    client._chat_json(
+        deployment={"id": "dep_cache_fallback", "user_id": str(user["id"]), "strategy_code": "PA_AGENT_V1", "config": {}},
+        endpoint="open",
+        system_prompt="test",
+        user_payload={"account": {"login": "123456", "server": "Test"}, "symbol": "XAUUSD", "timeframe": "M5"},
+    )
+
+    # 10000*2 + 500*8 = 24000 / 1e6, identical to billing every input token at the input price.
+    assert Decimal(store.get_user(user["id"])["ai_balance"]) == Decimal("-0.024")
+    usage = store.list_ai_usage_logs(page=1, size=10, user_id=str(user["id"]))["list"][0]
+    assert usage["cached_input_tokens"] == 8000
+    assert Decimal(usage["cache_input_price_snapshot"]) == Decimal("2")
+
+
+def test_missing_usage_block_is_logged_because_the_call_cannot_be_billed(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """An aggregating gateway that omits `usage` would silently give away calls."""
+    store = SqliteStore(tmp_path / "no-usage.db")
+    store.initialize()
+    user = store.save_user({"email": "no-usage@example.com", "status": "active"})
+    store.save_ai_endpoint({
+        "id": "aie_no_usage",
+        "owner_type": "gl",
+        "name": "No usage model",
+        "base_url": "https://example.com/v1",
+        "model": "example-model",
+        "api_key": "sk-no-usage",
+        "is_default": True,
+        "input_price_per_million": "2",
+        "output_price_per_million": "8",
+    })
+    client = AiDecisionClient(store)
+    # Valid decision JSON, but no usage block at all.
+    provider_response = json.dumps({
+        "choices": [{"message": {"content": json.dumps({
+            "should_open": False,
+            "direction": None,
+            "confidence": 0.5,
+            "reason": "测试无用量返回",
+            "analysis": "供应商没有返回 usage 字段，本次调用无法计费。",
+        }, ensure_ascii=False)}}],
+    }, ensure_ascii=False)
+    monkeypatch.setattr(client, "_post_chat_completion", lambda **_kwargs: provider_response)
+
+    with caplog.at_level("WARNING"):
+        result = client._chat_json(
+            deployment={"id": "dep_no_usage", "user_id": str(user["id"]), "strategy_code": "PA_AGENT_V1", "config": {}},
+            endpoint="open",
+            system_prompt="test",
+            user_payload={"account": {"login": "123456"}, "symbol": "XAUUSD", "timeframe": "M5"},
+        )
+
+    assert result is not None
+    assert result.usage.input_tokens == 0
+    assert "no usage block" in caplog.text
+    usage = store.list_ai_usage_logs(page=1, size=10, user_id=str(user["id"]))["list"][0]
+    assert usage["input_tokens"] == 0
+    assert Decimal(usage["charged_amount"]) == Decimal("0")
+
+
+def _summary_row(store: SqliteStore, user_id: str) -> dict:
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM ai_usage_monthly_summaries WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def test_monthly_summary_records_cached_tokens(tmp_path: Path) -> None:
+    """The platform's caching margin must outlive the 60-day call detail."""
+    store = SqliteStore(tmp_path / "summary-cache.db")
+    store.initialize()
+    user = store.save_user({"email": "summary-cache@example.com", "status": "active"})
+
+    store.save_ai_usage_log({
+        "user_id": str(user["id"]),
+        "model_id": "example-model",
+        "provider_id": "example-provider",
+        "deployment_id": "dep_1",
+        "strategy_code": "PA_AGENT_V1",
+        "billing_source": "official",
+        "input_tokens": 10000,
+        "cached_input_tokens": 8000,
+        "output_tokens": 500,
+        "success": True,
+        "provider_called": True,
+        "response_source": "provider",
+    })
+
+    summary = _summary_row(store, str(user["id"]))
+    assert summary["input_tokens"] == 10000
+    assert summary["cached_input_tokens"] == 8000
+
+    # A second call accumulates rather than replacing.
+    store.save_ai_usage_log({
+        "user_id": str(user["id"]),
+        "model_id": "example-model",
+        "provider_id": "example-provider",
+        "deployment_id": "dep_1",
+        "strategy_code": "PA_AGENT_V1",
+        "billing_source": "official",
+        "input_tokens": 1000,
+        "cached_input_tokens": 1000,
+        "output_tokens": 100,
+        "success": True,
+        "provider_called": True,
+        "response_source": "provider",
+    })
+
+    summary = _summary_row(store, str(user["id"]))
+    assert summary["calls"] == 2
+    assert summary["input_tokens"] == 11000
+    assert summary["cached_input_tokens"] == 9000
+
+
+def test_monthly_summary_backfill_keeps_cached_tokens(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "summary-backfill.db")
+    store.initialize()
+    user = store.save_user({"email": "summary-backfill@example.com", "status": "active"})
+    store.save_ai_usage_log({
+        "user_id": str(user["id"]),
+        "model_id": "example-model",
+        "provider_id": "example-provider",
+        "deployment_id": "dep_1",
+        "strategy_code": "PA_AGENT_V1",
+        "billing_source": "official",
+        "input_tokens": 5000,
+        "cached_input_tokens": 4000,
+        "output_tokens": 200,
+        "success": True,
+        "provider_called": True,
+        "response_source": "provider",
+    })
+
+    # Force the one-shot backfill to run again over the existing log rows.
+    with store._connect() as connection:
+        connection.execute("DELETE FROM ai_usage_monthly_summaries")
+        connection.execute(
+            "DELETE FROM system_settings WHERE setting_key = ?",
+            ("ai_usage_monthly_summary_backfilled",),
+        )
+    store._backfill_ai_usage_monthly_summaries()
+
+    summary = _summary_row(store, str(user["id"]))
+    assert summary["cached_input_tokens"] == 4000
+    assert summary["input_tokens"] == 5000
+
+

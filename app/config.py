@@ -51,7 +51,7 @@ class Settings:
     mysql_database: str = ""
     mysql_user: str = ""
     mysql_password: str = ""
-    ai_timeout: float = 30.0
+    ai_timeout: float = 45.0
     demo_deployment_key: str = "gl_demo_pa_key"
     auth_secret: str = ""
     admin_jwt_secret: str = ""
@@ -82,7 +82,7 @@ class Settings:
             mysql_database=os.getenv("GAINLAB_MYSQL_DATABASE", ""),
             mysql_user=os.getenv("GAINLAB_MYSQL_USER", ""),
             mysql_password=os.getenv("GAINLAB_MYSQL_PASSWORD", ""),
-            ai_timeout=float(os.getenv("GAINLAB_AI_TIMEOUT", "30")),
+            ai_timeout=float(os.getenv("GAINLAB_AI_TIMEOUT", "45")),
             auth_secret=os.getenv("GAINLAB_AUTH_SECRET", ""),
             admin_jwt_secret=os.getenv("GAINLAB_ADMIN_JWT_SECRET", ""),
             session_days=int(os.getenv("GAINLAB_SESSION_DAYS", "30")),

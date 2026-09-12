@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import base64
+import logging
 from decimal import Decimal, InvalidOperation
 import hmac
 import random
@@ -22,7 +23,6 @@ from app.models import (
     HeartbeatRequest,
     HeartbeatResponse,
     Mt5Bar,
-    Mt5DecisionResponse,
     Mt5HistorySyncRequest,
     Mt5HistorySyncResponse,
     Mt5OpenDecisionResponse,
@@ -53,6 +53,8 @@ from app.services.custom_indicators import public_indicator_catalog
 from app.services.custom_workflow import workflow_catalog, workflow_json_schema, workflow_validation_result
 from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
 from app.store import SqliteStore
+
+logger = logging.getLogger("gainlab.mt5")
 
 
 class AsciiJSONResponse(JSONResponse):
@@ -482,12 +484,21 @@ def create_mt5_router(
                 position_kline_count=int(config.get("position_kline_count", 100)),
                 call_mode=config.get("call_mode", "bar"),
                 call_val=float(config.get("call_val", 1)),
+                # Higher-timeframe data is not currently used by the official
+                # GL Trend strategy. Keep the response field empty for old EAs
+                # that still read it, while stopping new clients from sending
+                # unnecessary secondary bars.
+                secondary_timeframes=[],
             ),
         )
 
     @router.post("/open-decision", response_model=Mt5OpenDecisionResponse)
     def open_decision(request: Mt5OpenDecisionRequest) -> Mt5OpenDecisionResponse:
         request_id = _request_id("open", request)
+        logger.info(
+            "open secondary bars: %s",
+            {str(key).upper(): len(value or []) for key, value in (request.market.secondary_bars or {}).items()},
+        )
         deployment = store.find_deployment_by_key(request.deployment_key)
         access_error = "invalid_deployment_key" if deployment is None else decision_service.deployment_access_error(deployment)
         if access_error is None:
@@ -521,6 +532,7 @@ def create_mt5_router(
             ask=request.market.ask,
             spread_points=request.market.spread,
             candles=_candles(request.market.bars),
+            secondary_candles=_secondary_candles(request.market.secondary_bars),
             symbol_info=request.market.metadata,
             data_type=request.data_type,
             screenshot_data_url=screenshot_data_url,
@@ -534,6 +546,10 @@ def create_mt5_router(
     @router.post("/position-decision", response_model=Mt5PositionDecisionResponse)
     def position_decision(request: Mt5PositionDecisionRequest) -> Mt5PositionDecisionResponse:
         request_id = _request_id("position", request)
+        logger.info(
+            "position secondary bars: %s",
+            {str(key).upper(): len(value or []) for key, value in (request.market.secondary_bars or {}).items()},
+        )
         deployment = store.find_deployment_by_key(request.deployment_key)
         access_error = "invalid_deployment_key" if deployment is None else decision_service.deployment_access_error(deployment)
         if access_error is None:
@@ -567,6 +583,7 @@ def create_mt5_router(
             ask=request.market.ask,
             spread_points=request.market.spread,
             candles=_candles(request.market.bars),
+            secondary_candles=_secondary_candles(request.market.secondary_bars),
             symbol_info=request.market.metadata,
             data_type=request.data_type,
             screenshot_data_url=screenshot_data_url,
@@ -790,6 +807,24 @@ def create_admin_ai_router(
             raise HTTPException(status_code=400, detail="cache_ttl_invalid")
         return ok(store.save_ai_cache_settings(enabled=enabled, ttl_seconds=ttl_seconds), "saved")
 
+    @router.post("/ai/cost-comparison")
+    def ai_cost_comparison(payload: dict[str, object] | None = None) -> dict[str, object]:
+        """Platform-funded AI cost against the margin kept from prompt caching."""
+        payload = payload or {}
+        try:
+            months = int(payload.get("months") or 6)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="invalid_months") from None
+        return ok(store.admin_ai_cost_comparison(months=months))
+
+    @router.post("/ai/cache-discount/save")
+    def ai_cache_discount_save(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            saved = store.save_ai_cache_discount_ratio(payload.get("ratio"))
+        except (RuntimeError, InvalidOperation, ValueError):
+            raise HTTPException(status_code=400, detail="invalid_cache_discount_ratio") from None
+        return ok({"discount_ratio": saved}, "saved")
+
     @router.post("/wallet/adjust")
     def wallet_adjust(payload: dict[str, object]) -> dict[str, object]:
         raw_user_id = str(payload.get("user_id") or "").strip()
@@ -980,7 +1015,7 @@ def create_admin_ai_router(
             raise HTTPException(status_code=400, detail="endpoint_base_url_required")
         if not str(payload.get("model") or "").strip():
             raise HTTPException(status_code=400, detail="endpoint_model_required")
-        for field in ("input_price_per_million", "output_price_per_million"):
+        for field in ("input_price_per_million", "output_price_per_million", "cache_input_price_per_million"):
             if field not in payload:
                 continue
             try:
@@ -1468,6 +1503,7 @@ def _request_id(
             request.timeframe.upper(),
             request.data_type,
             _screenshot_request_fingerprint(request),
+            _secondary_request_fingerprint(request),
             last_bar_time,
             str(request.market.bid),
             str(request.market.ask),
@@ -1515,6 +1551,14 @@ def _screenshot_request_fingerprint(request: Mt5OpenDecisionRequest | Mt5Positio
     return sha256(str(screenshot.base64).encode("ascii", errors="ignore")).hexdigest()[:16]
 
 
+def _secondary_request_fingerprint(request: Mt5OpenDecisionRequest | Mt5PositionDecisionRequest) -> str:
+    latest: list[str] = []
+    for timeframe, bars in sorted((request.market.secondary_bars or {}).items()):
+        if bars:
+            latest.append(f"{str(timeframe).upper()}:{bars[-1].time}")
+    return ",".join(latest) or "no_secondary"
+
+
 def _normalize_epoch_seconds(value: int) -> int:
     timestamp = int(value)
     if timestamp > 10_000_000_000_000:
@@ -1541,6 +1585,17 @@ def _candles(bars: list[Mt5Bar]) -> list[Candle]:
     return sorted(candles, key=lambda item: item.timestamp)
 
 
+def _secondary_candles(groups: dict[str, list[Mt5Bar]]) -> dict[str, list[Candle]]:
+    allowed = {"M1", "M5", "M15", "M30", "H1", "H4", "D1"}
+    result: dict[str, list[Candle]] = {}
+    for raw_timeframe, bars in (groups or {}).items():
+        timeframe = str(raw_timeframe or "").strip().upper()
+        if timeframe not in allowed:
+            continue
+        result[timeframe] = _candles(bars)
+    return result
+
+
 def _position_snapshot(position: Mt5Position, *, bid: float, ask: float) -> PositionSnapshot:
     current_price = position.current_price
     direction = _mt5_direction(position)
@@ -1560,15 +1615,38 @@ def _position_snapshot(position: Mt5Position, *, bid: float, ask: float) -> Posi
     )
 
 
+def _panel_description(decision: TradeDecision) -> str:
+    """Panel text for the EA, with the AI analysis time appended.
+
+    The timing is presentation only, so it is added here rather than inside the
+    strategy: the stored decision keeps the strategy's own wording. It is omitted
+    when no AI call happened, because "0.0 秒" would read like a failure rather
+    than "this bar needed no AI".
+    """
+    elapsed_ms = int(decision.usage.elapsed_ms or 0)
+    if elapsed_ms <= 0:
+        return decision.reason
+    return f"{decision.reason}（本次AI分析耗时：{elapsed_ms / 1000:.1f}秒）"
+
+
 def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDecisionResponse:
     orders: list[Mt5OpenOrder] = []
     if decision.action in {"BUY", "SELL"} and decision.lot:
+        # Strategies may request a pending order (limit/stop) through metadata;
+        # everything else keeps the market order it has always sent.
+        order_type = str(decision.metadata.get("order_type") or "market").strip().lower()
+        if order_type not in {"market", "limit", "stop"}:
+            order_type = "market"
+        price = decision.entry or 0.0
+        if order_type != "market" and price <= 0:
+            # A pending order without a usable price cannot be placed.
+            order_type = "market"
         orders.append(
             Mt5OpenOrder(
                 direction="buy" if decision.action == "BUY" else "sell",
                 volume=decision.lot,
-                order_type="market",
-                price=decision.entry or 0.0,
+                order_type=order_type,
+                price=price,
                 sl=decision.sl,
                 tp=decision.tp,
                 comment=_strategy_order_comment(decision),
@@ -1578,7 +1656,7 @@ def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDeci
     return Mt5OpenDecisionResponse(
         status="ok",
         should_open=len(orders) > 0,
-        description=decision.reason,
+        description=_panel_description(decision),
         spread=spread,
         decision_id=decision.decision_id,
         request_id=decision.request_id,
@@ -1800,6 +1878,53 @@ def _mt5_position_response(
     positions: list[Mt5Position],
 ) -> Mt5PositionDecisionResponse:
     actions: list[Mt5PositionAction] = []
+    batch_actions = decision.metadata.get("batch_actions") if isinstance(decision.metadata, dict) else None
+    if isinstance(batch_actions, list):
+        for item in batch_actions:
+            if not isinstance(item, dict):
+                continue
+            item_action = str(item.get("action") or "modify").lower()
+            if item_action == "close":
+                target = _find_mt5_position(positions, str(item.get("ticket") or ""))
+                if target is not None:
+                    requested = float(item.get("volume") or 0)
+                    volume = min(requested, target.volume) if requested > 0 else target.volume
+                    actions.append(Mt5PositionAction(
+                        action="close", ticket=str(target.ticket), mt_type=target.mt_type,
+                        volume=volume, order_type="market", price=0.0,
+                        comment=str(item.get("comment") or decision.reason),
+                    ))
+                continue
+            if item_action == "add":
+                direction = str(item.get("direction") or "").lower()
+                if direction not in {"buy", "sell"} or float(item.get("volume") or 0) <= 0:
+                    continue
+                actions.append(Mt5PositionAction(
+                    action="add", ticket="", mt_type=0 if direction == "buy" else 1,
+                    direction=direction, volume=float(item.get("volume") or 0),
+                    order_type="market", price=float(item.get("price") or 0),
+                    sl=item.get("sl"), tp=item.get("tp"),
+                    comment=str(item.get("comment") or decision.reason),
+                ))
+                continue
+            target = _find_mt5_position(positions, str(item.get("ticket") or ""))
+            if target is not None:
+                actions.append(Mt5PositionAction(
+                    action="modify", ticket=str(target.ticket), mt_type=target.mt_type,
+                    volume=0.0, order_type="market", price=0.0,
+                    sl=item.get("sl"), tp=item.get("tp"),
+                    comment=str(item.get("comment") or decision.reason),
+                ))
+        return Mt5PositionDecisionResponse(
+            status="ok",
+            has_action=len(actions) > 0,
+            description=_panel_description(decision),
+            spread=spread,
+            decision_id=decision.decision_id,
+            request_id=decision.request_id,
+            actions_count=len(actions),
+            actions=actions,
+        )
     target = _find_mt5_position(positions, decision.position_ticket)
 
     if decision.action == "CLOSE" and target is not None:
@@ -1847,7 +1972,7 @@ def _mt5_position_response(
     return Mt5PositionDecisionResponse(
         status="ok",
         has_action=len(actions) > 0,
-        description=decision.reason,
+        description=_panel_description(decision),
         spread=spread,
         decision_id=decision.decision_id,
         request_id=decision.request_id,
@@ -2111,13 +2236,6 @@ def _spread_price(bid: float, ask: float) -> float:
     return max(abs(bid) * 0.001, 1.0)
 
 
-def _mt5_trade_type(position: Mt5Position) -> str:
-    if position.trade_type:
-        return position.trade_type
-    mt_type = _mt5_type_number(position.mt_type)
-    return "pending_order" if mt_type >= 2 else "position"
-
-
 def _mt5_direction(position: Mt5Position) -> str:
     if position.direction:
         return position.direction
@@ -2135,36 +2253,3 @@ def _mt5_type_number(mt_type: int | str) -> int:
         if "SELL" in upper:
             return 1
         return 0
-
-
-def _mt5_response(decision: TradeDecision) -> Mt5DecisionResponse:
-    action = "hold"
-    direction = None
-    if decision.action == "BUY":
-        action = "open"
-        direction = "buy"
-    elif decision.action == "SELL":
-        action = "open"
-        direction = "sell"
-    elif decision.action == "CLOSE":
-        action = "close"
-    elif decision.action in {"MODIFY_SL", "MODIFY_TP"}:
-        action = "modify_sl_tp"
-    elif decision.action == "HOLD":
-        action = "hold"
-
-    return Mt5DecisionResponse(
-        status="ok",
-        action=action,
-        direction=direction,
-        volume=decision.lot,
-        sl=decision.sl,
-        tp=decision.tp,
-        ticket=decision.position_ticket,
-        reason=decision.reason,
-        decision_id=decision.decision_id,
-        request_id=decision.request_id,
-        confidence=decision.confidence,
-        expires_at=decision.expires_at,
-        idempotent=decision.idempotent,
-    )

@@ -23,10 +23,23 @@ from app.strategies.pa_agent_lite import (
 
 
 class _OpenAi:
-    def __init__(self, content: dict[str, Any]) -> None:
+    def __init__(self, content: dict[str, Any], *, diagnosis: dict[str, Any] | None = None) -> None:
         self.content = content
+        self.diagnosis = diagnosis if diagnosis is not None else {
+            "cycle": "normal_channel",
+            "direction": "bullish",
+            "gates": {},
+        }
+        self.strategy_texts: list[str] = []
 
-    def pa_open_decision(self, **_: Any) -> AiCallResult:
+    def pa_open_diagnosis(self, **_: Any) -> AiCallResult:
+        return AiCallResult(
+            content=self.diagnosis,
+            usage=UsageSummary(ai_called=True, input_tokens=8, output_tokens=4),
+        )
+
+    def pa_open_decision(self, **kwargs: Any) -> AiCallResult:
+        self.strategy_texts.append(str(kwargs.get("strategy_text") or ""))
         return AiCallResult(
             content=self.content,
             usage=UsageSummary(ai_called=True, input_tokens=10, output_tokens=5),
@@ -225,7 +238,7 @@ def test_risk_sizing_rejects_trade_when_minimum_lot_exceeds_budget() -> None:
     assert "最小交易手数" in decision.reason
 
 
-def test_ai_cannot_add_when_strategy_disables_adding() -> None:
+def test_add_is_refused_under_the_default_config() -> None:
     strategy = PaAgentLiteStrategy(_PositionAi({
         "action": "add",
         "ticket": "123",
@@ -237,24 +250,26 @@ def test_ai_cannot_add_when_strategy_disables_adding() -> None:
     decision = strategy.evaluate_position(_position_request(), _deployment())
 
     assert decision.action == "HOLD"
-    assert "不允许本次加仓" in decision.reason
+    assert "不支持加仓" in decision.reason
 
 
 @pytest.mark.parametrize(
-    "config, direction",
+    "config",
     [
-        ({"allow_add": True, "max_positions": 1}, "buy"),
-        ({"allow_add": True, "max_positions": 2}, "sell"),
+        {"allow_add": True, "max_positions": 2},
+        {"allow_add": True, "max_positions": 4},
     ],
 )
-def test_ai_add_obeys_position_limit_and_existing_direction(
-    config: dict[str, Any],
-    direction: str,
-) -> None:
+def test_add_is_refused_even_when_the_config_enables_it(config: dict[str, Any]) -> None:
+    """PA holds a single position; the add switches must not bring adding back.
+
+    The customer form still offers "allow add" and "max positions", so an AI that
+    answers `add` must be refused regardless of what those are set to.
+    """
     strategy = PaAgentLiteStrategy(_PositionAi({
         "action": "add",
         "ticket": "123",
-        "direction": direction,
+        "direction": "buy",
         "confidence": 0.8,
         "reason": "继续加仓",
     }))
@@ -262,7 +277,17 @@ def test_ai_add_obeys_position_limit_and_existing_direction(
     decision = strategy.evaluate_position(_position_request(), _deployment(**config))
 
     assert decision.action == "HOLD"
-    assert "不允许本次加仓" in decision.reason
+    assert "不支持加仓" in decision.reason
+
+
+def test_position_prompt_tells_the_model_adding_is_not_available() -> None:
+    """The refusal has to be stated up front, not only enforced afterwards."""
+    from app.services.ai_service import _pa_system_prompt
+
+    prompt = _pa_system_prompt()
+
+    assert "never pyramids" in prompt
+    assert "add is not an available action" in prompt
 
 
 def test_ai_cannot_loosen_an_existing_stop() -> None:

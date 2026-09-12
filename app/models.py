@@ -88,6 +88,7 @@ class BaseEvaluateRequest(StrictModel):
     data_type: Literal["kline", "screenshot", "both"] = "kline"
     screenshot_data_url: str = ""
     screenshot_metadata: dict[str, Any] = Field(default_factory=dict)
+    secondary_candles: dict[str, list[Candle]] = Field(default_factory=dict)
 
 
 class OpenEvaluateRequest(BaseEvaluateRequest):
@@ -116,6 +117,14 @@ class UsageSummary(StrictModel):
     input_tokens: int = 0
     output_tokens: int = 0
     charged_points: int = 0
+    # Wall-clock time the provider call took. This is also how long a
+    # single-threaded EA sits idle on that check, so it is the number to watch
+    # when deciding whether a model is fast enough to keep.
+    elapsed_ms: int = 0
+    # Subset of input_tokens served from the provider's prompt cache. Billed at
+    # the endpoint's cache-hit price when configured, else at the normal input
+    # price (so an unconfigured endpoint keeps its previous charge exactly).
+    cached_input_tokens: int = 0
 
 
 class TradeDecision(StrictModel):
@@ -160,15 +169,6 @@ Mt5DataType = Literal["kline", "screenshot", "both"]
 Mt5CallMode = Literal["bar", "timer", "tick", "price_step"]
 PositionSizeMode = Literal["fixed", "risk"]
 RiskBaseMode = Literal["fixed_loss", "balance_percent"]
-Mt5DecisionAction = Literal[
-    "none",
-    "open",
-    "hold",
-    "close",
-    "add",
-    "reduce",
-    "modify_sl_tp",
-]
 
 
 class Mt5StrategyInfo(StrictModel):
@@ -182,6 +182,12 @@ class Mt5StrategyInfo(StrictModel):
     position_kline_count: int = Field(default=100, ge=1, le=1000)
     call_mode: Mt5CallMode = "bar"
     call_val: float = Field(default=1, ge=0)
+    secondary_timeframes: list["Mt5SecondaryTimeframe"] = Field(default_factory=list, max_length=8)
+
+
+class Mt5SecondaryTimeframe(StrictModel):
+    timeframe: Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+    kline_count: int = Field(default=100, ge=1, le=1000)
 
 
 class Mt5StrategyInitRequest(StrictModel):
@@ -221,6 +227,7 @@ class Mt5MarketSnapshot(StrictModel):
     screenshot: Mt5Screenshot | None = None
     screenshot_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    secondary_bars: dict[str, list[Mt5Bar]] = Field(default_factory=dict)
 
 
 class Mt5BaseDecisionRequest(StrictModel):
@@ -342,23 +349,7 @@ class Mt5HistorySyncResponse(StrictModel):
     profit_orders_count: int = Field(default=0, ge=0)
     profit_deals_count: int = Field(ge=0)
     net_profit: float = 0.0
-
-
-class Mt5DecisionResponse(StrictModel):
-    status: Literal["ok"]
-    action: Mt5DecisionAction
-    reason: str
-    decision_id: str
-    request_id: str
-    confidence: float = Field(ge=0, le=1)
-    direction: Literal["buy", "sell"] | None = None
-    volume: float | None = None
-    sl: float | None = None
-    tp: float | None = None
-    ticket: str | None = None
-    comment: str = "GainLabAI"
-    expires_at: datetime
-    idempotent: bool = False
+    archived_count: int = Field(default=0, ge=0)
 
 
 class WebDeploymentUpsertRequest(StrictModel):
