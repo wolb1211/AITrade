@@ -427,13 +427,21 @@ def test_runtime_payload_contains_closed_candles_and_calculated_indicators(tmp_p
         request_payload=_open_request(),
     )
     payload = captured["user_payload"]
-    assert len(payload["candles"]) == 100
-    assert [item["t"] for item in payload["candles"]] == sorted(item["t"] for item in payload["candles"])
-    assert payload["candles"][-1]["t"] == max(item.timestamp for item in _open_request().candles)
+    request_candles = _open_request().candles
+    candles = payload["candles"]
+    # The runtime serializes only the window the confirmed graph consumes, so the
+    # payload is shorter than the request and omits candle timestamps. Positional
+    # order and the "last item is the latest closed candle" contract still hold.
+    assert 0 < len(candles) < len(request_candles)
+    assert [item["c"] for item in candles] == [candle.close for candle in request_candles[-len(candles) :]]
+    assert candles[-1]["c"] == request_candles[-1].close
     # The indicator window is derived from the confirmed graph instead of a fixed
-    # 100 values, so only ordering and presence are asserted here.
-    assert payload["indicators"]["timestamps"]
-    assert payload["indicators"]["timestamps"] == sorted(payload["indicators"]["timestamps"])
+    # 100 values and is trimmed to the same window as the candles; timestamps are
+    # dropped along with the candle ones.
+    assert payload["indicators"]["order"] == "oldest_to_latest"
+    indicator_values = payload["indicators"]["values"]
+    assert indicator_values
+    assert all(len(series) == len(candles) for series in indicator_values.values())
     assert payload["data_convention"]["last_item"] == "latest_closed_candle"
 
 

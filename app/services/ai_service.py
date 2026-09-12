@@ -539,11 +539,12 @@ class AiDecisionClient:
                 "spread_points": request_payload.spread_points,
                 "balance": request_payload.balance,
                 "equity": request_payload.equity,
-                "candles": _compact_candles(request_payload.candles, limit=candle_count),
-                "indicators": indicators,
+                "candles": _compact_candles(request_payload.candles, limit=indicator_count if visual_stage is not None else candle_count, include_timestamp=False if visual_stage is not None else True),
+                "indicators": _compact_workflow_indicators(indicators, limit=indicator_count) if visual_stage is not None else indicators,
                 "computed_facts": computed_facts,
                 "workflow_context": _workflow_runtime_context(config, "open", computed_facts),
                 "workflow_actions": _workflow_selected_actions(config, "open", computed_facts),
+                "workflow_all_actions": _workflow_action_specs(config, "open"),
                 "ai_conditions": _runtime_ai_conditions(config, "open"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "open"),
@@ -605,12 +606,13 @@ class AiDecisionClient:
                 "balance": request_payload.balance,
                 "equity": request_payload.equity,
                 "positions": [item.model_dump(mode="json") for item in request_payload.positions],
-                "candles": _compact_candles(request_payload.candles, limit=candle_count),
-                "indicators": indicators,
+                "candles": _compact_candles(request_payload.candles, limit=indicator_count if visual_stage is not None else candle_count, include_timestamp=False if visual_stage is not None else True),
+                "indicators": _compact_workflow_indicators(indicators, limit=indicator_count) if visual_stage is not None else indicators,
                 "computed_facts": computed_facts,
                 "workflow_context": _workflow_runtime_context(config, "position", computed_facts),
                 "position_facts": _position_runtime_facts(request_payload, indicators),
                 "workflow_actions": _workflow_selected_actions(config, "position", computed_facts),
+                "workflow_all_actions": _workflow_action_specs(config, "position"),
                 "ai_conditions": _runtime_ai_conditions(config, "position"),
                 "screenshot": _screenshot_ai_metadata(request_payload.screenshot_metadata),
                 "visual_conditions": _runtime_visual_conditions(config, "position"),
@@ -2572,7 +2574,17 @@ def _position_runtime_facts(request_payload: PositionEvaluateRequest, indicators
     current = position.current_price
     if current is None:
         current = request_payload.bid if str(position.side).upper() == "BUY" else request_payload.ask
-    atr_values = (indicators.get("values") or {}).get("atr14", []) if isinstance(indicators.get("values"), dict) else []
+    indicator_values = indicators.get("values") if isinstance(indicators.get("values"), dict) else {}
+    atr_values = indicator_values.get("atr14", [])
+    if not atr_values:
+        # The visual editor commonly aliases ATR(14) as atr_14_value or
+        # atr14_value. Treat these as the same indicator for signed distance
+        # and breakeven/trailing calculations.
+        for alias, values in indicator_values.items():
+            normalized = str(alias).replace("_", "").lower()
+            if normalized.startswith("atr14"):
+                atr_values = values
+                break
     try:
         atr = float(atr_values[-1]) if atr_values else None
     except (TypeError, ValueError):
@@ -2618,16 +2630,26 @@ def _apply_workflow_position_defaults(user_payload: dict[str, Any], content: dic
     if not isinstance(content, dict) or content.get("action") not in {None, "", "hold", "modify"}:
         return content
     facts = user_payload.get("position_facts")
-    actions = user_payload.get("workflow_actions")
+    actions = user_payload.get("workflow_all_actions") or user_payload.get("workflow_actions")
     if not isinstance(facts, dict) or not isinstance(actions, list):
         return content
     side = str(facts.get("side") or "").upper()
     current, open_price, atr = facts.get("current_price"), facts.get("open_price"), facts.get("atr14_latest")
     if side not in {"BUY", "SELL"} or not isinstance(current, (int, float)) or not isinstance(open_price, (int, float)) or not isinstance(atr, (int, float)) or atr <= 0:
         return content
-    rule_text = " ".join(str(item.get("stop_loss_rule") or "") for item in actions if isinstance(item, dict) and item.get("kind") == "modify_sl")
+    modify_actions = [item for item in actions if isinstance(item, dict) and item.get("kind") == "modify_sl"]
+    rule_text = " ".join(str(item.get("stop_loss_rule") or "") for item in modify_actions)
     has_breakeven_rule = "0.5 ATR" in rule_text and "开仓价" in rule_text
     has_trailing_rule = "1 ATR" in rule_text and "当前价格" in rule_text and "0.5 ATR" in rule_text
+    for item in modify_actions:
+        target = item.get("target") if isinstance(item.get("target"), dict) else {}
+        base = str(target.get("formula_base") or "")
+        adjustment_kind = str(target.get("adjustment_kind") or "")
+        adjustment_value = float(target.get("adjustment_value") or 0)
+        if base == "entry_price" and adjustment_kind == "fixed" and abs(adjustment_value) > 0:
+            has_breakeven_rule = True
+        if base == "current_price" and adjustment_kind == "atr" and abs(adjustment_value or float(target.get("atr_multiplier") or 0)) > 0:
+            has_trailing_rule = True
     target_price: float | None = None
     reason = ""
     open_distance_atr = float(facts.get("open_distance_atr") or 0)
@@ -2680,18 +2702,50 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
     if endpoint != "open" or not isinstance(content, dict):
         return content
     direction = str(content.get("direction") or "").lower()
-    actions = user_payload.get("workflow_actions")
+    actions = user_payload.get("workflow_all_actions") or user_payload.get("workflow_actions")
     candles = user_payload.get("candles")
     if direction not in {"buy", "sell"} or not isinstance(actions, list) or not isinstance(candles, list):
         return content
     selected = next((item for item in actions if isinstance(item, dict) and item.get("kind") == ("open_buy" if direction == "buy" else "open_sell")), None)
     target = selected.get("stop_loss") if isinstance(selected, dict) and isinstance(selected.get("stop_loss"), dict) else None
+    explicit_stop_configured = bool(target) or bool(str(selected.get("stop_loss_rule") or "").strip()) if isinstance(selected, dict) else False
     if not target:
         rule = str(selected.get("stop_loss_rule") or "") if isinstance(selected, dict) else ""
         match = re.search(r"recent_(high|low)\s*\(\s*(\d+)\s*\)", rule, re.IGNORECASE)
+        if not match:
+            match = re.search(r"(?:highest_high|recent[_ ]high|highest)[^0-9]{0,12}(\d+)", rule, re.IGNORECASE)
+            if match:
+                match = ("recent_high", match.group(1))
+        if not match:
+            match = re.search(r"(?:lowest_low|recent[_ ]low|lowest)[^0-9]{0,12}(\d+)", rule, re.IGNORECASE)
+            if match:
+                match = ("recent_low", match.group(1))
+        if not match:
+            # The editor may persist the human-readable Chinese rule instead
+            # of the normalized recent_high()/recent_low() expression.
+            match = re.search(r"(?:最近|近)\s*(\d+)\s*根?(?:已?收盘)?K?线?\s*(?:的)?\s*(最高|最低|高点|低点)", rule, re.IGNORECASE)
+            if match:
+                match = ("recent_high" if match.group(2) in {"最高", "高点"} else "recent_low", match.group(1))
         if match:
-            target = {"kind": f"recent_{match.group(1).lower()}", "lookback": int(match.group(2))}
+            if isinstance(match, tuple):
+                target = {"kind": match[0], "lookback": int(match[1])}
+            else:
+                target = {"kind": f"recent_{match.group(1).lower()}", "lookback": int(match.group(2))}
+    if target and target.get("kind") == "formula" and target.get("formula_base") in {"recent_high", "recent_low"}:
+        # The visual editor stores a candle extreme with optional fixed/ATR
+        # adjustment as a formula target. Normalize that representation to
+        # the same absolute stop price as the shorthand recent_high/low form.
+        target = {
+            **target,
+            "kind": str(target.get("formula_base")),
+            "lookback": target.get("lookback") or 1,
+        }
     if not target or target.get("kind") not in {"recent_high", "recent_low"}:
+        if explicit_stop_configured:
+            content["should_open"] = False
+            content["sl"] = None
+            content["reason"] = "流程图止损规则无法计算出有效价格，本次禁止开仓"
+            content["analysis"] = content["reason"]
         return content
     try:
         lookback = max(1, int(target.get("lookback") or 1))
@@ -2710,10 +2764,33 @@ def _apply_workflow_action_defaults(endpoint: str, user_payload: dict[str, Any],
         if values:
             # An explicit workflow candle stop is authoritative; replace any
             # stale or incorrectly calculated model value.
-            content["sl"] = max(values) if target["kind"] == "recent_high" else min(values)
+            stop = max(values) if target["kind"] == "recent_high" else min(values)
+            # Apply an explicit fixed/ATR adjustment if the editor supplied
+            # one.  For the common recent-high/low stop this is zero.
+            adjustment_kind = str(target.get("adjustment_kind") or "fixed")
+            adjustment = float(target.get("adjustment_value") or 0)
+            if adjustment_kind == "atr":
+                atr_values = (user_payload.get("indicators") or {}).get("values", {}).get("atr14", [])
+                if isinstance(atr_values, list) and atr_values:
+                    adjustment *= float(atr_values[-1])
+            operation = str(target.get("operation") or "none")
+            if operation == "add":
+                stop += adjustment
+            elif operation == "subtract":
+                stop -= adjustment
+            content["sl"] = stop
             content.setdefault("reason", "已按流程图止损规则设置保护价")
+        elif explicit_stop_configured:
+            content["should_open"] = False
+            content["sl"] = None
+            content["reason"] = "流程图止损规则缺少足够K线数据，本次禁止开仓"
+            content["analysis"] = content["reason"]
     except (TypeError, ValueError, KeyError):
-        pass
+        if explicit_stop_configured:
+            content["should_open"] = False
+            content["sl"] = None
+            content["reason"] = "流程图止损规则计算失败，本次禁止开仓"
+            content["analysis"] = content["reason"]
     return content
 
 
@@ -3034,7 +3111,33 @@ def _workflow_runtime_context(config: dict[str, Any], stage_name: str, facts: li
                 unresolved = True
                 break
             branch = "yes" if result else "no"
-        current = str((transitions.get(current) or {}).get(branch) or "")
+        transition_map = transitions.get(current) or {}
+        next_node = transition_map.get(branch)
+        if not next_node:
+            # Older editor builds used boolean/Chinese handle names while
+            # the current editor uses yes/no. Accept all persisted aliases so
+            # a valid graph does not become an unresolved path at runtime.
+            aliases = (
+                ("true", "是", "on_yes", "success")
+                if branch == "yes" else
+                ("false", "否", "on_no", "failure")
+            )
+            for alias in aliases:
+                if transition_map.get(alias):
+                    next_node = transition_map[alias]
+                    break
+        if not next_node:
+            # React Flow handle ids have also appeared as ``yes-*``/``no-*``
+            # in older saved graphs. Match the semantic branch suffix while
+            # keeping the exact key preferred above.
+            for handle, candidate in transition_map.items():
+                normalized = str(handle).strip().lower().replace("_", "-")
+                if (branch == "yes" and (normalized.startswith("yes-") or normalized.endswith("-yes"))) or (branch == "no" and (normalized.startswith("no-") or normalized.endswith("-no"))):
+                    next_node = candidate
+                    break
+        if not next_node and node.get("type") != "action":
+            unresolved = True
+        current = str(next_node or "")
     if current and current not in nodes:
         unresolved = True
     return {"path_node_ids": path, "selected_actions": actions, "unresolved": unresolved}
@@ -3150,19 +3253,25 @@ def _max_tokens_for_endpoint(endpoint: str) -> int:
         return 3000
     return 500
 
-def _compact_candles(candles: list[Candle], *, limit: int) -> list[dict[str, Any]]:
+def _compact_candles(candles: list[Candle], *, limit: int, include_timestamp: bool = True) -> list[dict[str, Any]]:
     ordered = sorted(candles, key=lambda candle: candle.timestamp)[-limit:]
-    return [
-        {
-            "t": candle.timestamp,
-            "o": candle.open,
-            "h": candle.high,
-            "l": candle.low,
-            "c": candle.close,
-            "v": candle.volume,
-        }
-        for candle in ordered
-    ]
+    result = []
+    for candle in ordered:
+        item = {"o": candle.open, "h": candle.high, "l": candle.low, "c": candle.close, "v": candle.volume}
+        if include_timestamp:
+            item["t"] = candle.timestamp
+        result.append(item)
+    return result
+
+
+def _compact_workflow_indicators(indicators: dict[str, Any], *, limit: int) -> dict[str, Any]:
+    """Serialize only the necessary indicator window for a visual workflow."""
+    values = indicators.get("values") if isinstance(indicators, dict) and isinstance(indicators.get("values"), dict) else {}
+    compact_values: dict[str, list[Any]] = {}
+    for alias, series in values.items():
+        if isinstance(series, list):
+            compact_values[str(alias)] = series[-limit:]
+    return {"order": "oldest_to_latest", "values": compact_values}
 
 
 def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
