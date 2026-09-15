@@ -120,12 +120,35 @@ def _order_type_label(code: str) -> str:
     return _ORDER_TYPE_LABELS.get(code, "市价单")
 
 
+# Gates that stop the trade when the model explicitly answers ``passed: false``.
+#
+# gate3_extreme_location is deliberately absent. The diagnosis framework defines
+# it as "do not chase with a market order" (不要市价追单), so it selects the order
+# type in stage 2 instead of vetoing the trade. Treating it as a veto shipped a
+# regression that blocked every candidate: the model read the gate name
+# literally, failed it whenever price sat mid-range, and the strategy opened no
+# trades at all.
+BLOCKING_GATES = {
+    "gate1_no_trade_environment": "无交易环境",
+    "gate2_direction_clear": "方向不明确",
+    "gate4_stop_definable": "止损位置无法定义",
+}
+
+# Every gate stage 1 reports, in reporting order.
+ALL_GATES = (
+    "gate1_no_trade_environment",
+    "gate2_direction_clear",
+    "gate3_extreme_location",
+    "gate4_stop_definable",
+)
+
+
 def _blocking_gate_reason(diagnosis: dict[str, Any]) -> str:
-    """Return a Chinese hold reason when stage 1 explicitly closed a gate.
+    """Return a Chinese hold reason when stage 1 explicitly closed a blocking gate.
 
     Only an explicit ``passed: false`` blocks: a missing or malformed gate must
     never stop trading, otherwise a chatty model could silently disable the
-    strategy.
+    strategy. See ``BLOCKING_GATES`` for why gate3 never blocks.
     """
     cycle = str(diagnosis.get("cycle") or "").strip().lower()
     if cycle == "extreme_tr":
@@ -134,13 +157,7 @@ def _blocking_gate_reason(diagnosis: dict[str, Any]) -> str:
     gates = diagnosis.get("gates")
     if not isinstance(gates, dict):
         return ""
-    labels = {
-        "gate1_no_trade_environment": "无交易环境",
-        "gate2_direction_clear": "方向不明确",
-        "gate3_extreme_location": "处于极端位置",
-        "gate4_stop_definable": "止损位置无法定义",
-    }
-    for key, label in labels.items():
+    for key, label in BLOCKING_GATES.items():
         gate = gates.get(key)
         if not isinstance(gate, dict):
             continue
@@ -149,6 +166,44 @@ def _blocking_gate_reason(diagnosis: dict[str, Any]) -> str:
         reason = str(gate.get("reason") or "").strip()
         return f"阶段一闸门未通过（{label}）：{reason}" if reason else f"阶段一闸门未通过（{label}），本次不下单"
     return ""
+
+
+def _gate_verdicts(diagnosis: dict[str, Any] | None) -> dict[str, bool]:
+    """Return the explicit boolean verdict of every gate stage 1 reported."""
+    if not isinstance(diagnosis, dict):
+        return {}
+    gates = diagnosis.get("gates")
+    if not isinstance(gates, dict):
+        return {}
+    verdicts: dict[str, bool] = {}
+    for key in ALL_GATES:
+        gate = gates.get(key)
+        if isinstance(gate, dict) and isinstance(gate.get("passed"), bool):
+            verdicts[key] = bool(gate["passed"])
+    return verdicts
+
+
+def _diagnosis_metadata(diagnosis: dict[str, Any] | None) -> dict[str, Any]:
+    """Record the stage-1 verdict on the decision so gate behaviour stays measurable.
+
+    Every decision is persisted in ``decisions.response_json``, so these keys make
+    the per-gate pass rate queryable. Without them a gate that blocks every
+    candidate is only visible by reading the EA log by hand.
+    """
+    if not isinstance(diagnosis, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    cycle = str(diagnosis.get("cycle") or "").strip()
+    if cycle:
+        metadata["stage1_cycle"] = cycle
+    direction = str(diagnosis.get("direction") or "").strip()
+    if direction:
+        metadata["stage1_direction"] = direction
+    verdicts = _gate_verdicts(diagnosis)
+    if verdicts:
+        metadata["stage1_gate_passed"] = verdicts
+    metadata["stage1_gate3_advisory"] = verdicts.get("gate3_extreme_location") is False
+    return metadata
 
 
 def _knowledge_setup_codes(features: PaFeatureSnapshot) -> tuple[str, ...]:
@@ -438,13 +493,19 @@ class PaAgentLiteStrategy:
             usage = diagnosis_result.usage
             gate_reason = _blocking_gate_reason(diagnosis)
             if gate_reason:
-                return _hold(
+                blocked = _hold(
                     request,
                     self._decision_id(),
                     gate_reason,
                     confidence=0.32,
                     usage=usage,
                 )
+                # Keep every verdict on the blocked decision, not only the gate
+                # that fired, so the per-gate pass rate stays measurable. Every
+                # HOLD returned below this point already passed all blocking
+                # gates by construction.
+                blocked.metadata.update(_diagnosis_metadata(diagnosis))
+                return blocked
 
         strategy_text = pa_knowledge.route(
             cycle=str((diagnosis or {}).get("cycle") or features.cycle_position),
@@ -596,9 +657,7 @@ class PaAgentLiteStrategy:
 
         metadata = _setup_metadata(features)
         metadata["order_type"] = order_type
-        if diagnosis is not None:
-            metadata["stage1_cycle"] = str(diagnosis.get("cycle") or "")
-            metadata["stage1_direction"] = str(diagnosis.get("direction") or "")
+        metadata.update(_diagnosis_metadata(diagnosis))
         return TradeDecision(
             decision_id=self._decision_id(),
             request_id=request.request_id,

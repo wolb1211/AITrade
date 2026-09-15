@@ -141,10 +141,22 @@ class AiDecisionClient:
                     "probabilities": "object with all eight cycle keys, integer 0-100, summing to 100",
                     "direction": "bullish|bearish|neutral",
                     "gates": {
-                        "gate1_no_trade_environment": {"passed": "boolean", "reason": "short Chinese"},
-                        "gate2_direction_clear": {"passed": "boolean", "reason": "short Chinese"},
-                        "gate3_extreme_location": {"passed": "boolean", "reason": "short Chinese"},
-                        "gate4_stop_definable": {"passed": "boolean", "reason": "short Chinese"},
+                        "gate1_no_trade_environment": {
+                            "passed": "boolean, true = tradable (default true); false only for an untradeable environment",
+                            "reason": "short Chinese",
+                        },
+                        "gate2_direction_clear": {
+                            "passed": "boolean, true = directions do not conflict (default true)",
+                            "reason": "short Chinese",
+                        },
+                        "gate3_extreme_location": {
+                            "passed": "boolean, true = fine to enter (default true); false only when entering now would chase an extended move, which switches the order stage to a pending order and never forbids the trade",
+                            "reason": "short Chinese",
+                        },
+                        "gate4_stop_definable": {
+                            "passed": "boolean, true = a structural invalidation level exists (default true)",
+                            "reason": "short Chinese",
+                        },
                     },
                     "reasoning": "Chinese explanation, 80-300 characters",
                 },
@@ -1692,6 +1704,11 @@ def _pa_system_prompt() -> str:
         "reason must be Chinese, concrete, <=60 Chinese characters. "
         "analysis must be Chinese, 120-300 Chinese characters, with market structure, setup score, price/risk context, and action rationale. "
         "Never invent prices. Use price distances for open SL/TP. "
+        # gate3 warns about chasing, so it steers the order type instead of
+        # blocking the trade.
+        "If stage1_market_diagnosis.gates.gate3_extreme_location.passed is false, price is extended: never answer "
+        "order_type market in that case. Use a limit or stop order, or answer should_open false when no sensible "
+        "pending price exists. "
         f"{_PLAIN_CHINESE_RULE}"
     )
 
@@ -1710,6 +1727,20 @@ def _pa_diagnosis_system_prompt() -> str:
         "direction is one of bullish, bearish, neutral and must be an independent judgement, not derived from cycle. "
         "gates must contain gate1_no_trade_environment, gate2_direction_clear, gate3_extreme_location and "
         "gate4_stop_definable, each an object with a boolean passed and a short Chinese reason. "
+        # The pass semantics were originally left undefined and the model read
+        # gate3 backwards: it failed the gate whenever price sat mid-range, which
+        # then vetoed every candidate. State what passed means, and that the
+        # default is true.
+        "passed means the gate does not forbid trading, so default every gate to true and only answer false when you "
+        "can name the specific evidence in reason. "
+        "gate1_no_trade_environment: passed true unless the market is genuinely untradeable (extreme choppy overlap "
+        "or barbwire). "
+        "gate2_direction_clear: passed true unless the background, recent and structure directions actively conflict. "
+        "gate3_extreme_location: passed true in normal conditions. This gate is only a warning about chasing: answer "
+        "false when entering right now would mean chasing an extended move, and the order stage will then use a "
+        "pending order instead of a market order. Never answer false merely because price sits in the middle of a "
+        "range. "
+        "gate4_stop_definable: passed true unless no structural invalidation level exists. "
         "reasoning must be Chinese, 80-300 Chinese characters, explaining the cycle evidence and the expected transition. "
         f"{_PLAIN_CHINESE_RULE}"
     )
