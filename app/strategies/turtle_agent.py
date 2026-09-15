@@ -188,11 +188,16 @@ class TurtleTrendStrategy:
                 )
         add_decision = _maybe_add(request, config, atr)
         if self.ai_client is None:
+            # Adding is evaluated first. A bar that prints a new high also makes
+            # the trailing target tighter, so returning the protection update
+            # first skipped the add on exactly the advancing bars a pyramid
+            # exists for. The add moves the whole basket onto its own new stop,
+            # so nothing is left unprotected by taking this branch.
+            if add_decision is not None:
+                return add_decision
             protection = _protection_batch_decision(request, config, atr)
             if protection is not None:
                 return protection
-            if add_decision is not None:
-                return add_decision
             return _hold_position(request, first_ticket, "趋势结构未被破坏，继续持有")
         # The AI is asked on every position request, including the bars where a
         # break-even or trailing update is due: taking profit is the AI's call,
@@ -209,11 +214,13 @@ class TurtleTrendStrategy:
             )
             decision.usage = review_usage
             return decision
-        protection = _protection_batch_decision(request, config, atr)
-        if protection is not None:
-            protection.reason = _with_ai_analysis(protection.reason, review)
-            protection.usage = review_usage
-            return protection
+        # Adding is evaluated before the protection ladder. A bar that prints a
+        # new high makes the trailing target tighter as well, so returning the
+        # protection update first skipped the add on exactly the advancing bars a
+        # pyramid exists for, and the strategy could rarely reach its unit cap.
+        # The add carries the whole basket onto its new stop, so no protection is
+        # lost here; a protection update that was due on the same bar is applied
+        # on the next one.
         if add_decision is not None:
             add_decision.metadata["ai_risk"] = review["note"]
             add_decision.usage = review_usage
@@ -227,6 +234,11 @@ class TurtleTrendStrategy:
                 return hold
             add_decision.reason = _with_ai_analysis(add_decision.reason, review)
             return add_decision
+        protection = _protection_batch_decision(request, config, atr)
+        if protection is not None:
+            protection.reason = _with_ai_analysis(protection.reason, review)
+            protection.usage = review_usage
+            return protection
         hold = _hold_position(
             request,
             first_ticket,

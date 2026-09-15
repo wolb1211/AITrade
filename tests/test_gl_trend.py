@@ -296,6 +296,56 @@ def test_add_does_not_loosen_an_already_tighter_stop() -> None:
     assert [item["action"] for item in actions] == ["add"]
 
 
+def test_add_wins_over_a_simultaneous_trailing_update() -> None:
+    """The add and the protection ladder compete for the same bar.
+
+    A bar that prints a new high also makes the trailing target tighter, so
+    returning the protection update first skipped the add on every advancing bar
+    - exactly the bars a pyramid is meant to fire on - and the strategy could
+    rarely reach its unit cap.
+    """
+    config = {
+        "allow_add": True,
+        "max_positions": 4,
+        "position_size_mode": "fixed",
+        "fixed_volume": 0.01,
+        "add_step_atr": 0.5,
+    }
+    # open 105, ATR 10: a bid of 120 is +1.5 ATR (trailing due) and also well
+    # past the 0.5 ATR add step, so both candidate actions exist on this bar.
+    request = _position_request(
+        [_position("6201", current_price=120.0)],
+        bid=120.0,
+        ask=120.1,
+    )
+
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+
+    assert decision.action == "BUY", "the add must win over the trailing update"
+    assert decision.metadata["batch_actions"][0]["action"] == "add"
+
+
+def test_protection_still_fires_when_no_add_candidate_exists() -> None:
+    """Reordering must not disable the ladder once the unit cap is reached."""
+    config = {
+        "allow_add": True,
+        "max_positions": 1,
+        "position_size_mode": "fixed",
+        "fixed_volume": 0.01,
+        "add_step_atr": 0.5,
+    }
+    request = _position_request(
+        [_position("6202", current_price=120.0)],
+        bid=120.0,
+        ask=120.1,
+    )
+
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+
+    assert decision.action == "MODIFY_SL"
+    assert decision.sl == pytest.approx(110.0)
+
+
 def test_router_expands_a_basket_close_into_one_action_per_ticket() -> None:
     """The EA receives one close action per ticket of a basket exit."""
     from app.api.router import _mt5_position_response
