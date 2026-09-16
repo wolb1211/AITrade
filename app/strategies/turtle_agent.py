@@ -369,53 +369,45 @@ class TurtleTrendStrategy:
         atr: float,
     ) -> tuple[bool, str, Any]:
         """Risk gate for a new entry: AI may warn, never reshape the order."""
+        signal = {
+            "direction": "buy" if candidate.action == "BUY" else "sell",
+            "entry": candidate.entry,
+            "protective_stop": candidate.sl,
+            "stop_atr": STOP_ATR,
+            "atr": atr,
+            "lot": candidate.lot,
+            "entry_analysis": candidate.metadata.get("entry_analysis"),
+            "swing_direction": candidate.metadata.get("swing_direction"),
+            "donchian_direction": candidate.metadata.get("donchian_direction"),
+        }
         result = self.ai_client.turtle_open_risk_decision(
-            deployment=deployment,
-            request_payload=request,
-            signal={
-                "direction": "buy" if candidate.action == "BUY" else "sell",
-                "entry": candidate.entry,
-                "protective_stop": candidate.sl,
-                "stop_atr": STOP_ATR,
-                "atr": atr,
-                "lot": candidate.lot,
-                "entry_analysis": candidate.metadata.get("entry_analysis"),
-                "swing_direction": candidate.metadata.get("swing_direction"),
-                "donchian_direction": candidate.metadata.get("donchian_direction"),
-            },
+            deployment=deployment, request_payload=request, signal=signal,
         )
         if result is None:
             return True, "AI 未返回结果，按策略规则开仓", None
-        reason = str(result.content.get("reason") or "").strip()
-        # The full analysis is what the panel should show; the one-line reason is
-        # only the fallback for callers that do not return one.
-        ai_text = str(result.content.get("analysis") or "").strip() or reason
+        outcome = _open_risk_outcome(result)
+        if outcome is not None:
+            return outcome
+        # The answer ignored the output contract: neither allow_open nor a usable
+        # risk_level came back. That is not a verdict the gate can read - reading
+        # it as "not high" is what let a warned-about entry through, while
+        # reading it as a refusal blocks setups the same analysis calls sound.
+        # Ask once more with the contract spelled out, then give up.
+        retry = self.ai_client.turtle_open_risk_decision(
+            deployment=deployment,
+            request_payload=request,
+            signal=signal,
+            correction=_OPEN_RISK_FORMAT_REMINDER,
+        )
+        retried = _open_risk_outcome(retry) if retry is not None else None
+        if retried is not None:
+            return retried
         risk_level = str(result.content.get("risk_level") or "").strip().lower()
-        if _truthy(result.content.get("allow_open")):
-            note = f"AI 风险评估通过（风险{_cn_risk_level(risk_level)}）"
-            return True, f"{note}：{ai_text}" if ai_text else note, result.usage
-        if _ai_risk_is_high(risk_level):
-            return False, ai_text or "AI 判定当前风险偏高", result.usage
-        if not _ai_risk_is_known(risk_level):
-            # The gate only lets an entry through when the model deliberately
-            # answered "not high". An unreadable level is not that answer - it is
-            # a malformed verdict, and a live example had the analysis warn about
-            # exhaustion and a false breakout while the level came back
-            # unclassifiable, so the order was placed anyway. Refuse instead;
-            # the panel says why, and the raw value travels in the metadata.
-            return (
-                False,
-                f"AI 风险等级无法识别（{risk_level or '缺失'}），为确保安全本次不开仓"
-                + (f"：{ai_text}" if ai_text else ""),
-                result.usage,
-            )
-        # Lenient by design: a mild "no" from the model must not veto an entry the
-        # deterministic rules already qualified, and the panel says so, because
-        # "the AI warned yet it still opened" is the question customers ask.
+        reason = str(result.content.get("reason") or "").strip()
+        ai_text = str(result.content.get("analysis") or "").strip() or reason
         return (
-            True,
-            f"AI 持保留意见（风险{_cn_risk_level(risk_level)}），未达到否决标准，"
-            "按策略规则开仓（AI 仅在判定高风险时才阻止开仓）"
+            False,
+            f"AI 风险等级无法识别（{risk_level or '缺失'}），为确保安全本次不开仓"
             + (f"：{ai_text}" if ai_text else ""),
             result.usage,
         )
@@ -954,6 +946,48 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on", "approve", "approved"}
+
+
+_OPEN_RISK_FORMAT_REMINDER = (
+    "Your previous answer did not follow the output contract. "
+    "Answer again with exactly this JSON object and nothing else: "
+    '{"allow_open": true|false, "risk_level": "low"|"medium"|"high", '
+    '"reason": "short Chinese text", "analysis": "short Chinese text"}. '
+    "risk_level is mandatory and must be one of those three values."
+)
+
+
+def _open_risk_outcome(result: Any) -> tuple[bool, str, Any] | None:
+    """Read an entry-risk verdict, or None when the answer ignored the contract.
+
+    Only an explicit answer is read: either the model approved, or it reported a
+    level the gate understands. A reply carrying neither cannot be told apart
+    from a field the model silently dropped, so the caller asks again before
+    deciding either way.
+    """
+    content = result.content if isinstance(result.content, dict) else {}
+    risk_level = str(content.get("risk_level") or "").strip().lower()
+    reason = str(content.get("reason") or "").strip()
+    # The full analysis is what the panel should show; the one-line reason is only
+    # the fallback for callers that do not return one.
+    ai_text = str(content.get("analysis") or "").strip() or reason
+    if _truthy(content.get("allow_open")):
+        note = f"AI 风险评估通过（风险{_cn_risk_level(risk_level)}）"
+        return True, (f"{note}：{ai_text}" if ai_text else note), result.usage
+    if _ai_risk_is_high(risk_level):
+        return False, (ai_text or "AI 判定当前风险偏高"), result.usage
+    if _ai_risk_is_known(risk_level):
+        # Lenient by design: a mild "no" from the model must not veto an entry the
+        # deterministic rules already qualified, and the panel says so, because
+        # "the AI warned yet it still opened" is the question customers ask.
+        return (
+            True,
+            f"AI 持保留意见（风险{_cn_risk_level(risk_level)}），未达到否决标准，"
+            "按策略规则开仓（AI 仅在判定高风险时才阻止开仓）"
+            + (f"：{ai_text}" if ai_text else ""),
+            result.usage,
+        )
+    return None
 
 
 def _ai_risk_is_known(risk_level: str) -> bool:

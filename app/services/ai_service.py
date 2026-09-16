@@ -980,36 +980,44 @@ class AiDecisionClient:
         deployment: dict[str, Any],
         request_payload: OpenEvaluateRequest,
         signal: dict[str, Any],
+        correction: str = "",
     ) -> AiCallResult | None:
         """Use AI as a risk gate for a new Turtle/GL entry.
 
         The deterministic strategy has already produced the direction, entry,
         protective stop and volume.  AI may flag a concrete danger, but it can
         neither change order parameters nor veto a usable setup by default.
+
+        ``correction`` is sent when the previous answer ignored the output
+        contract, so the gate can ask again instead of treating an unreadable
+        verdict as a refusal.
         """
+        payload: dict[str, Any] = {
+            "task": "turtle_open_risk_filter",
+            "strategy_name": deployment.get("strategy_name", "GL趋势策略"),
+            "symbol": request_payload.symbol,
+            "timeframe": request_payload.timeframe,
+            "account": request_payload.account.model_dump(mode="json"),
+            "bid": request_payload.bid,
+            "ask": request_payload.ask,
+            "spread_points": request_payload.spread_points,
+            "balance": request_payload.balance,
+            "equity": request_payload.equity,
+            "signal": signal,
+            "recent_candles": _compact_candles(request_payload.candles, limit=20),
+            "required_json_schema": {
+                "allow_open": "boolean",
+                "risk_level": "low|medium|high",
+                "reason": "short Chinese reason",
+            },
+        }
+        if correction:
+            payload["correction"] = correction
         return self._chat_json(
             deployment=deployment,
             endpoint="open",
             system_prompt=_turtle_open_risk_system_prompt(),
-            user_payload={
-                "task": "turtle_open_risk_filter",
-                "strategy_name": deployment.get("strategy_name", "GL趋势策略"),
-                "symbol": request_payload.symbol,
-                "timeframe": request_payload.timeframe,
-                "account": request_payload.account.model_dump(mode="json"),
-                "bid": request_payload.bid,
-                "ask": request_payload.ask,
-                "spread_points": request_payload.spread_points,
-                "balance": request_payload.balance,
-                "equity": request_payload.equity,
-                "signal": signal,
-                "recent_candles": _compact_candles(request_payload.candles, limit=20),
-                "required_json_schema": {
-                    "allow_open": "boolean",
-                    "risk_level": "low|medium|high",
-                    "reason": "short Chinese reason",
-                },
-            },
+            user_payload=payload,
         )
 
     def _chat_json(

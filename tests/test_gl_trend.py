@@ -1050,3 +1050,49 @@ def test_risk_gate_prompt_requires_a_consistent_answer() -> None:
     assert "must never be omitted" in prompt
     assert "risk_level high" in prompt
 
+
+class _FormatFixedOnRetry(_FakeRiskGate):
+    """First answer ignores the contract, the corrective retry follows it."""
+
+    def __init__(self, second_content: dict[str, Any]) -> None:
+        super().__init__(open_content={"allow_open": False, "reason": "缺少等级"})
+        self.second_content = second_content
+        self.open_kwargs: list[dict[str, Any]] = []
+
+    def turtle_open_risk_decision(self, **kwargs: Any) -> Any:
+        self.open_kwargs.append(kwargs)
+        self.open_calls += 1
+        content = self.open_content if len(self.open_kwargs) == 1 else self.second_content
+        return AiCallResult(content=content, usage=UsageSummary(ai_called=True))
+
+
+def test_a_malformed_verdict_is_asked_again_before_refusing() -> None:
+    """The missing-level case must not silently block a sound setup.
+
+    A live entry was refused with "risk level unreadable" while its own analysis
+    called the setup sound. The answer ignored the output contract, so the gate
+    asks once more with the contract spelled out instead of blocking the trade.
+    """
+    gate = _FormatFixedOnRetry(
+        {"allow_open": True, "risk_level": "low", "analysis": "风险可控"}
+    )
+
+    decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
+
+    assert decision.action == "BUY"
+    assert gate.open_calls == 2
+    assert "correction" in gate.open_kwargs[1]
+    assert "correction" not in gate.open_kwargs[0]
+    assert "AI 风险评估通过" in decision.reason
+
+
+def test_a_verdict_that_stays_malformed_after_the_retry_is_refused() -> None:
+    """Asking again is a second chance, not a way to open regardless."""
+    gate = _FakeRiskGate(open_content={"allow_open": False, "reason": "缺少等级"})
+
+    decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
+
+    assert decision.action == "HOLD"
+    assert "风险等级无法识别" in decision.reason
+    assert gate.open_calls == 2
+
