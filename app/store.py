@@ -191,6 +191,18 @@ def _is_demo_server(server: str) -> bool:
     return any(token in normalized for token in ("demo", "trial", "practice", "模拟", "測試", "测试"))
 
 
+def _mt_type_text(value: Any) -> str:
+    """Render an MT5 order type without losing zero.
+
+    MT5 numbers order types as 0 = buy, 1 = sell, so the usual ``value or ""``
+    idiom turns every buy into an empty string. Stored that way, the order list
+    showed a direction for sells and nothing at all for buys.
+    """
+    if value is None or value == "":
+        return ""
+    return str(value)
+
+
 def _deal_net_profit(payload: dict[str, Any]) -> float:
     value = payload.get("net_profit")
     if value is not None:
@@ -1877,7 +1889,7 @@ class SqliteStore:
                 {
                     "order_id": str(row["order_id"] or row["deal_id"] or ""),
                     "symbol": str(row["symbol"] or ""),
-                    "mt_type": str(row["mt_type"] or ""),
+                    "mt_type": _mt_type_text(row["mt_type"]),
                     "volume": float(row["volume"] or 0),
                     "open_price": float(row["open_price"] or 0),
                     "close_price": close_price,
@@ -3579,7 +3591,7 @@ class SqliteStore:
                         order_id,
                         order_id,
                         str(order.get("symbol") or ""),
-                        str(order.get("mt_type") or ""),
+                        _mt_type_text(order.get("mt_type")),
                         entry,
                         float(order.get("volume") or 0),
                         float(order.get("close_price") or 0),
@@ -4911,7 +4923,7 @@ class SqliteStore:
                 "deployment_id": str(row["deployment_id"] or ""),
                 "strategy_name": str(row["strategy_name"] or ""),
                 "symbol": str(row["symbol"] or ""),
-                "mt_type": str(row["mt_type"] or ""),
+                "mt_type": _mt_type_text(row["mt_type"]),
                 "volume": float(row["volume"] or 0),
                 "open_price": float(row["open_price"] or 0),
                 "close_price": float(row["close_price"] or row["price"] or 0),
@@ -5149,7 +5161,7 @@ class SqliteStore:
                 "strategy_name": str(deployment.get("name") or row["strategy_name"] or ""),
                 "account_login": str(row["account_login"] or ""),
                 "symbol": str(row["symbol"] or ""),
-                "mt_type": str(row["mt_type"] or ""),
+                "mt_type": _mt_type_text(row["mt_type"]),
                 "volume": float(row["volume"] or 0),
                 "open_price": float(row["open_price"] or 0),
                 "close_price": float(row["close_price"] or row["price"] or 0),

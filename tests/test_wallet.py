@@ -386,6 +386,41 @@ def test_future_dated_deal_still_shows_in_the_order_list(tmp_path: Path) -> None
     ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def test_order_direction_survives_the_zero_buy_type(tmp_path: Path) -> None:
+    """MT5 numbers a buy as 0, which ``value or ""`` used to store as empty.
+
+    The order list then showed a direction for every sell and nothing at all for
+    every buy, because the client maps 0 to buy and an empty string to unknown.
+    """
+    store = SqliteStore(tmp_path / "order-direction.db")
+    store.initialize()
+    user = store.save_user({"email": "order-direction@example.com", "status": "active"})
+    deployment = store.upsert_web_deployment(
+        "gl_order_direction", user_id=str(user["id"]), strategy_code="GL_TREND_V1",
+        strategy_name="Direction", status="active", symbol="*", timeframe="*",
+        config={"deployment_key": "gl_order_direction"},
+    )
+    now = int(datetime.now(timezone.utc).timestamp())
+    store.sync_mt5_history_deals(
+        deployment["id"],
+        account_login="40001",
+        account_server="Demo",
+        orders=[
+            {"order_id": "buy-1", "symbol": "XAUUSD", "mt_type": 0, "volume": 0.1,
+             "open_price": 1.0, "close_price": 1.1, "net_profit": 10.0, "close_time": now},
+            {"order_id": "sell-1", "symbol": "XAUUSD", "mt_type": 1, "volume": 0.1,
+             "open_price": 1.1, "close_price": 1.0, "net_profit": 5.0, "close_time": now - 60},
+        ],
+    )
+
+    result = store.list_user_orders(user_id=user["id"], page=1, size=10)
+
+    assert {row["order_id"]: row["mt_type"] for row in result["list"]} == {
+        "buy-1": "0",
+        "sell-1": "1",
+    }
+
+
 def test_user_can_pause_resume_and_soft_delete_own_strategy(tmp_path: Path) -> None:
     store = SqliteStore(tmp_path / "strategy-actions.db")
     store.initialize()
