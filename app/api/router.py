@@ -541,7 +541,9 @@ def create_mt5_router(
             equity=request.equity or request.account.equity,
         )
         decision = decision_service.evaluate_open(evaluate_request)
-        return _mt5_open_response(decision, spread=request.market.spread)
+        return _mt5_open_response(
+            decision, spread=request.market.spread, metadata=request.market.metadata,
+        )
 
     @router.post("/position-decision", response_model=Mt5PositionDecisionResponse)
     def position_decision(request: Mt5PositionDecisionRequest) -> Mt5PositionDecisionResponse:
@@ -600,6 +602,7 @@ def create_mt5_router(
             decision,
             spread=request.market.spread,
             positions=request.positions,
+            metadata=request.market.metadata,
         )
 
     return router
@@ -1629,7 +1632,47 @@ def _panel_description(decision: TradeDecision) -> str:
     return f"{decision.reason}（本次AI分析耗时：{elapsed_ms / 1000:.1f}秒）"
 
 
-def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDecisionResponse:
+# The contract fields a current EA reports. They are what turns a stop distance
+# into a position size, so a build that sends none of them cannot be sized.
+_REQUIRED_SYMBOL_INFO_KEYS = (
+    "tick_size", "trade_tick_size", "tick", "point", "point_size",
+    "tick_value", "trade_tick_value", "tick_value_profit", "trade_tick_value_profit", "tickVal",
+    "value_per_price", "money_per_price", "valuePerPrice",
+    "value_per_point", "money_per_point", "valuePerPoint",
+    "contract_size", "trade_contract_size", "contractSize",
+)
+
+_EA_UPDATE_NOTICE = "请下载最新版本 EA：当前 EA 未上报合约参数，服务端无法计算仓位"
+
+
+def _ea_update_notice(metadata: Any) -> str:
+    """Return the update hint when the client reported no contract data at all.
+
+    Builds that predate the contract metadata still serialize the block on the
+    position interface but never fill it in, so the request arrives with an empty
+    object. Sizing then has nothing to work with and the order is refused, which
+    is indistinguishable from the strategy simply finding no setup; say so
+    explicitly instead.
+    """
+    if not isinstance(metadata, dict):
+        # The caller did not hand over the request metadata at all, so there is
+        # nothing to judge; only an empty block from a real client warns.
+        return ""
+    for key in _REQUIRED_SYMBOL_INFO_KEYS:
+        try:
+            if float(metadata.get(key) or 0) > 0:
+                return ""
+        except (TypeError, ValueError):
+            continue
+    return _EA_UPDATE_NOTICE
+
+
+def _mt5_open_response(
+    decision: TradeDecision,
+    *,
+    spread: float,
+    metadata: Any = None,
+) -> Mt5OpenDecisionResponse:
     orders: list[Mt5OpenOrder] = []
     if decision.action in {"BUY", "SELL"} and decision.lot:
         # Strategies may request a pending order (limit/stop) through metadata;
@@ -1653,10 +1696,15 @@ def _mt5_open_response(decision: TradeDecision, *, spread: float) -> Mt5OpenDeci
             ),
         )
 
+    notice = _ea_update_notice(metadata)
+    description = _panel_description(decision)
+    if notice:
+        description = f"{description}；{notice}"
     return Mt5OpenDecisionResponse(
         status="ok",
         should_open=len(orders) > 0,
-        description=_panel_description(decision),
+        description=description,
+        notice=notice,
         spread=spread,
         decision_id=decision.decision_id,
         request_id=decision.request_id,
@@ -1876,7 +1924,12 @@ def _mt5_position_response(
     *,
     spread: float,
     positions: list[Mt5Position],
+    metadata: Any = None,
 ) -> Mt5PositionDecisionResponse:
+    notice = _ea_update_notice(metadata)
+    description = _panel_description(decision)
+    if notice:
+        description = f"{description}；{notice}"
     actions: list[Mt5PositionAction] = []
     batch_actions = decision.metadata.get("batch_actions") if isinstance(decision.metadata, dict) else None
     if isinstance(batch_actions, list):
@@ -1918,7 +1971,8 @@ def _mt5_position_response(
         return Mt5PositionDecisionResponse(
             status="ok",
             has_action=len(actions) > 0,
-            description=_panel_description(decision),
+            description=description,
+            notice=notice,
             spread=spread,
             decision_id=decision.decision_id,
             request_id=decision.request_id,
@@ -1972,7 +2026,8 @@ def _mt5_position_response(
     return Mt5PositionDecisionResponse(
         status="ok",
         has_action=len(actions) > 0,
-        description=_panel_description(decision),
+        description=description,
+        notice=notice,
         spread=spread,
         decision_id=decision.decision_id,
         request_id=decision.request_id,

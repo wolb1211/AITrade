@@ -281,6 +281,10 @@ class Mt5OpenDecisionResponse(StrictModel):
     status: Literal["ok"]
     should_open: bool
     description: str
+    # Set when the client EA is too old to report the contract fields the server
+    # needs to size an order. The same text is appended to description, so the
+    # panel shows it without the EA having to read this field.
+    notice: str = ""
     spread: float = Field(ge=0)
     decision_id: str
     request_id: str
@@ -305,6 +309,8 @@ class Mt5PositionDecisionResponse(StrictModel):
     status: Literal["ok"]
     has_action: bool
     description: str
+    # Same contract-data notice as the open response.
+    notice: str = ""
     spread: float = Field(ge=0)
     decision_id: str
     request_id: str
