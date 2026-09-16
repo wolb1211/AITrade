@@ -744,7 +744,7 @@ class AiDecisionClient:
                 'Return only this JSON object: {"status":"ok","message":"connection successful"}'
                 if strict_json else "Reply with exactly: OK"
             ),
-            max_tokens=256,
+            max_tokens=1024,
             strict_json=strict_json,
         )
         elapsed_ms = max(1, round((perf_counter() - started_at) * 1000))
@@ -760,7 +760,7 @@ class AiDecisionClient:
         if not content and message_payload.get("reasoning_content"):
             content = str(message_payload.get("reasoning_content") or "").strip()
         if not content:
-            raise RuntimeError(f"AI provider response content empty: {_preview_text(raw_response)}")
+            raise RuntimeError(_empty_content_error(parsed, raw_response))
         if strict_json:
             _extract_json_object(content)
         usage = parsed.get("usage") if isinstance(parsed, dict) else {}
@@ -825,7 +825,9 @@ class AiDecisionClient:
                 "Do not guess when no image is visible."
             ),
             user_image_url=_VISION_TEST_IMAGE_DATA_URL,
-            max_tokens=512,
+            # Same reasoning allowance as the text test: a vision model that
+            # thinks first would otherwise answer with nothing.
+            max_tokens=1024,
             strict_json=False,
         )
         elapsed_ms = max(1, round((perf_counter() - started_at) * 1000))
@@ -3327,6 +3329,43 @@ def _json_api_system_prompt(
         f"{_PLAIN_CHINESE_RULE}"
         f"Task: {task_prompt}"
     )
+
+
+def _empty_content_error(parsed: Any, raw_response: str) -> str:
+    """Explain an empty answer, naming reasoning-token exhaustion when it applies.
+
+    A reasoning model charges its thinking against the same output budget, so a
+    small ceiling spends the whole allowance on reasoning and returns no text
+    with finish_reason length. The provider payload says exactly that; without
+    reading it the operator only sees an empty answer and cannot tell a broken
+    endpoint from a budget that is simply too small.
+    """
+    choice = (parsed.get("choices") or [{}])[0] if isinstance(parsed, dict) else {}
+    choice = choice if isinstance(choice, dict) else {}
+    finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+    usage = parsed.get("usage") if isinstance(parsed, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    try:
+        reasoning_tokens = int(details.get("reasoning_tokens") or 0)
+    except (TypeError, ValueError):
+        reasoning_tokens = 0
+
+    if finish_reason == "length" and reasoning_tokens > 0:
+        return (
+            "AI 返回内容为空：输出上限被推理占用"
+            f"（思考 {reasoning_tokens} tokens，finish_reason=length）。"
+            "该模型是推理模型，思考也计入 max_tokens，请提高上限或改用非推理模型。"
+            f"原始返回: {_preview_text(raw_response)}"
+        )
+    if finish_reason == "length":
+        return (
+            "AI 返回内容为空：在写出内容前就到达了 max_tokens 上限"
+            "（finish_reason=length），请提高上限。"
+            f"原始返回: {_preview_text(raw_response)}"
+        )
+    return f"AI provider response content empty: {_preview_text(raw_response)}"
 
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:

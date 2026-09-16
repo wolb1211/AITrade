@@ -393,3 +393,35 @@ def test_normal_call_does_not_override_the_configured_timeout(tmp_path: Path, mo
     assert "timeout" not in captured
     # And the repair path is the only one that narrows it.
     assert REPAIR_TIMEOUT_SECONDS < client.timeout
+
+
+def test_empty_content_names_reasoning_token_exhaustion() -> None:
+    """A reasoning model spends the whole budget thinking and answers nothing.
+
+    The connection test reported only "content empty" while the payload said
+    finish_reason length with 242 reasoning tokens and no text, which reads like
+    a broken endpoint rather than a budget that is too small.
+    """
+    from app.services.ai_service import _empty_content_error
+
+    thinking = {
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+        "usage": {
+            "completion_tokens": 242,
+            "completion_tokens_details": {"reasoning_tokens": 242},
+        },
+    }
+    message = _empty_content_error(thinking, json.dumps(thinking))
+    assert "推理" in message
+    assert "242" in message
+
+    # A plain truncation is named as such, without blaming reasoning.
+    truncated = {
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+        "usage": {"completion_tokens": 1024},
+    }
+    assert "max_tokens" in _empty_content_error(truncated, json.dumps(truncated))
+
+    # Anything else keeps the original wording.
+    other = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
+    assert _empty_content_error(other, "{}").startswith("AI provider response content empty")
