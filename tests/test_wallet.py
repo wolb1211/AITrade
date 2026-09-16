@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from app.services.decision_service import DecisionService
-from app.store import SqliteStore
+from app.store import SqliteStore, _period_bounds
 
 
 def test_wallet_settings_and_balance_ledger(tmp_path: Path) -> None:
@@ -332,6 +332,52 @@ def test_order_curve_uses_requested_time_granularity(tmp_path: Path) -> None:
     assert three_days["curve_granularity"] == "order"
     assert ten_days["curve_granularity"] == "hour"
     assert eleven_days["curve_granularity"] == "day"
+
+
+def test_future_dated_deal_still_shows_in_the_order_list(tmp_path: Path) -> None:
+    """A deal on the broker clock must not be hidden as "future-dated".
+
+    MT5 stamps deals with the broker's server time, which runs ahead of real UTC.
+    A window ending at the real "now" used to drop a just-closed deal from the
+    order detail list while the day summary still counted it, so the page showed
+    a profit whose order could not be found.
+    """
+    store = SqliteStore(tmp_path / "future-dated.db")
+    store.initialize()
+    user = store.save_user({"email": "future-dated@example.com", "status": "active"})
+    deployment = store.upsert_web_deployment(
+        "gl_future_dated", user_id=str(user["id"]), strategy_code="GL_TREND_V1",
+        strategy_name="FutureDated", status="active", symbol="*", timeframe="*",
+        config={"deployment_key": "gl_future_dated"},
+    )
+    now = datetime.now(timezone.utc)
+    # Three hours ahead of real UTC, as a UTC+3 broker would report it.
+    broker_close = int((now + timedelta(hours=3)).timestamp())
+    store.sync_mt5_history_deals(
+        deployment["id"],
+        account_login="30001",
+        account_server="Demo",
+        orders=[{
+            "order_id": "future-1",
+            "symbol": "XAUUSD",
+            "volume": 46.2,
+            "open_price": 4315.87,
+            "close_price": 4332.02,
+            "net_profit": 74428.2,
+            "open_time": broker_close - 2400,
+            "close_time": broker_close,
+        }],
+    )
+
+    start_iso, end_iso, _, _, _ = _period_bounds("today")
+    result = store.list_user_orders(
+        user_id=user["id"], page=1, size=10, start_at=start_iso, end_at=end_iso,
+    )
+
+    assert result["total"] == 1
+    assert [row["order_id"] for row in result["list"]] == ["future-1"]
+    # The list total and the PnL summary must agree on the same deal.
+    assert result["summary"]["pnl"] == pytest.approx(74428.2)
 
 
 def test_user_can_pause_resume_and_soft_delete_own_strategy(tmp_path: Path) -> None:

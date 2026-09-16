@@ -119,6 +119,18 @@ def decimal_string(value: Any, default: str = "0") -> str:
     return format(amount, "f")
 
 
+# MT5 reports deal times on the broker's server clock rather than as true UTC
+# instants, so a deal that has just closed can carry a timestamp that is still
+# "in the future" relative to real UTC by the broker's GMT offset (up to +14
+# hours). A window ending at the real "now" therefore classifies those deals as
+# future-dated and hides them from the order detail list, while the day
+# summaries - each bucket bounded by its own end, not by "now" - still count
+# them. The result is a strategy that shows a profit whose order cannot be
+# found. Let the end of every window tolerate any legal broker offset; the start
+# of the window is untouched.
+PERIOD_END_TOLERANCE = timedelta(hours=26)
+
+
 def _period_bounds(period: str) -> tuple[str, str, int, int, str]:
     now_local = datetime.now(LOCAL_TIMEZONE)
     today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -141,9 +153,9 @@ def _period_bounds(period: str) -> tuple[str, str, int, int, str]:
     else:
         start = datetime(1970, 1, 1, tzinfo=LOCAL_TIMEZONE)
         bucket = "day"
-    now_utc = now_local.astimezone(timezone.utc)
+    end_utc = now_local.astimezone(timezone.utc) + PERIOD_END_TOLERANCE
     start_utc = start.astimezone(timezone.utc)
-    return start_utc.isoformat(), now_utc.isoformat(), int(start_utc.timestamp()), int(now_utc.timestamp()), bucket
+    return start_utc.isoformat(), end_utc.isoformat(), int(start_utc.timestamp()), int(end_utc.timestamp()), bucket
 
 
 def _time_bucket(timestamp: int, bucket: str) -> str:
