@@ -851,3 +851,53 @@ def test_analysis_is_not_duplicated_when_the_reason_already_contains_it() -> Non
     text = _with_ai_analysis("继续持有；AI 分析：结构完好", {"analysis": "结构完好"})
     assert text == "继续持有；AI 分析：结构完好"
 
+
+def test_risk_per_lot_skips_a_branch_that_cannot_be_right() -> None:
+    """A partial symbol_info must never size an order from a nonsense figure.
+
+    Production: a position request described XAUUSD in units the tick branch did
+    not expect, so the per-lot risk came out at about 2 instead of 1438 and the
+    add-on was sized at 46.2 lots where roughly 0.07 was intended.
+    """
+    price_risk = 14.38
+    broken_tick = {"tick_size": 0.01, "tick_value": 0.0015, "contract_size": 100}
+
+    # The broken tick figure is ignored and the contract size carries the sizing.
+    assert turtle_agent._risk_per_lot(price_risk, broken_tick, {}) == pytest.approx(1438.0)
+    # A healthy payload still uses the tick branch, unchanged.
+    healthy = {"tick_size": 0.01, "tick_value": 1.0, "contract_size": 100}
+    assert turtle_agent._risk_per_lot(price_risk, healthy, {}) == pytest.approx(1438.0)
+    # Nothing usable: refuse to size rather than guess.
+    assert turtle_agent._risk_per_lot(price_risk, {"tick_size": 0.01, "tick_value": 0.0015}, {}) == 0.0
+    assert turtle_agent._risk_per_lot(0.0, healthy, {}) == 0.0
+
+
+def test_unit_lot_stays_sane_when_the_tick_figure_is_broken() -> None:
+    """The 46-lot add-on: the same payload must now size about 0.07 lots."""
+    from types import SimpleNamespace
+
+    config = {
+        "position_size_mode": "risk",
+        "risk_base_mode": "fixed_loss",
+        "risk_amount": 100,
+    }
+    request = SimpleNamespace(
+        symbol_info={
+            "tick_size": 0.01,
+            "tick_value": 0.0015,
+            "contract_size": 100,
+            "volume_min": 0.01,
+            "volume_step": 0.01,
+        },
+        balance=10_000.0,
+        equity=10_000.0,
+    )
+
+    lot, sizing = turtle_agent._unit_lot(
+        request, config, entry=4316.05, stop_loss=4301.67,
+    )
+
+    assert sizing["mode"] == "risk"
+    assert sizing["risk_per_lot"] == pytest.approx(1438.0)
+    assert lot == pytest.approx(0.07, abs=0.005)
+

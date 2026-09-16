@@ -606,6 +606,21 @@ def _unit_lot(
 
 
 def _risk_per_lot(price_risk: float, info: dict[str, Any], config: dict[str, Any]) -> float:
+    """Money risked per 1.0 lot when the price moves ``price_risk``.
+
+    Several symbol-info fields can describe the same quantity, and a request that
+    carried only some of them used to fall through to whichever branch matched
+    first. A position request whose tick fields were in unexpected units reported
+    a per-lot risk of about 2 where roughly 1400 was right, and the resulting
+    order was sized at 46 lots instead of 0.07.
+
+    Keep the same priority order, but only accept a figure that can be right: a
+    lot is never smaller than one contract unit, so the money risked per lot can
+    never be below the price move itself. Anything smaller means the payload
+    described the symbol in units the branch does not expect, and sizing from it
+    would scale the intended risk by the same factor. When no branch yields a
+    usable figure the strategy refuses to size the order instead of guessing.
+    """
     if price_risk <= 0:
         return 0.0
     tick_size = _positive_float(info, "tick_size", "trade_tick_size", "tick", "point", "point_size")
@@ -614,14 +629,19 @@ def _risk_per_lot(price_risk: float, info: dict[str, Any], config: dict[str, Any
     value_per_point = _positive_float(info, "value_per_point", "money_per_point", "valuePerPoint")
     point = _positive_float(info, "point", "point_size")
     contract = _positive_float(info, "contract_size", "trade_contract_size", "contractSize") or _positive_float(config.get("contract_size"), default=0.0)
+
+    candidates: list[float] = []
     if tick_size and tick_value:
-        return price_risk / tick_size * tick_value
+        candidates.append(price_risk / tick_size * tick_value)
     if value_per_price:
-        return price_risk * value_per_price
+        candidates.append(price_risk * value_per_price)
     if point and value_per_point:
-        return price_risk / point * value_per_point
+        candidates.append(price_risk / point * value_per_point)
     if contract:
-        return price_risk * contract
+        candidates.append(price_risk * contract)
+    for candidate in candidates:
+        if candidate >= price_risk:
+            return candidate
     return 0.0
 
 
