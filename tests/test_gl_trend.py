@@ -1103,8 +1103,11 @@ def test_risk_gate_prompt_requires_a_consistent_answer() -> None:
 
     prompt = _turtle_open_risk_system_prompt()
     assert "Your level and your analysis must agree" in prompt
-    assert "must never be omitted" in prompt
     assert "risk_level high" in prompt
+    # The level is optional in practice, so the prompt must not ask for a
+    # placeholder when the model has none to report.
+    assert "风险等级为？" in prompt
+    assert "risk_level is optional" in prompt
 
 
 class _FormatFixedOnRetry(_FakeRiskGate):

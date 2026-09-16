@@ -1793,6 +1793,11 @@ def _turtle_position_review_prompt() -> str:
         "Do not answer true merely because the trend is unclear or you would have picked a different entry. "
         "Required keys: close_now (boolean), allow_add (boolean), risk_level (low|medium|high), confidence (0..1), "
         "reason (short Chinese text). "
+        # risk_level is optional in practice - the models in use follow the generic
+        # shape and omit it - and one live answer ended its analysis with the
+        # literal placeholder "风险等级为？", which customers read as a defect.
+        "risk_level is optional: when you are not reporting one, do not mention a risk level in reason or analysis at "
+        "all, and never write a placeholder such as 风险等级为？. State only conclusions you actually reached. "
         f"{_PLAIN_CHINESE_RULE}"
     )
 
@@ -1828,8 +1833,11 @@ def _turtle_open_risk_system_prompt() -> str:
         "requirements - an exhausted or overextended move, a failed or false breakout, a poor risk-reward, or no momentum "
         "follow-through - you must answer allow_open false and risk_level high. Never describe such a danger while "
         "answering low or medium. "
-        "risk_level must be exactly one of low, medium or high and must never be omitted. "
-        "Required keys: allow_open (boolean), risk_level (low|medium|high), reason (short Chinese text). "
+        "risk_level is optional: when you report one it must be exactly low, medium or high, and when you do not, do "
+        "not mention a risk level in reason or analysis at all - never write a placeholder such as 风险等级为？. "
+        "State only conclusions you actually reached. "
+        "Keys: allow_open (boolean), reason (short Chinese text), and risk_level (low|medium|high) when you can give "
+        "one. "
         f"{_PLAIN_CHINESE_RULE}"
     )
 
