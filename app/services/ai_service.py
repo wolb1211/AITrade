@@ -30,7 +30,7 @@ from app.store import SqliteStore
 
 logger = logging.getLogger(__name__)
 
-# The JSON repair call is a small reformatting task (max_tokens=700), so it gets a
+# The JSON repair call is a small reformatting task (max_tokens=1500), so it gets a
 # much shorter timeout than a full decision call. That is what makes the worst
 # case of the longest call chain predictable: PA runs two stages and each stage
 # may be followed by one repair, so the ceiling is
@@ -1622,7 +1622,7 @@ class AiDecisionClient:
                 literal_user_rules=True,
             ),
             user_prompt=response_content[:6000],
-            max_tokens=700,
+            max_tokens=1500,
             strict_json=strict_json,
             timeout=REPAIR_TIMEOUT_SECONDS,
         )
@@ -3369,15 +3369,20 @@ def _empty_content_error(parsed: Any, raw_response: str) -> str:
 
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
+    # A ceiling costs nothing on its own: the model still stops when it is
+    # finished, so raising it only decides whether an answer that needs room gets
+    # it. The limits are therefore set for the hungriest model in use, because a
+    # reasoning model charges its thinking against this same budget - one spent
+    # 242 tokens thinking about a one-line connection test and returned no text.
+    # 6000 is the value the workflow calls already use, so it is known to be
+    # accepted by the configured providers.
     if endpoint.startswith("workflow_"):
         return 6000
     if endpoint in {"open", "position", "pa_diag"}:
-        # 3000 rather than 1000: reasoning models charge their thinking against
-        # this same budget, and at 1000 they ran out before writing any JSON.
-        # A higher ceiling costs nothing on its own because the model still stops
-        # when it is finished; it only stops truncating the answers that need it.
-        return 3000
-    return 500
+        # The decision endpoints must never truncate: a half-written JSON object
+        # costs the call and produces nothing usable.
+        return 6000
+    return 1024
 
 def _compact_candles(candles: list[Candle], *, limit: int, include_timestamp: bool = True) -> list[dict[str, Any]]:
     ordered = sorted(candles, key=lambda candle: candle.timestamp)[-limit:]

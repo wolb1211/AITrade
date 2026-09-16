@@ -61,14 +61,16 @@ def _response(content: str, *, finish_reason: str, completion_tokens: int) -> st
 
 
 def test_decision_endpoints_get_a_budget_reasoning_models_can_fit_in() -> None:
-    # Reasoning eats the same budget as the answer, so 1000 truncated DeepSeek.
-    assert _max_tokens_for_endpoint("open") == 3000
-    assert _max_tokens_for_endpoint("position") == 3000
-    assert _max_tokens_for_endpoint("pa_diag") == 3000
+    # Reasoning eats the same budget as the answer, so 1000 truncated DeepSeek,
+    # and 3000 truncated a model that spent 242 tokens thinking about a one-line
+    # connection test. The decision calls now match the workflow ceiling.
+    assert _max_tokens_for_endpoint("open") == 6000
+    assert _max_tokens_for_endpoint("position") == 6000
+    assert _max_tokens_for_endpoint("pa_diag") == 6000
     # Workflow compilation legitimately returns large JSON.
     assert _max_tokens_for_endpoint("workflow_open") == 6000
-    # Anything unrecognised keeps the small default.
-    assert _max_tokens_for_endpoint("something_else") == 500
+    # Anything unrecognised keeps a safe minimum rather than the old 500.
+    assert _max_tokens_for_endpoint("something_else") == 1024
 
 
 def test_truncation_note_is_empty_unless_truncated() -> None:
@@ -425,3 +427,19 @@ def test_empty_content_names_reasoning_token_exhaustion() -> None:
     # Anything else keeps the original wording.
     other = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}
     assert _empty_content_error(other, "{}").startswith("AI provider response content empty")
+
+
+def test_decision_calls_have_room_for_a_reasoning_model() -> None:
+    """A reasoning model charges its thinking against the output budget.
+
+    At 3000 one spent the whole allowance thinking and returned no text at all,
+    leaving the strategy on its fallback while still paying for the call. The
+    decision ceilings now match the workflow calls, a value the configured
+    providers already accept, and the helper endpoints keep a safe minimum.
+    """
+    from app.services.ai_service import _max_tokens_for_endpoint
+
+    for endpoint in ("open", "position", "pa_diag"):
+        assert _max_tokens_for_endpoint(endpoint) >= 6000
+    assert _max_tokens_for_endpoint("screenshot") >= 1024
+    assert _max_tokens_for_endpoint("vision_test") >= 1024
