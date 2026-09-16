@@ -907,6 +907,50 @@ def test_unit_lot_stays_sane_when_the_tick_figure_is_broken() -> None:
     assert lot == pytest.approx(0.07, abs=0.005)
 
 
+def test_inconsistent_symbol_info_is_refused() -> None:
+    """Two figures that must agree do not: the payload mixes units.
+
+    A client EA reporting a tick value ten times too small is still above the
+    price move, so it would look plausible on its own and size the order ten
+    times too large. Comparing it with value_per_price exposes the mismatch.
+    """
+    price_risk = 14.38
+    mixed = {"tick_size": 0.01, "tick_value": 0.15, "value_per_price": 100}
+    assert turtle_agent._risk_per_lot(price_risk, mixed) == (0.0, "inconsistent_symbol_info")
+
+    consistent = {"tick_size": 0.01, "tick_value": 1.0, "value_per_price": 100}
+    value, source = turtle_agent._risk_per_lot(price_risk, consistent)
+    assert value == pytest.approx(1438.0)
+    assert source == "tick_size"
+
+
+def test_add_explains_why_the_position_size_could_not_be_computed() -> None:
+    """A client EA without contract metadata must not fail silently.
+
+    Refusing to size the order is the safe outcome, but the operator has to be
+    able to tell "no setup" apart from "we could not size this".
+    """
+    config = {
+        "allow_add": True,
+        "max_positions": 4,
+        "position_size_mode": "risk",
+        "risk_base_mode": "fixed_loss",
+        "risk_amount": 100,
+        "add_step_atr": 0.5,
+    }
+    # _position_request carries no symbol_info, as an un-updated client would.
+    request = _position_request(
+        [_position("7001", current_price=111.0)],
+        bid=111.0,
+        ask=111.1,
+    )
+
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+
+    assert decision.action == "HOLD"
+    assert "加仓手数无法确定" in decision.reason
+
+
 def test_config_contract_size_can_no_longer_size_an_order() -> None:
     """The 40-million-lot order: the config fallback is gone.
 

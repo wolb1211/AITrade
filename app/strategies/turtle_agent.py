@@ -186,7 +186,7 @@ class TurtleTrendStrategy:
                     members,
                     f"触发保护止损（距最远入场 {STOP_ATR:g} 倍 ATR，止损位 {stop_level:g}），全部离场",
                 )
-        add_decision = _maybe_add(request, config, atr)
+        add_decision, add_block_reason = _maybe_add(request, config, atr)
         if self.ai_client is None:
             # Adding is evaluated first. A bar that prints a new high also makes
             # the trailing target tighter, so returning the protection update
@@ -198,7 +198,9 @@ class TurtleTrendStrategy:
             protection = _protection_batch_decision(request, config, atr)
             if protection is not None:
                 return protection
-            return _hold_position(request, first_ticket, "趋势结构未被破坏，继续持有")
+            return _hold_position(
+                request, first_ticket, add_block_reason or "趋势结构未被破坏，继续持有",
+            )
         # The AI is asked on every position request, including the bars where a
         # break-even or trailing update is due: taking profit is the AI's call,
         # while moving the stop stays the strategy's own logic.  Only the safety
@@ -242,9 +244,13 @@ class TurtleTrendStrategy:
         hold = _hold_position(
             request,
             first_ticket,
-            _with_ai_analysis("趋势结构未被破坏，继续持有", review),
+            _with_ai_analysis(add_block_reason or "趋势结构未被破坏，继续持有", review),
         )
         hold.metadata["ai_risk"] = review["note"]
+        if add_block_reason:
+            # Keep the sizing failure on the decision as well, so it is queryable
+            # rather than only visible in the panel text.
+            hold.metadata["add_blocked_reason"] = add_block_reason
         hold.usage = review_usage
         return hold
 
@@ -568,6 +574,12 @@ def _bearish_confirmation_event(candles, window: int) -> tuple[int, str] | None:
     return None
 
 
+# How far two figures that must describe the same quantity may disagree before
+# the symbol info is treated as unusable. They should be identical when the
+# payload is consistent, so only a unit mix-up opens a spread this wide.
+MAX_SYMBOL_INFO_SPREAD = 5.0
+
+
 def _unit_lot(
     request: OpenEvaluateRequest,
     config: dict[str, Any],
@@ -653,18 +665,30 @@ def _risk_per_lot(price_risk: float, info: dict[str, Any]) -> tuple[float, str]:
     point = _positive_float(info, "point", "point_size")
     contract = _positive_float(info, "contract_size", "trade_contract_size", "contractSize")
 
-    candidates: list[tuple[float, str]] = []
-    if tick_size and tick_value:
-        candidates.append((price_risk / tick_size * tick_value, "tick_size"))
-    if value_per_price:
-        candidates.append((price_risk * value_per_price, "value_per_price"))
-    if point and value_per_point:
-        candidates.append((price_risk / point * value_per_point, "point"))
-    if contract:
-        candidates.append((price_risk * contract, "contract_size"))
-    for candidate, source in candidates:
-        if candidate >= price_risk:
-            return candidate, source
+    tick_figure = price_risk / tick_size * tick_value if (tick_size and tick_value) else 0.0
+    price_figure = price_risk * value_per_price if value_per_price else 0.0
+    point_figure = price_risk / point * value_per_point if (point and value_per_point) else 0.0
+
+    # tick_value / tick_size and value_per_price describe the same quantity by
+    # definition, so they must agree; a wide spread means the payload mixes units
+    # and sizing from either would scale the position by the same factor. Only
+    # these two are compared - a client that labels point values differently
+    # would make the third figure diverge legitimately.
+    if tick_figure and price_figure:
+        if max(tick_figure, price_figure) > min(tick_figure, price_figure) * MAX_SYMBOL_INFO_SPREAD:
+            return 0.0, "inconsistent_symbol_info"
+
+    for value, source in (
+        (tick_figure, "tick_size"),
+        (price_figure, "value_per_price"),
+        (point_figure, "point"),
+    ):
+        if value >= price_risk:
+            return value, source
+    # Only the raw unit count is left. It describes the underlying rather than an
+    # amount of money, so it is a last resort and still has to clear the floor.
+    if contract >= 1:
+        return price_risk * contract, "contract_size"
     return 0.0, "none"
 
 
@@ -810,28 +834,41 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
     )
 
 
-def _maybe_add(request: PositionEvaluateRequest, config: dict[str, Any], atr: float) -> TradeDecision | None:
+def _maybe_add(
+    request: PositionEvaluateRequest,
+    config: dict[str, Any],
+    atr: float,
+) -> tuple[TradeDecision | None, str]:
+    """Return the add-on decision plus the reason it could not be sized.
+
+    The reason is only set when the symbol info made the position size
+    uncomputable, so a client EA that predates the contract metadata cannot be
+    silently ignored: the operator sees why nothing was added.
+    """
     if not bool(config.get("allow_add", False)) or atr <= 0 or len(request.positions) >= _max_units(config):
-        return None
+        return None, ""
     sides = {item.side for item in request.positions}
     if len(sides) != 1:
-        return None
+        return None, ""
     side = next(iter(sides))
     direction = "buy" if side == "BUY" else "sell"
     step = float(config.get("add_step_atr") or DEFAULT_ADD_STEP_ATR)
     if side == "BUY":
         anchor = max(item.open_price for item in request.positions)
         if request.bid < anchor + step * atr:
-            return None
+            return None, ""
         entry, action, stop_loss = request.ask, "BUY", request.ask - STOP_ATR * atr
     else:
         anchor = min(item.open_price for item in request.positions)
         if request.ask > anchor - step * atr:
-            return None
+            return None, ""
         entry, action, stop_loss = request.bid, "SELL", request.bid + STOP_ATR * atr
     lot, sizing = _unit_lot(request, config, entry=entry, stop_loss=stop_loss)
     if lot <= 0:
-        return None
+        return None, (
+            "加仓手数无法确定：合约参数缺失或单位不匹配"
+            f"（{sizing.get('risk_source') or sizing.get('mode')}），本次不加仓"
+        )
     reason = f"趋势延续：价格较最远入场再延伸{step:g}倍ATR，加仓第{len(request.positions) + 1}笔"
     # The added unit carries the basket's new unified stop, and every existing
     # unit is moved onto that same level in the same response.  A unit that is
@@ -869,7 +906,7 @@ def _maybe_add(request: PositionEvaluateRequest, config: dict[str, Any], atr: fl
                   "unified_stop": stop_loss,
                   "batch_actions": batch_actions,
                   },
-    )
+    ), ""
 
 
 def _positive_int(value: Any, default: int) -> int:
