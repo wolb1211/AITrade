@@ -332,10 +332,10 @@ class TurtleTrendStrategy:
                 "allow_add": True,
                 "reason": reason or "AI 判断应当提前锁定利润",
                 "analysis": ai_analysis,
-                "note": f"止盈离场（AI 风险等级：{_cn_risk_level(risk_level)}）：{reason}",
+                "note": f"止盈离场{_risk_level_note(risk_level)}：{reason}",
             }, result.usage
         if add_allowed:
-            note = f"AI 风险评估通过（风险{_cn_risk_level(risk_level)}）"
+            note = f"AI 风险评估通过{_risk_level_note(risk_level)}"
             note = f"{note}：{reason}" if reason else note
             return {
                 "close": False,
@@ -350,12 +350,12 @@ class TurtleTrendStrategy:
                 "allow_add": False,
                 "reason": reason or "AI 判定当前风险偏高",
                 "analysis": ai_analysis,
-                "note": f"AI 判定风险{_cn_risk_level(risk_level)}，暂不加仓：{reason}" + guard_note,
+                "note": f"AI 判定暂不加仓{_risk_level_note(risk_level)}：{reason}" + guard_note,
             }, result.usage
         # Same leniency rule as the entry gate: a mild "no" must not veto an
         # add-on the deterministic rules already qualified.
         note = (
-            f"AI 提示谨慎（{_cn_risk_level(risk_level)}）但未判定高风险，按策略规则加仓"
+            f"AI 提示谨慎{_risk_level_note(risk_level)}但未判定高风险，按策略规则加仓"
             + (f"：{reason}" if reason else "")
         )
         return {
@@ -993,11 +993,10 @@ def _open_risk_outcome(result: Any) -> tuple[bool, str, Any] | None:
             break
 
     if approval is True:
-        note = f"AI 风险评估通过（风险{_cn_risk_level(risk_level)}）"
+        note = f"AI 风险评估通过{_risk_level_note(risk_level)}"
         return True, (f"{note}：{ai_text}" if ai_text else note), result.usage
     if approval is False:
-        level = _cn_risk_level(risk_level) if _ai_risk_is_known(risk_level) else "未分级"
-        note = f"AI 判定风险{level}，本次不开仓"
+        note = f"AI 判定不宜开仓{_risk_level_note(risk_level)}，本次不开仓"
         return False, (f"{note}：{ai_text}" if ai_text else note), result.usage
     if _ai_risk_is_high(risk_level):
         return False, (ai_text or "AI 判定当前风险偏高"), result.usage
@@ -1035,6 +1034,17 @@ def _ai_risk_is_high(risk_level: str) -> bool:
 def _cn_direction(direction: str) -> str:
     """Business wording for a direction, never the internal field value."""
     return "做多" if str(direction or "").strip().lower() in {"buy", "bullish", "long"} else "做空"
+
+
+def _risk_level_note(risk_level: str) -> str:
+    """Render a risk level only when the model actually supplied one.
+
+    The models in use follow the generic prompt shape, which carries no
+    risk_level, so every panel used to read "风险未分级" - accurate, but it reads
+    like a fault the operator cannot act on. The approval flag is the meaningful
+    signal, so the level is shown only when it exists.
+    """
+    return f"（风险{_cn_risk_level(risk_level)}）" if _ai_risk_is_known(risk_level) else ""
 
 
 def _cn_risk_level(risk_level: str) -> str:

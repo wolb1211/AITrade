@@ -1051,6 +1051,24 @@ def test_a_generic_should_open_verdict_is_understood() -> None:
     assert "本次不开仓" in blocked.reason
 
 
+def test_the_panel_omits_a_risk_level_that_never_arrived() -> None:
+    """A model following the generic shape never sends risk_level.
+
+    Every entry then read "风险未分级", which looks like a fault the operator
+    cannot act on. The approval is the signal that matters, so the level is only
+    mentioned when the model actually supplied one.
+    """
+    without_level = _gate_decision({"should_open": True, "analysis": "风险可控"})
+    assert without_level.action in {"BUY", "SELL"}
+    assert "风险评估通过" in without_level.reason
+    assert "未分级" not in without_level.reason
+
+    with_level = _gate_decision(
+        {"should_open": True, "risk_level": "low", "analysis": "风险可控"}
+    )
+    assert "（风险正常）" in with_level.reason
+
+
 def test_a_verdict_missing_every_signal_is_asked_again() -> None:
     """Only a reply with no flag and no level is treated as unreadable."""
     gate = _FormatFixedOnRetry({"should_open": True, "analysis": "风险可控"})
