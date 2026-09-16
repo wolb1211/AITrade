@@ -1136,7 +1136,6 @@ class AiDecisionClient:
                 max_tokens=_max_tokens_for_endpoint(endpoint),
                 strict_json=bool(model.get("strict_json", True)),
                 user_image_url=user_image_url,
-                response_schema=response_schema,
             )
             elapsed_ms = max(1, round((perf_counter() - call_started) * 1000))
             parsed = json.loads(raw_response)
