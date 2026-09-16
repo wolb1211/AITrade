@@ -1518,6 +1518,18 @@ class AiDecisionClient:
             compatible_body = dict(body)
             compatible_body.pop("response_format", None)
             attempts.append(compatible_body)
+        # Some models pin temperature to their own default and reject an explicit
+        # 0 outright, which fails the whole call even though the rest of the
+        # request is fine. The image path below already drops the field, so on
+        # such a model images succeeded while text did not; only the text ladder
+        # needs this variant, and keeping it out of the vision ladder leaves that
+        # sequence unchanged.
+        if not user_image_url:
+            for variant in list(attempts):
+                if "temperature" in variant:
+                    without_temperature = dict(variant)
+                    without_temperature.pop("temperature", None)
+                    attempts.append(without_temperature)
         if user_image_url:
             vision_compatible_body = dict(attempts[-1])
             vision_compatible_body.pop("temperature", None)

@@ -149,6 +149,62 @@ def test_vision_parameter_rejection_retries_new_and_minimal_parameters(tmp_path:
     assert "max_completion_tokens" not in request_bodies[2]
 
 
+def test_a_model_that_rejects_temperature_is_retried_without_it(tmp_path: Path, monkeypatch) -> None:
+    """A gateway fronting gpt-6-astra returned 400 for temperature 0.
+
+    Image calls already dropped the field, so the image test passed on that
+    model while the connection test and every text call failed; the text ladder
+    now drops it too instead of losing the endpoint.
+    """
+    store = SqliteStore(tmp_path / "temperature-fallback.db")
+    store.initialize()
+    client = AiDecisionClient(store)
+    request_bodies = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{\\"status\\":\\"ok\\"}"}}]}'
+
+    def fake_urlopen(req: request.Request, timeout: float):
+        body = json.loads((req.data or b"{}").decode("utf-8"))
+        request_bodies.append(body)
+        if "temperature" in body:
+            raise error.HTTPError(
+                req.full_url,
+                400,
+                "unsupported value",
+                hdrs=None,
+                fp=BytesIO(
+                    b'{"error":{"message":"Unsupported value: temperature does not support 0 '
+                    b'with this model. Only the default (1) value is supported.",'
+                    b'"type":"invalid_request_error","param":"temperature",'
+                    b'"code":"unsupported_value"}}'
+                ),
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(request, "urlopen", fake_urlopen)
+    result = client.test_configuration(
+        base_url="https://api.b.ai/v1",
+        api_key="sk-temperature-fallback",
+        model="gpt-6-astra",
+        strict_json=True,
+    )
+
+    assert result["success"] is True
+    assert request_bodies[0]["temperature"] == 0
+    # The temperature-free variant keeps the json response format it was derived
+    # from, so a model that only objects to temperature keeps strict json.
+    assert "temperature" not in request_bodies[2]
+    assert request_bodies[2]["response_format"] == {"type": "json_object"}
+
+
 def test_ai_endpoint_connection_test_does_not_create_billing_log(tmp_path: Path, monkeypatch) -> None:
     store = SqliteStore(tmp_path / "endpoint-connection-test.db")
     store.initialize()
