@@ -378,6 +378,12 @@ def test_future_dated_deal_still_shows_in_the_order_list(tmp_path: Path) -> None
     assert [row["order_id"] for row in result["list"]] == ["future-1"]
     # The list total and the PnL summary must agree on the same deal.
     assert result["summary"]["pnl"] == pytest.approx(74428.2)
+    # The chart point is labelled as stored, not shifted into the viewer's
+    # timezone, so it matches the order row beside it.
+    assert result["curve_granularity"] == "order"
+    assert result["curve"][0]["time"] == datetime.fromtimestamp(
+        broker_close, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def test_user_can_pause_resume_and_soft_delete_own_strategy(tmp_path: Path) -> None:

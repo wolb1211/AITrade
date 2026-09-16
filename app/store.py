@@ -5164,11 +5164,16 @@ class SqliteStore:
 
         curve = []
         cumulative = 0.0
+        # A per-order point carries a real deal timestamp, i.e. the broker's
+        # server clock: label it exactly as stored so the chart agrees with the
+        # order table beside it. Bucketed points are Asia/Shanghai boundaries, so
+        # they keep the local rendering that matches how they were cut.
+        curve_timezone = timezone.utc if curve_granularity == "order" else LOCAL_TIMEZONE
         for row in curve_rows:
             change = float(row["change_amount"] or 0)
             cumulative = round(cumulative + change, 2)
             curve.append({
-                "time": datetime.fromtimestamp(int(row["close_timestamp"]), LOCAL_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+                "time": datetime.fromtimestamp(int(row["close_timestamp"]), curve_timezone).strftime("%Y-%m-%d %H:%M:%S"),
                 "change": round(change, 2),
                 "pnl": cumulative,
             })
