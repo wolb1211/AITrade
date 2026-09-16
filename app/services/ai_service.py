@@ -972,6 +972,7 @@ class AiDecisionClient:
                     "reason": "short Chinese reason",
                 },
             },
+            response_schema=_TURTLE_POSITION_REVIEW_SCHEMA,
         )
 
     def turtle_open_risk_decision(
@@ -1018,6 +1019,7 @@ class AiDecisionClient:
             endpoint="open",
             system_prompt=_turtle_open_risk_system_prompt(),
             user_payload=payload,
+            response_schema=_TURTLE_OPEN_RISK_SCHEMA,
         )
 
     def _chat_json(
@@ -1028,6 +1030,7 @@ class AiDecisionClient:
         system_prompt: str,
         user_payload: dict[str, Any],
         user_image_url: str = "",
+        response_schema: str = "",
     ) -> AiCallResult | None:
         model = self._select_model(deployment, endpoint)
         if model is None:
@@ -1042,6 +1045,7 @@ class AiDecisionClient:
                 user_payload=user_payload,
                 model=model,
                 user_image_url=user_image_url,
+                response_schema=response_schema,
             )
 
         cache_key = self._cache_key(
@@ -1097,6 +1101,7 @@ class AiDecisionClient:
         user_image_url: str = "",
         cache_key: str = "",
         cache_ttl_seconds: int = 120,
+        response_schema: str = "",
     ) -> AiCallResult:
 
         provider_id = str(model["provider_id"])
@@ -1107,6 +1112,7 @@ class AiDecisionClient:
             endpoint,
             system_prompt,
             literal_user_rules=_uses_literal_user_rules(deployment),
+            schema_override=response_schema,
         )
         request_snapshot = _format_request_snapshot(
             model=model,
@@ -1130,6 +1136,7 @@ class AiDecisionClient:
                 max_tokens=_max_tokens_for_endpoint(endpoint),
                 strict_json=bool(model.get("strict_json", True)),
                 user_image_url=user_image_url,
+                response_schema=response_schema,
             )
             elapsed_ms = max(1, round((perf_counter() - call_started) * 1000))
             parsed = json.loads(raw_response)
@@ -1787,6 +1794,20 @@ def _turtle_position_review_prompt() -> str:
         "reason (short Chinese text). "
         f"{_PLAIN_CHINESE_RULE}"
     )
+
+
+# The shapes the GL strategy actually reads. The generic per-endpoint shape in
+# _json_api_system_prompt does not contain these keys, and the model follows the
+# system prompt rather than the payload hint, so without these the strategy read
+# defaults on every call.
+_TURTLE_OPEN_RISK_SCHEMA = (
+    '{"allow_open":false,"risk_level":"low|medium|high",'
+    '"reason":"short Chinese reason","analysis":"concise Chinese conclusion"}'
+)
+_TURTLE_POSITION_REVIEW_SCHEMA = (
+    '{"close_now":false,"allow_add":true,"risk_level":"low|medium|high",'
+    '"reason":"short Chinese reason","analysis":"concise Chinese conclusion"}'
+)
 
 
 def _turtle_open_risk_system_prompt() -> str:
@@ -3230,6 +3251,7 @@ def _json_api_system_prompt(
     task_prompt: str,
     *,
     literal_user_rules: bool = False,
+    schema_override: str = "",
 ) -> str:
     if endpoint.startswith("workflow_"):
         return (
@@ -3265,6 +3287,13 @@ def _json_api_system_prompt(
         '"lot":null,"close_scope":null,"volume":null,"sl":null,"tp":null,'
         '"reason":"short Chinese reason","analysis":"concise Chinese conclusion"}'
     )
+    # A caller may read keys the generic shape does not contain. The model follows
+    # this system prompt, not the payload hint, so a mismatch leaves the strategy
+    # reading defaults without any error: the GL entry gate asked for allow_open
+    # and risk_level while this shape demanded should_open, so every entry looked
+    # unreadable. Callers that care pass their own shape.
+    if schema_override:
+        schema = schema_override
     if literal_user_rules:
         return (
             "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
