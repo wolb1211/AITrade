@@ -563,7 +563,7 @@ def test_open_ai_cautious_verdict_is_reported_on_the_panel() -> None:
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
 
     assert decision.action == "BUY"
-    assert "AI 提示谨慎（中等）" in decision.reason
+    assert "AI 持保留意见（风险中等）" in decision.reason
     assert "上影线偏长" in decision.reason
 
 
@@ -587,7 +587,7 @@ def test_open_ai_mild_rejection_is_overridden() -> None:
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
 
     assert decision.action == "BUY"
-    assert "未判定高风险" in decision.metadata["ai_risk"]
+    assert "未达到否决标准" in decision.metadata["ai_risk"]
 
 
 def test_open_ai_text_false_is_not_treated_as_approval() -> None:
@@ -599,7 +599,7 @@ def test_open_ai_text_false_is_not_treated_as_approval() -> None:
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
 
     assert decision.action == "BUY"
-    assert "未判定高风险" in decision.metadata["ai_risk"]
+    assert "未达到否决标准" in decision.metadata["ai_risk"]
 
 
 def test_open_ai_failure_still_opens() -> None:
@@ -1001,4 +1001,52 @@ def test_config_contract_size_can_no_longer_size_an_order() -> None:
     assert lot == 0.0
     assert sizing["risk_source"] == "none"
     assert sizing["risk_per_lot"] == 0.0
+
+
+def _gate_decision(content: dict[str, Any]) -> Any:
+    client = _FakeRiskGate(open_content=content)
+    return TurtleTrendStrategy(client).evaluate_open(_breakout_request(), {"config": {}})
+
+
+def test_unreadable_risk_level_does_not_open() -> None:
+    """A malformed verdict must not be read as "not high".
+
+    A live case warned in prose about exhaustion and a false breakout while the
+    level came back unclassifiable, and the entry went through because only an
+    explicit high level vetoes. Refusing is the safe reading of a broken answer.
+    """
+    decision = _gate_decision({
+        "allow_open": False,
+        "reason": "超卖反抽，动能不持续",
+        "analysis": "上涨末端承压，超卖反抽，面临假突破与浮亏扩大压力",
+    })
+
+    assert decision.action == "HOLD"
+    assert "风险等级无法识别" in decision.reason
+
+
+def test_cautious_verdict_still_opens_and_explains_the_gate() -> None:
+    """A deliberate low/medium answer keeps the original lenient behaviour.
+
+    "The AI warned yet it still opened" is the question customers ask, so the
+    panel has to state the rule instead of only reporting the verdict.
+    """
+    decision = _gate_decision({
+        "allow_open": False,
+        "risk_level": "medium",
+        "reason": "结构一般",
+        "analysis": "趋势尚可但不够理想",
+    })
+
+    assert decision.action in {"BUY", "SELL"}
+    assert "AI 仅在判定高风险时才阻止开仓" in decision.reason
+
+
+def test_risk_gate_prompt_requires_a_consistent_answer() -> None:
+    from app.services.ai_service import _turtle_open_risk_system_prompt
+
+    prompt = _turtle_open_risk_system_prompt()
+    assert "Your level and your analysis must agree" in prompt
+    assert "must never be omitted" in prompt
+    assert "risk_level high" in prompt
 

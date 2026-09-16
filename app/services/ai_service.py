@@ -1779,6 +1779,14 @@ def _turtle_open_risk_system_prompt() -> str:
         "entry, an extreme volatility spike, or a violent opposite reaction on the latest bars. "
         "Do not use medium or high merely because the trend is unclear, the setup is imperfect, or you would have picked a "
         "different entry. Never propose a different direction, price, stop or volume. "
+        # The gate lets an entry through when the model answers "not high", so a
+        # verdict that warns in prose while reporting a low level silently opens
+        # the trade. Require the two halves of the answer to agree.
+        "Your level and your analysis must agree. If your analysis concludes that this entry does not meet the strategy's "
+        "requirements - an exhausted or overextended move, a failed or false breakout, a poor risk-reward, or no momentum "
+        "follow-through - you must answer allow_open false and risk_level high. Never describe such a danger while "
+        "answering low or medium. "
+        "risk_level must be exactly one of low, medium or high and must never be omitted. "
         "Required keys: allow_open (boolean), risk_level (low|medium|high), reason (short Chinese text). "
         f"{_PLAIN_CHINESE_RULE}"
     )

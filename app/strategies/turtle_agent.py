@@ -396,11 +396,26 @@ class TurtleTrendStrategy:
             return True, f"{note}：{ai_text}" if ai_text else note, result.usage
         if _ai_risk_is_high(risk_level):
             return False, ai_text or "AI 判定当前风险偏高", result.usage
-        # Lenient by design: a mild "no" from the model must not veto an entry
-        # the deterministic rules already qualified.
+        if not _ai_risk_is_known(risk_level):
+            # The gate only lets an entry through when the model deliberately
+            # answered "not high". An unreadable level is not that answer - it is
+            # a malformed verdict, and a live example had the analysis warn about
+            # exhaustion and a false breakout while the level came back
+            # unclassifiable, so the order was placed anyway. Refuse instead;
+            # the panel says why, and the raw value travels in the metadata.
+            return (
+                False,
+                f"AI 风险等级无法识别（{risk_level or '缺失'}），为确保安全本次不开仓"
+                + (f"：{ai_text}" if ai_text else ""),
+                result.usage,
+            )
+        # Lenient by design: a mild "no" from the model must not veto an entry the
+        # deterministic rules already qualified, and the panel says so, because
+        # "the AI warned yet it still opened" is the question customers ask.
         return (
             True,
-            f"AI 提示谨慎（{_cn_risk_level(risk_level)}）但未判定高风险，按策略规则开仓"
+            f"AI 持保留意见（风险{_cn_risk_level(risk_level)}），未达到否决标准，"
+            "按策略规则开仓（AI 仅在判定高风险时才阻止开仓）"
             + (f"：{ai_text}" if ai_text else ""),
             result.usage,
         )
@@ -939,6 +954,17 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on", "approve", "approved"}
+
+
+def _ai_risk_is_known(risk_level: str) -> bool:
+    """Whether the model answered the risk level the prompt asks for.
+
+    The prompt requires exactly low, medium or high. Anything else is a malformed
+    verdict and must not be read as "not high", which would quietly open the
+    trade the model was warning about.
+    """
+    text = str(risk_level or "").strip().lower()
+    return any(marker in text for marker in ("high", "medium", "low", "高", "中", "低"))
 
 
 def _ai_risk_is_high(risk_level: str) -> bool:
