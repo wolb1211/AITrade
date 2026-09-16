@@ -556,8 +556,9 @@ def test_open_ai_approval_keeps_the_order() -> None:
 
 
 def test_open_ai_cautious_verdict_is_reported_on_the_panel() -> None:
+    """A level without an explicit no keeps the lenient wording."""
     gate = _FakeRiskGate(
-        open_content={"allow_open": False, "risk_level": "medium", "reason": "上影线偏长"}
+        open_content={"risk_level": "medium", "reason": "上影线偏长"}
     )
 
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
@@ -578,28 +579,33 @@ def test_open_ai_high_risk_veto_blocks_the_order() -> None:
     assert "过度延伸" in decision.reason
 
 
-def test_open_ai_mild_rejection_is_overridden() -> None:
-    """A model 'no' that is not high risk must not veto a qualified entry."""
+def test_open_ai_explicit_rejection_blocks_the_entry() -> None:
+    """A model that answers no is obeyed, whatever level it reports.
+
+    Only a high level used to veto, so an answer that objected while rating the
+    risk lower still opened - the combination customers asked about. A level on
+    its own, with no approval flag, keeps the lenient wording instead.
+    """
     gate = _FakeRiskGate(
         open_content={"allow_open": False, "risk_level": "medium", "reason": "趋势不明"}
     )
 
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
 
-    assert decision.action == "BUY"
-    assert "未达到否决标准" in decision.metadata["ai_risk"]
+    assert decision.action == "HOLD"
+    assert "本次不开仓" in decision.reason
 
 
 def test_open_ai_text_false_is_not_treated_as_approval() -> None:
-    """The string "false" must not pass the gate as an approval."""
+    """The string "false" must be read as a no, not as an approval."""
     gate = _FakeRiskGate(
         open_content={"allow_open": "false", "risk_level": "low", "reason": "文本布尔"}
     )
 
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
 
-    assert decision.action == "BUY"
-    assert "未达到否决标准" in decision.metadata["ai_risk"]
+    assert decision.action == "HOLD"
+    assert "本次不开仓" in decision.reason
 
 
 def test_open_ai_failure_still_opens() -> None:
@@ -1009,20 +1015,53 @@ def _gate_decision(content: dict[str, Any]) -> Any:
 
 
 def test_unreadable_risk_level_does_not_open() -> None:
-    """A malformed verdict must not be read as "not high".
+    """An answer with no verdict at all must not be read as "not high".
 
-    A live case warned in prose about exhaustion and a false breakout while the
-    level came back unclassifiable, and the entry went through because only an
-    explicit high level vetoes. Refusing is the safe reading of a broken answer.
+    A live case warned in prose about exhaustion and a false breakout while no
+    approval flag or level came back, and the entry went through because only an
+    explicit high level vetoed. Refusing is the safe reading of a broken answer.
     """
     decision = _gate_decision({
-        "allow_open": False,
         "reason": "超卖反抽，动能不持续",
         "analysis": "上涨末端承压，超卖反抽，面临假突破与浮亏扩大压力",
     })
 
     assert decision.action == "HOLD"
     assert "风险等级无法识别" in decision.reason
+
+
+def test_a_generic_should_open_verdict_is_understood() -> None:
+    """The model answers should_open; reading only allow_open lost every verdict.
+
+    Production: the generic prompt shape asks for should_open, so allow_open was
+    never present and the gate read defaults on every call.
+    """
+    approved = _gate_decision({"should_open": True, "analysis": "风险可控"})
+    assert approved.action in {"BUY", "SELL"}
+    assert "风险评估通过" in approved.reason
+
+    refused = _gate_decision({"should_open": False, "analysis": "动能衰竭，假突破"})
+    assert refused.action == "HOLD"
+    assert "本次不开仓" in refused.reason
+
+    # An explicit no blocks even when the model rates the risk lower: that is the
+    # combination customers complained about, "it warned yet it still opened".
+    blocked = _gate_decision({"allow_open": False, "risk_level": "medium", "analysis": "动能转弱"})
+    assert blocked.action == "HOLD"
+    assert "本次不开仓" in blocked.reason
+
+
+def test_a_verdict_missing_every_signal_is_asked_again() -> None:
+    """Only a reply with no flag and no level is treated as unreadable."""
+    gate = _FormatFixedOnRetry({"should_open": True, "analysis": "风险可控"})
+
+    decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
+
+    assert decision.action == "BUY"
+    assert gate.open_calls == 2
+    assert "correction" in gate.open_kwargs[1]
+    assert "correction" not in gate.open_kwargs[0]
+    assert "AI 风险评估通过" in decision.reason
 
 
 def test_cautious_verdict_still_opens_and_explains_the_gate() -> None:
@@ -1032,7 +1071,6 @@ def test_cautious_verdict_still_opens_and_explains_the_gate() -> None:
     panel has to state the rule instead of only reporting the verdict.
     """
     decision = _gate_decision({
-        "allow_open": False,
         "risk_level": "medium",
         "reason": "结构一般",
         "analysis": "趋势尚可但不够理想",
@@ -1055,7 +1093,7 @@ class _FormatFixedOnRetry(_FakeRiskGate):
     """First answer ignores the contract, the corrective retry follows it."""
 
     def __init__(self, second_content: dict[str, Any]) -> None:
-        super().__init__(open_content={"allow_open": False, "reason": "缺少等级"})
+        super().__init__(open_content={"reason": "只有理由，没有任何判定字段"})
         self.second_content = second_content
         self.open_kwargs: list[dict[str, Any]] = []
 
@@ -1066,29 +1104,9 @@ class _FormatFixedOnRetry(_FakeRiskGate):
         return AiCallResult(content=content, usage=UsageSummary(ai_called=True))
 
 
-def test_a_malformed_verdict_is_asked_again_before_refusing() -> None:
-    """The missing-level case must not silently block a sound setup.
-
-    A live entry was refused with "risk level unreadable" while its own analysis
-    called the setup sound. The answer ignored the output contract, so the gate
-    asks once more with the contract spelled out instead of blocking the trade.
-    """
-    gate = _FormatFixedOnRetry(
-        {"allow_open": True, "risk_level": "low", "analysis": "风险可控"}
-    )
-
-    decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
-
-    assert decision.action == "BUY"
-    assert gate.open_calls == 2
-    assert "correction" in gate.open_kwargs[1]
-    assert "correction" not in gate.open_kwargs[0]
-    assert "AI 风险评估通过" in decision.reason
-
-
 def test_a_verdict_that_stays_malformed_after_the_retry_is_refused() -> None:
     """Asking again is a second chance, not a way to open regardless."""
-    gate = _FakeRiskGate(open_content={"allow_open": False, "reason": "缺少等级"})
+    gate = _FakeRiskGate(open_content={"reason": "只有理由，没有任何判定字段"})
 
     decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
 

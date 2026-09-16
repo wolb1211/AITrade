@@ -313,7 +313,12 @@ class TurtleTrendStrategy:
         reason = str(result.content.get("reason") or "").strip()
         ai_analysis = str(result.content.get("analysis") or "").strip()
         risk_level = str(result.content.get("risk_level") or "").strip().lower()
-        close_requested = _truthy(result.content.get("close_now"))
+        # The generic prompt shape asks for an "action" while this review reads
+        # close_now and allow_add, so the same field is accepted under both
+        # spellings; otherwise the review silently read defaults on every call.
+        action = str(result.content.get("action") or "").strip().lower()
+        close_requested = _truthy(result.content.get("close_now")) or action == "close"
+        add_allowed = _truthy(result.content.get("allow_add")) or action == "add"
         fresh_guard = _too_fresh_to_close(candles, request)
         # Recorded on every branch so a suppressed proactive exit stays visible.
         guard_note = (
@@ -329,7 +334,7 @@ class TurtleTrendStrategy:
                 "analysis": ai_analysis,
                 "note": f"止盈离场（AI 风险等级：{_cn_risk_level(risk_level)}）：{reason}",
             }, result.usage
-        if _truthy(result.content.get("allow_add")):
+        if add_allowed:
             note = f"AI 风险评估通过（风险{_cn_risk_level(risk_level)}）"
             note = f"{note}：{reason}" if reason else note
             return {
@@ -957,13 +962,22 @@ _OPEN_RISK_FORMAT_REMINDER = (
 )
 
 
-def _open_risk_outcome(result: Any) -> tuple[bool, str, Any] | None:
-    """Read an entry-risk verdict, or None when the answer ignored the contract.
+_APPROVAL_KEYS = ("allow_open", "should_open", "approved", "approve")
 
-    Only an explicit answer is read: either the model approved, or it reported a
-    level the gate understands. A reply carrying neither cannot be told apart
-    from a field the model silently dropped, so the caller asks again before
-    deciding either way.
+
+def _open_risk_outcome(result: Any) -> tuple[bool, str, Any] | None:
+    """Read an entry-risk verdict, or None when the answer carries nothing usable.
+
+    The approval flag is read from whichever key the model used. The generic
+    prompt shape asks for should_open while this gate was written against
+    allow_open, and the model follows its habit, so reading only one spelling
+    made every verdict look unreadable - entries then opened regardless or were
+    all refused, depending on how the unreadable case was treated.
+
+    A flag that is present decides the entry: true approves, false vetoes. The
+    risk level only decorates the wording, so a model that omits it can still
+    approve. That is what makes "the analysis warned about risk yet it opened"
+    impossible when the model actually answers false.
     """
     content = result.content if isinstance(result.content, dict) else {}
     risk_level = str(content.get("risk_level") or "").strip().lower()
@@ -971,9 +985,20 @@ def _open_risk_outcome(result: Any) -> tuple[bool, str, Any] | None:
     # The full analysis is what the panel should show; the one-line reason is only
     # the fallback for callers that do not return one.
     ai_text = str(content.get("analysis") or "").strip() or reason
-    if _truthy(content.get("allow_open")):
+
+    approval: bool | None = None
+    for key in _APPROVAL_KEYS:
+        if key in content and content.get(key) not in (None, ""):
+            approval = _truthy(content.get(key))
+            break
+
+    if approval is True:
         note = f"AI 风险评估通过（风险{_cn_risk_level(risk_level)}）"
         return True, (f"{note}：{ai_text}" if ai_text else note), result.usage
+    if approval is False:
+        level = _cn_risk_level(risk_level) if _ai_risk_is_known(risk_level) else "未分级"
+        note = f"AI 判定风险{level}，本次不开仓"
+        return False, (f"{note}：{ai_text}" if ai_text else note), result.usage
     if _ai_risk_is_high(risk_level):
         return False, (ai_text or "AI 判定当前风险偏高"), result.usage
     if _ai_risk_is_known(risk_level):
