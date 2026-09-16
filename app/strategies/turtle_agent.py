@@ -574,10 +574,12 @@ def _bearish_confirmation_event(candles, window: int) -> tuple[int, str] | None:
     return None
 
 
-# How far two figures that must describe the same quantity may disagree before
-# the symbol info is treated as unusable. They should be identical when the
-# payload is consistent, so only a unit mix-up opens a spread this wide.
-MAX_SYMBOL_INFO_SPREAD = 5.0
+# How far the two account-currency per-lot risk figures may disagree before the
+# sizing records it. They describe the same quantity, but a broker quoting in
+# another currency or an EA deriving one value from the contract size makes them
+# diverge by the conversion factor, so this flags the payload for inspection
+# rather than blocking it.
+NOTABLE_SYMBOL_INFO_SPREAD = 5.0
 
 
 def _unit_lot(
@@ -607,10 +609,11 @@ def _unit_lot(
     else:
         risk_money = float(config.get("risk_amount") or 0)
     price_risk = abs(float(entry) - float(stop_loss))
-    risk_per_lot, risk_source = _risk_per_lot(price_risk, info)
+    risk_per_lot, risk_source, risk_spread = _risk_per_lot(price_risk, info)
     # Record how the figure was derived: a wrong per-lot risk once sized a 46-lot
     # order and finding out why took a second production round trip, so the
-    # branch and its inputs travel with the decision.
+    # branch, its inputs and the disagreement between branches travel with the
+    # decision.
     sizing: dict[str, Any] = {
         "mode": "risk",
         "risk_money": risk_money,
@@ -618,6 +621,8 @@ def _unit_lot(
         "risk_source": risk_source,
         "price_risk": price_risk,
     }
+    if risk_spread > NOTABLE_SYMBOL_INFO_SPREAD:
+        sizing["risk_spread"] = round(risk_spread, 4)
     if risk_money <= 0 or risk_per_lot <= 0:
         return 0.0, sizing
     raw = risk_money / risk_per_lot
@@ -629,12 +634,14 @@ def _unit_lot(
     return lot, sizing
 
 
-def _risk_per_lot(price_risk: float, info: dict[str, Any]) -> tuple[float, str]:
+def _risk_per_lot(price_risk: float, info: dict[str, Any]) -> tuple[float, str, float]:
     """Money risked per 1.0 lot when the price moves ``price_risk``.
 
-    Returns the figure together with the branch that produced it, so a wrong one
-    can be traced back to its field from the stored decision instead of needing
-    another production round trip.
+    Returns the figure, the branch that produced it, and how far the two
+    account-currency figures disagree (1.0 when only one is available). A wide
+    spread is recorded rather than refused: a broker quoting in another currency,
+    or an EA deriving one value from the contract size, diverges legitimately,
+    and refusing would stop a healthy client from trading.
 
     Several symbol-info fields describe the same quantity and a partial payload
     used to fall through to whichever branch matched first: a deployment whose
@@ -669,27 +676,36 @@ def _risk_per_lot(price_risk: float, info: dict[str, Any]) -> tuple[float, str]:
     price_figure = price_risk * value_per_price if value_per_price else 0.0
     point_figure = price_risk / point * value_per_point if (point and value_per_point) else 0.0
 
-    # tick_value / tick_size and value_per_price describe the same quantity by
-    # definition, so they must agree; a wide spread means the payload mixes units
-    # and sizing from either would scale the position by the same factor. Only
-    # these two are compared - a client that labels point values differently
-    # would make the third figure diverge legitimately.
+    # tick_value / tick_size and value_per_price describe the same quantity when
+    # the client reports them consistently, but they may legitimately diverge: a
+    # broker quoting in another currency, or an EA deriving one of them from the
+    # contract size rather than the tick value, differs by the conversion factor.
+    # A disagreement is therefore recorded rather than treated as an error, and
+    # the largest usable figure wins - a bigger per-lot risk means a smaller
+    # position, so a branch that is wrong can only under-size the order, never
+    # scale it up. The spread is reported so a genuinely mixed-up payload stays
+    # visible instead of silently trading at the wrong size.
+    spread = 1.0
     if tick_figure and price_figure:
-        if max(tick_figure, price_figure) > min(tick_figure, price_figure) * MAX_SYMBOL_INFO_SPREAD:
-            return 0.0, "inconsistent_symbol_info"
+        spread = max(tick_figure, price_figure) / min(tick_figure, price_figure)
 
-    for value, source in (
-        (tick_figure, "tick_size"),
-        (price_figure, "value_per_price"),
-        (point_figure, "point"),
-    ):
-        if value >= price_risk:
-            return value, source
+    usable = [
+        (value, source)
+        for value, source in (
+            (tick_figure, "tick_size"),
+            (price_figure, "value_per_price"),
+            (point_figure, "point"),
+        )
+        if value >= price_risk
+    ]
+    if usable:
+        value, source = max(usable, key=lambda item: item[0])
+        return value, source, spread
     # Only the raw unit count is left. It describes the underlying rather than an
     # amount of money, so it is a last resort and still has to clear the floor.
     if contract >= 1:
-        return price_risk * contract, "contract_size"
-    return 0.0, "none"
+        return price_risk * contract, "contract_size", spread
+    return 0.0, "none", spread
 
 
 def _positive_float(value: Any = None, *keys: str, default: float = 0.0) -> float:

@@ -863,12 +863,12 @@ def test_risk_per_lot_skips_a_branch_that_cannot_be_right() -> None:
     broken_tick = {"tick_size": 0.01, "tick_value": 0.0015, "contract_size": 100}
 
     # The broken tick figure is ignored and the contract size carries the sizing.
-    value, source = turtle_agent._risk_per_lot(price_risk, broken_tick)
+    value, source, _spread = turtle_agent._risk_per_lot(price_risk, broken_tick)
     assert value == pytest.approx(1438.0)
     assert source == "contract_size"
     # A healthy payload still uses the tick branch, unchanged.
     healthy = {"tick_size": 0.01, "tick_value": 1.0, "contract_size": 100}
-    value, source = turtle_agent._risk_per_lot(price_risk, healthy)
+    value, source, _spread = turtle_agent._risk_per_lot(price_risk, healthy)
     assert value == pytest.approx(1438.0)
     assert source == "tick_size"
     # Nothing usable: refuse to size rather than guess.
@@ -907,21 +907,38 @@ def test_unit_lot_stays_sane_when_the_tick_figure_is_broken() -> None:
     assert lot == pytest.approx(0.07, abs=0.005)
 
 
-def test_inconsistent_symbol_info_is_refused() -> None:
-    """Two figures that must agree do not: the payload mixes units.
+def test_a_wide_spread_between_risk_figures_is_conservative_not_fatal() -> None:
+    """Figures that disagree must not block trading; the larger one wins.
 
-    A client EA reporting a tick value ten times too small is still above the
-    price move, so it would look plausible on its own and size the order ten
-    times too large. Comparing it with value_per_price exposes the mismatch.
+    The same lot size can show tens of one currency on BTC and cents on ETH, and
+    a broker quoting in another currency or an EA deriving value_per_price from
+    the contract size makes tick_value/tick_size and value_per_price diverge by
+    the conversion factor. Refusing on that spread would stop a healthy client
+    from trading, so the larger figure is used instead: a bigger per-lot risk
+    means a smaller position, so a wrong branch can only under-size the order and
+    never blow it up. The spread is reported so a real mix-up stays visible.
     """
     price_risk = 14.38
-    mixed = {"tick_size": 0.01, "tick_value": 0.15, "value_per_price": 100}
-    assert turtle_agent._risk_per_lot(price_risk, mixed) == (0.0, "inconsistent_symbol_info")
-
-    consistent = {"tick_size": 0.01, "tick_value": 1.0, "value_per_price": 100}
-    value, source = turtle_agent._risk_per_lot(price_risk, consistent)
+    # 1438 from the tick fields against 215.7 from a value_per_price ten times small.
+    mixed = {"tick_size": 0.01, "tick_value": 1.0, "value_per_price": 15.0}
+    value, source, spread = turtle_agent._risk_per_lot(price_risk, mixed)
     assert value == pytest.approx(1438.0)
     assert source == "tick_size"
+    assert spread == pytest.approx(1438.0 / 215.7, rel=1e-3)
+
+    # A figure from another currency is far larger: it wins, and under-sizes.
+    foreign = {"tick_size": 0.01, "tick_value": 1.0, "value_per_price": 100_000.0}
+    value, source, spread = turtle_agent._risk_per_lot(price_risk, foreign)
+    assert value == pytest.approx(price_risk * 100_000.0)
+    assert source == "value_per_price"
+    assert spread > 5.0
+
+    # Agreement is the normal case and reports no spread.
+    consistent = {"tick_size": 0.01, "tick_value": 1.0, "value_per_price": 100}
+    value, source, spread = turtle_agent._risk_per_lot(price_risk, consistent)
+    assert value == pytest.approx(1438.0)
+    assert source == "tick_size"
+    assert spread == pytest.approx(1.0)
 
 
 def test_add_explains_why_the_position_size_could_not_be_computed() -> None:
