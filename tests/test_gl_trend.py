@@ -855,21 +855,25 @@ def test_analysis_is_not_duplicated_when_the_reason_already_contains_it() -> Non
 def test_risk_per_lot_skips_a_branch_that_cannot_be_right() -> None:
     """A partial symbol_info must never size an order from a nonsense figure.
 
-    Production: a position request described XAUUSD in units the tick branch did
-    not expect, so the per-lot risk came out at about 2 instead of 1438 and the
-    add-on was sized at 46.2 lots where roughly 0.07 was intended.
+    Production: the deployment's size mode was risk, so the per-lot risk had to
+    be about 1438 for a 14.38 move, but it came out at 2.16 and the add-on was
+    sized at 46.2 lots where roughly 0.07 was intended.
     """
     price_risk = 14.38
     broken_tick = {"tick_size": 0.01, "tick_value": 0.0015, "contract_size": 100}
 
     # The broken tick figure is ignored and the contract size carries the sizing.
-    assert turtle_agent._risk_per_lot(price_risk, broken_tick, {}) == pytest.approx(1438.0)
+    value, source = turtle_agent._risk_per_lot(price_risk, broken_tick)
+    assert value == pytest.approx(1438.0)
+    assert source == "contract_size"
     # A healthy payload still uses the tick branch, unchanged.
     healthy = {"tick_size": 0.01, "tick_value": 1.0, "contract_size": 100}
-    assert turtle_agent._risk_per_lot(price_risk, healthy, {}) == pytest.approx(1438.0)
+    value, source = turtle_agent._risk_per_lot(price_risk, healthy)
+    assert value == pytest.approx(1438.0)
+    assert source == "tick_size"
     # Nothing usable: refuse to size rather than guess.
-    assert turtle_agent._risk_per_lot(price_risk, {"tick_size": 0.01, "tick_value": 0.0015}, {}) == 0.0
-    assert turtle_agent._risk_per_lot(0.0, healthy, {}) == 0.0
+    assert turtle_agent._risk_per_lot(price_risk, {"tick_size": 0.01, "tick_value": 0.0015})[0] == 0.0
+    assert turtle_agent._risk_per_lot(0.0, healthy)[0] == 0.0
 
 
 def test_unit_lot_stays_sane_when_the_tick_figure_is_broken() -> None:
@@ -898,6 +902,42 @@ def test_unit_lot_stays_sane_when_the_tick_figure_is_broken() -> None:
     )
 
     assert sizing["mode"] == "risk"
+    assert sizing["risk_source"] == "contract_size"
     assert sizing["risk_per_lot"] == pytest.approx(1438.0)
     assert lot == pytest.approx(0.07, abs=0.005)
+
+
+def test_config_contract_size_can_no_longer_size_an_order() -> None:
+    """The 40-million-lot order: the config fallback is gone.
+
+    The deployment carried contract_size = 0.1505, which _risk_per_lot used as if
+    it were an amount of money per price unit, multiplying the position size by
+    roughly 665. A contract size is a quantity of the underlying, not money, so
+    it is no longer read from the config at all.
+    """
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(symbol_info={}, balance=6_643_600.0, equity=6_643_600.0)
+
+    def size(contract_size: float) -> tuple[float, dict]:
+        config = {
+            "position_size_mode": "risk",
+            "risk_base_mode": "fixed_loss",
+            "risk_amount": 100,
+            "contract_size": contract_size,
+        }
+        return turtle_agent._unit_lot(request, config, entry=4316.05, stop_loss=4301.67)
+
+    # The production value: refused as implausible even before the fallback went.
+    lot, sizing = size(0.1505)
+    assert lot == 0.0
+    assert sizing["risk_source"] == "none"
+    assert sizing["price_risk"] == pytest.approx(14.38)
+
+    # A value large enough to look plausible must not be used either: the config
+    # is not consulted, so an empty symbol_info simply means no position size.
+    lot, sizing = size(1000.0)
+    assert lot == 0.0
+    assert sizing["risk_source"] == "none"
+    assert sizing["risk_per_lot"] == 0.0
 

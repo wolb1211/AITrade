@@ -595,54 +595,77 @@ def _unit_lot(
     else:
         risk_money = float(config.get("risk_amount") or 0)
     price_risk = abs(float(entry) - float(stop_loss))
-    risk_per_lot = _risk_per_lot(price_risk, info, config)
+    risk_per_lot, risk_source = _risk_per_lot(price_risk, info)
+    # Record how the figure was derived: a wrong per-lot risk once sized a 46-lot
+    # order and finding out why took a second production round trip, so the
+    # branch and its inputs travel with the decision.
+    sizing: dict[str, Any] = {
+        "mode": "risk",
+        "risk_money": risk_money,
+        "risk_per_lot": risk_per_lot,
+        "risk_source": risk_source,
+        "price_risk": price_risk,
+    }
     if risk_money <= 0 or risk_per_lot <= 0:
-        return 0.0, {"mode": "risk", "risk_money": risk_money, "risk_per_lot": risk_per_lot}
+        return 0.0, sizing
     raw = risk_money / risk_per_lot
     if raw < min_lot:
-        return 0.0, {"mode": "risk", "risk_money": risk_money, "risk_per_lot": risk_per_lot, "raw_lot": raw}
+        sizing["raw_lot"] = raw
+        return 0.0, sizing
     lot = _normalize_volume(raw, min_lot, max_lot, step)
-    return lot, {"mode": "risk", "risk_money": risk_money, "risk_per_lot": risk_per_lot, "unit_lot": lot}
+    sizing["unit_lot"] = lot
+    return lot, sizing
 
 
-def _risk_per_lot(price_risk: float, info: dict[str, Any], config: dict[str, Any]) -> float:
+def _risk_per_lot(price_risk: float, info: dict[str, Any]) -> tuple[float, str]:
     """Money risked per 1.0 lot when the price moves ``price_risk``.
 
-    Several symbol-info fields can describe the same quantity, and a request that
-    carried only some of them used to fall through to whichever branch matched
-    first. A position request whose tick fields were in unexpected units reported
-    a per-lot risk of about 2 where roughly 1400 was right, and the resulting
-    order was sized at 46 lots instead of 0.07.
+    Returns the figure together with the branch that produced it, so a wrong one
+    can be traced back to its field from the stored decision instead of needing
+    another production round trip.
 
-    Keep the same priority order, but only accept a figure that can be right: a
-    lot is never smaller than one contract unit, so the money risked per lot can
-    never be below the price move itself. Anything smaller means the payload
-    described the symbol in units the branch does not expect, and sizing from it
-    would scale the intended risk by the same factor. When no branch yields a
-    usable figure the strategy refuses to size the order instead of guessing.
+    Several symbol-info fields describe the same quantity and a partial payload
+    used to fall through to whichever branch matched first: a deployment whose
+    sizing came from a mis-set contract size reported a per-lot risk of about 2
+    where 1438 was right, and its add-ons were sized at 46, 5538 and 40 million
+    lots instead of roughly 0.07.
+
+    The branches keep their priority, but a figure is only accepted when it can
+    be right: a lot is never smaller than one contract unit, so the money risked
+    per lot can never be below the price move itself. Anything smaller means the
+    payload described the symbol in units that branch does not expect, and sizing
+    from it would scale the intended risk by the same factor. When no branch
+    yields a usable figure the order is not sized at all, so bad input can only
+    ever skip a trade.
+
+    Only symbol-info fields are consulted. The deployment config used to be a
+    fallback for the contract size, but a contract size is a quantity of the
+    underlying rather than an amount of money: it only behaves like one when the
+    quote currency matches the account currency, and a mis-set value silently
+    multiplied the position size.
     """
     if price_risk <= 0:
-        return 0.0
+        return 0.0, "invalid_price_risk"
     tick_size = _positive_float(info, "tick_size", "trade_tick_size", "tick", "point", "point_size")
     tick_value = _positive_float(info, "tick_value", "trade_tick_value", "tick_value_profit", "trade_tick_value_profit", "tickVal")
     value_per_price = _positive_float(info, "value_per_price", "money_per_price", "valuePerPrice")
     value_per_point = _positive_float(info, "value_per_point", "money_per_point", "valuePerPoint")
     point = _positive_float(info, "point", "point_size")
-    contract = _positive_float(info, "contract_size", "trade_contract_size", "contractSize") or _positive_float(config.get("contract_size"), default=0.0)
+    contract = _positive_float(info, "contract_size", "trade_contract_size", "contractSize")
 
-    candidates: list[float] = []
+    candidates: list[tuple[float, str]] = []
     if tick_size and tick_value:
-        candidates.append(price_risk / tick_size * tick_value)
+        candidates.append((price_risk / tick_size * tick_value, "tick_size"))
     if value_per_price:
-        candidates.append(price_risk * value_per_price)
+        candidates.append((price_risk * value_per_price, "value_per_price"))
     if point and value_per_point:
-        candidates.append(price_risk / point * value_per_point)
+        candidates.append((price_risk / point * value_per_point, "point"))
     if contract:
-        candidates.append(price_risk * contract)
-    for candidate in candidates:
+        candidates.append((price_risk * contract, "contract_size"))
+    for candidate, source in candidates:
         if candidate >= price_risk:
-            return candidate
-    return 0.0
+            return candidate, source
+    return 0.0, "none"
 
 
 def _positive_float(value: Any = None, *keys: str, default: float = 0.0) -> float:
