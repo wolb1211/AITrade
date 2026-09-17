@@ -54,6 +54,14 @@ MAX_UNITS = 4                        # this strategy never pyramids beyond this
 # unit's risk.
 DEFAULT_ADD_STEP_ATR = 1.0           # extension beyond the furthest entry allowing an add
 
+# Share of a basket's best profit it keeps before the rest is taken off. A live
+# four-unit basket peaked well in profit and gave all of it back, because nothing
+# looked at the give-back at all. 0 switches the rule off.
+DEFAULT_GIVE_BACK_RATIO = 0.5
+# The peak has to be worth protecting before the rule may fire, so ordinary early
+# noise is left alone.
+GIVE_BACK_MIN_ATR = 1.5
+
 # Proactive exit requested by the AI review.  The protective stop and the exit
 # channel stay in force regardless, so declining to close is always safe.
 PROACTIVE_EXIT_MIN_BARS = 1          # closed bars required before the AI may close early
@@ -169,9 +177,6 @@ class TurtleTrendStrategy:
                 # entry's stop, so a wider stop than the ATR rule implies is
                 # explainable from the decision alone.
                 "min_stop_distance_enforced": round(clamped, 5),
-            "min_stop_distance_used": round(
-                min_stop_distance(request.symbol_info, config, atr=atr), 5
-            ),
                 # What the server resolved from the client's symbol info and the
                 # config, so a client that reports a stops level can be told
                 # apart from one that does not without reading its payload.
@@ -240,6 +245,13 @@ class TurtleTrendStrategy:
                     members,
                     f"触发保护止损（距最远入场 {STOP_ATR:g} 倍 ATR，止损位 {stop_level:g}），全部离场",
                 )
+        # A basket that has handed back most of its best profit is taken off
+        # before anything else is considered: it must not add a unit into a
+        # pullback, and the protective levels below only ever look at how much is
+        # made, never at how much of it has been given back.
+        give_back = _give_back_decision(request, request.positions, config, atr, candles)
+        if give_back is not None:
+            return give_back
         add_decision, add_block_reason = _maybe_add(request, config, atr)
         if self.ai_client is None:
             # Adding is evaluated first. A bar that prints a new high also makes
@@ -1043,6 +1055,101 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
     )
 
 
+def _basket_stop_floor(*, positions: list[Any], side: str, config: dict[str, Any]) -> float:
+    """The lowest level the basket stop may sit at, from the deployment setting.
+
+    The unified stop is anchored at the furthest entry, which for a young basket
+    sits below where it started: with a single add-on the stop lands one ATR
+    under the first unit, so an ordinary pullback stops the whole basket at a
+    loss even though it was well in profit at the top.
+
+    ``first_entry`` (the default) keeps the stop at the earliest unit's entry so
+    the basket cannot be stopped below where it opened. ``farthest_entry`` puts it
+    at the newest unit's entry, where no unit can be stopped at a loss. ``off``
+    restores the behaviour before this existed.
+    """
+    mode = str(config.get("basket_stop_floor") or "first_entry").strip().lower()
+    if mode in {"off", "none", "0", "false", "no"}:
+        return 0.0
+
+    entries = [float(item.open_price) for item in positions if float(item.open_price or 0) > 0]
+    if not entries:
+        return 0.0
+    if mode in {"farthest", "farthest_entry", "last_entry"}:
+        return max(entries) if side == "BUY" else min(entries)
+    # first_entry: a pyramid's earliest unit is the lowest for a buy and the
+    # highest for a sell, so the extreme of the entries is that first unit.
+    return min(entries) if side == "BUY" else max(entries)
+
+
+def _give_back_decision(
+    request: PositionEvaluateRequest,
+    positions: list[Any],
+    config: dict[str, Any],
+    atr: float,
+    candles: list[Any],
+) -> TradeDecision | None:
+    """Take the basket off once it has handed back most of its best profit.
+
+    A four-unit basket peaked well in profit and then returned to nothing: the
+    protective levels only ever ask how much has been made, never how much of it
+    has been given back, so nothing acted on the way down. The peak is derived
+    from the bars since the basket opened, so no state has to be carried between
+    requests and a restart cannot lose it.
+
+    ``give_back_ratio`` is the share of the peak the basket keeps (0.5 by
+    default, 0 to switch it off). Nothing fires until the peak itself was worth
+    protecting, so ordinary early noise is left alone.
+    """
+    # An explicit 0 switches the rule off, so absent and zero are told apart
+    # rather than both falling back to the default.
+    configured = config.get("give_back_ratio")
+    if configured is None:
+        ratio = DEFAULT_GIVE_BACK_RATIO
+    else:
+        try:
+            ratio = float(configured)
+        except (TypeError, ValueError):
+            ratio = DEFAULT_GIVE_BACK_RATIO
+    if ratio <= 0 or ratio >= 1 or atr <= 0 or not positions:
+        return None
+
+    sides = {item.side for item in positions}
+    if len(sides) != 1:
+        return None
+    side = next(iter(sides))
+
+    entries = [float(item.open_price) for item in positions if float(item.open_price or 0) > 0]
+    if not entries:
+        return None
+    first_entry = min(entries) if side == "BUY" else max(entries)
+
+    price = float(request.bid) if side == "BUY" else float(request.ask)
+    current = (price - first_entry) if side == "BUY" else (first_entry - price)
+
+    opened_at = min((int(item.open_time or 0) for item in positions), default=0)
+    relevant = [bar for bar in candles if not opened_at or int(bar.timestamp) >= opened_at]
+    if relevant:
+        if side == "BUY":
+            peak = max(float(bar.high) for bar in relevant) - first_entry
+        else:
+            peak = first_entry - min(float(bar.low) for bar in relevant)
+        peak = max(peak, current)
+    else:
+        peak = current
+
+    if peak < GIVE_BACK_MIN_ATR * atr:
+        return None
+    if current > peak * ratio:
+        return None
+    return _close_basket(
+        request,
+        list(positions),
+        f"浮盈回吐保护：峰值浮盈 {peak / atr:.1f} 倍ATR，已回吐至 {current / atr:.1f} 倍ATR"
+        f"（回吐超过 {(1 - ratio) * 100:.0f}%），全部离场",
+    )
+
+
 def _maybe_add(
     request: PositionEvaluateRequest,
     config: dict[str, Any],
@@ -1072,6 +1179,12 @@ def _maybe_add(
         if request.ask > anchor - step * atr:
             return None, ""
         entry, action, stop_loss = request.bid, "SELL", request.bid + STOP_ATR * atr
+    # A young basket starts with its stop below where it opened, so the whole
+    # basket could be stopped at a loss after being well in profit. The floor
+    # names the level the stop may not go beyond.
+    floor = _basket_stop_floor(positions=request.positions, side=side, config=config)
+    if floor > 0:
+        stop_loss = max(stop_loss, floor) if side == "BUY" else min(stop_loss, floor)
     # The added unit carries the basket stop, which the broker has to accept as
     # well; sizing then uses the distance the broker will actually hold.
     stop_loss, stop_clamped = respect_min_stop(
