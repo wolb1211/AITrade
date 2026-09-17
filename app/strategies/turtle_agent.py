@@ -1169,15 +1169,20 @@ def _give_back_decision(
     current = (price - first_entry) if side == "BUY" else (first_entry - price)
 
     opened_at = min((int(item.open_time or 0) for item in positions), default=0)
-    relevant = [bar for bar in candles if not opened_at or int(bar.timestamp) >= opened_at]
-    if relevant:
-        if side == "BUY":
-            peak = max(float(bar.high) for bar in relevant) - first_entry
-        else:
-            peak = first_entry - min(float(bar.low) for bar in relevant)
-        peak = max(peak, current)
+    if opened_at <= 0:
+        # Without an open time the bars cannot be attributed to this basket, and a
+        # peak measured over older bars would fire the rule far too early. The
+        # trailing stop is the protection that does not depend on it, so nothing
+        # is lost by standing down here.
+        return None
+    relevant = [bar for bar in candles if int(bar.timestamp) >= opened_at]
+    if not relevant:
+        return None
+    if side == "BUY":
+        peak = max(float(bar.high) for bar in relevant) - first_entry
     else:
-        peak = current
+        peak = first_entry - min(float(bar.low) for bar in relevant)
+    peak = max(peak, current)
 
     if peak < GIVE_BACK_MIN_ATR * atr:
         return None

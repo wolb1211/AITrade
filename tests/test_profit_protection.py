@@ -147,6 +147,18 @@ def test_the_give_back_rule_can_be_switched_off_and_tuned() -> None:
     ) is not None
 
 
+def test_without_an_open_time_the_rule_stands_down() -> None:
+    """A peak measured over bars from before the basket would fire far too early.
+
+    The trailing stop covers this case, so refusing to act is the safe answer.
+    """
+    positions = [_snapshot(entry=4300.0, opened_at=0)]
+    candles = [_bar(1100, 4390.0, 4300.0)]  # a peak from someone else's move
+    request = _request(positions, bid=4312.0, ask=4312.2)
+
+    assert turtle_agent._give_back_decision(request, positions, {}, 10.0, candles) is None
+
+
 def test_a_sell_basket_is_measured_the_same_way() -> None:
     positions = [_snapshot(entry=4310.0, side="SELL"), _snapshot("2", entry=4300.0, side="SELL")]
     candles = [_bar(1100, 4310.0, 4260.0)]  # peak 50 below the first entry
