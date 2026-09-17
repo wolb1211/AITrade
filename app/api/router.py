@@ -574,6 +574,29 @@ def create_mt5_router(
         except ScreenshotError as exc:
             return _mt5_position_error_response(request, request_id, str(exc))
 
+        # Pending orders arrive in the same list as open positions, and the
+        # strategy must only ever manage the latter: an unfilled order would
+        # otherwise consume a slot against max_positions, become the furthest
+        # entry for the basket stop, and earn an add-on of its own.
+        open_positions = [
+            _position_snapshot(item, bid=request.market.bid, ask=request.market.ask)
+            for item in request.positions
+            if not _is_pending_mt_type(item.mt_type)
+        ]
+        if not open_positions:
+            # A client holding only pending orders: there is nothing to manage,
+            # and the strategy request requires at least one position.
+            return Mt5PositionDecisionResponse(
+                status="ok",
+                has_action=False,
+                description="当前只有挂单、没有持仓，本轮无需管理",
+                spread=request.market.spread,
+                decision_id=f"dec_no_positions_{sha256(request_id.encode('utf-8')).hexdigest()[:24]}",
+                request_id=request_id,
+                actions_count=0,
+                actions=[],
+            )
+
         evaluate_request = PositionEvaluateRequest(
             deployment_key=request.deployment_key,
             request_id=request_id,
@@ -592,10 +615,7 @@ def create_mt5_router(
             screenshot_metadata=screenshot_metadata,
             balance=request.balance or request.account.balance,
             equity=request.equity or request.account.equity,
-            positions=[
-                _position_snapshot(item, bid=request.market.bid, ask=request.market.ask)
-                for item in request.positions
-            ],
+            positions=open_positions,
         )
         decision = decision_service.evaluate_position(evaluate_request)
         return _mt5_position_response(
@@ -1597,6 +1617,24 @@ def _secondary_candles(groups: dict[str, list[Mt5Bar]]) -> dict[str, list[Candle
             continue
         result[timeframe] = _candles(bars)
     return result
+
+
+def _is_pending_mt_type(mt_type: int | str) -> bool:
+    """Whether an entry describes a pending order rather than an open position.
+
+    MT5 numbers order types 0-5: 0 buy and 1 sell are live positions, 2/3 are
+    limit orders and 4/5 stop orders. A client that lists pending orders beside
+    open positions made the strategy treat an unfilled order as a unit - it
+    consumed a slot against max_positions, its price became the furthest entry
+    for the basket stop, and an add-on was approved on the strength of it while
+    the pending order's own stop was modified as if it were a position.
+    """
+    try:
+        return int(str(mt_type).strip() or 0) in {2, 3, 4, 5}
+    except (TypeError, ValueError):
+        # An unexpected value is treated as a position, so nothing that might be
+        # real is dropped.
+        return False
 
 
 def _position_snapshot(position: Mt5Position, *, bid: float, ask: float) -> PositionSnapshot:
