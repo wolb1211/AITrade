@@ -1098,6 +1098,23 @@ def test_cautious_verdict_still_opens_and_explains_the_gate() -> None:
     assert "AI 仅在判定高风险时才阻止开仓" in decision.reason
 
 
+def test_the_position_review_prompt_binds_its_answer_to_its_analysis() -> None:
+    """The review must not describe a broken structure while answering false.
+
+    Production watched a basket give back more than six hundred to break-even
+    while its analysis read like a breakdown, and a competitor's model on the
+    same bars locked in several hundred.
+    """
+    from app.services.ai_service import _turtle_position_review_prompt
+
+    prompt = _turtle_position_review_prompt()
+    assert "Your level and your analysis must agree" in prompt
+    assert "never describe a broken structure" in prompt
+    assert "giving back profit" in prompt
+    # The sentence that invited a decline is gone.
+    assert "Declining is safe" not in prompt
+
+
 def test_risk_gate_prompt_requires_a_consistent_answer() -> None:
     from app.services.ai_service import _turtle_open_risk_system_prompt
 

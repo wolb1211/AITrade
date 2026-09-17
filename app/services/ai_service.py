@@ -1785,10 +1785,19 @@ def _turtle_position_review_prompt() -> str:
         "trailing distance, a direction, a price or a volume. "
         "You answer exactly two questions. "
         "close_now: should the server close the WHOLE position right now, before any of those triggers fire? "
-        "Answer true when either (a) the move has already run far enough that taking the profit now is better than "
-        "giving it back, or (b) the current state looks like a genuine reversal or exhaustion. "
-        "Declining is safe because the protective stop stays in force, so only answer true when you can name a "
-        "concrete reason. "
+        "Answer true when the run looks finished rather than merely paused: structure has broken against the "
+        "position (a close beyond the recent swing low for a long, or the recent swing high for a short), an "
+        "opposite engulfing bar or pin bar has printed, two or more consecutive strong opposite bars have taken "
+        "back a large part of the open profit, or momentum is clearly fading after an extended move. "
+        # The models answered false here while their own analysis described a
+        # broken structure, because the sentence below used to say declining was
+        # safe: production watched a basket give back six hundred to break-even
+        # while a competitor's model on the same bars locked in several hundred.
+        "Your level and your analysis must agree: if your analysis describes any of those conditions, close_now "
+        "must be true - never describe a broken structure, a reversal or fading momentum while answering false. "
+        "Do not decline because the protective stop is in force. That stop is the last resort; giving back profit "
+        "that was already earned is a worse outcome than closing a little early. "
+        "Decline only when the structure is intact and the move still looks like it is going somewhere. "
         "allow_add: may the server execute the add-on candidate if one is present? Approve by default: the add-on "
         "only has to be acceptable, not ideal. "
         "Use risk_level high only for a specific, nameable danger. "
