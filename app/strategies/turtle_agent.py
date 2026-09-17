@@ -118,12 +118,12 @@ class TurtleTrendStrategy:
         sl, clamped = respect_min_stop(
             sl, side="BUY" if direction == "buy" else "SELL",
             bid=request.bid, ask=request.ask,
-            info=request.symbol_info, config=config,
+            info=request.symbol_info, config=config, atr=atr,
         )
         if not stop_is_placeable(
             sl, side="BUY" if direction == "buy" else "SELL",
             bid=request.bid, ask=request.ask,
-            info=request.symbol_info, config=config,
+            info=request.symbol_info, config=config, atr=atr,
         ):
             # The broker would answer "Invalid S/L or T/P", so there is no entry
             # to place on this bar; say so instead of sending it anyway.
@@ -847,11 +847,11 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
     # leaves no improvement over the stop already in place, send nothing.
     target, clamped = respect_min_stop(
         target, side=position.side, bid=request.bid, ask=request.ask,
-        info=request.symbol_info, config=config,
+        info=request.symbol_info, config=config, atr=atr,
     )
     if not stop_is_placeable(
         target, side=position.side, bid=request.bid, ask=request.ask,
-        info=request.symbol_info, config=config,
+        info=request.symbol_info, config=config, atr=atr,
     ):
         # The market already moved past this level; the broker would refuse the
         # modification, so keep the stop that is in force until it can hold.
@@ -897,11 +897,11 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
     # the position on its old stop, which is what made gold look untrailed.
     target, clamped = respect_min_stop(
         target, side=position.side, bid=request.bid, ask=request.ask,
-        info=request.symbol_info, config=config,
+        info=request.symbol_info, config=config, atr=atr,
     )
     if not stop_is_placeable(
         target, side=position.side, bid=request.bid, ask=request.ask,
-        info=request.symbol_info, config=config,
+        info=request.symbol_info, config=config, atr=atr,
     ):
         # Price has already run past the trailing level, so the broker would
         # refuse it; the stop in force stays until the market allows the move.
@@ -959,11 +959,11 @@ def _maybe_add(
     # well; sizing then uses the distance the broker will actually hold.
     stop_loss, stop_clamped = respect_min_stop(
         stop_loss, side=action, bid=request.bid, ask=request.ask,
-        info=request.symbol_info, config=config,
+        info=request.symbol_info, config=config, atr=atr,
     )
     if not stop_is_placeable(
         stop_loss, side=action, bid=request.bid, ask=request.ask,
-        info=request.symbol_info, config=config,
+        info=request.symbol_info, config=config, atr=atr,
     ):
         # A basket stop the broker refuses would leave every unit unprotected at
         # the new level, so the add is skipped and the old stops stay in force.

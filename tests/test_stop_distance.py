@@ -126,6 +126,24 @@ def test_a_stop_the_market_has_already_passed_is_not_placeable() -> None:
     assert stop_is_placeable(0.0, side="BUY", bid=4301.0, ask=4301.2) is False
 
 
+def test_a_client_without_a_stops_level_still_gets_a_floor() -> None:
+    """No reported level and no override still leaves a minimum in force.
+
+    A quarter ATR is small enough that it cannot widen a strategy's stop - every
+    rule here places a stop at least one ATR from the market - so it acts purely
+    as a floor for a client nobody has updated yet.
+    """
+    assert min_stop_distance({}, {}, atr=8.0) == pytest.approx(2.0)
+    assert min_stop_distance({}, {"min_stop_distance_atr": 0.5}, atr=8.0) == pytest.approx(4.0)
+    # A deployment can switch the floor off, and without an ATR nothing is known.
+    assert min_stop_distance({}, {"min_stop_distance_atr": 0}, atr=8.0) == 0.0
+    assert min_stop_distance({}, {}, atr=0.0) == 0.0
+    # The broker's own figure still wins over the fallback.
+    assert min_stop_distance(
+        {"point": 0.01, "stops_level": 250}, {"min_stop_distance_atr": 1.0}, atr=8.0
+    ) == pytest.approx(2.5)
+
+
 def test_the_add_step_is_half_the_stop_distance() -> None:
     """A quarter left a full basket risking more than twice one unit.
 

@@ -953,11 +953,11 @@ def _atr_protective_stop(
     # broker accepts before deciding whether it is still an improvement.
     protected_sl, _clamped = respect_min_stop(
         protected_sl, side=position.side, bid=request.bid, ask=request.ask,
-        info=request.symbol_info,
+        info=request.symbol_info, atr=atr,
     )
     if not stop_is_placeable(
         protected_sl, side=position.side, bid=request.bid, ask=request.ask,
-        info=request.symbol_info,
+        info=request.symbol_info, atr=atr,
     ):
         # The market already moved past the level; keep the stop in force rather
         # than sending a modification the broker answers with 10016.
