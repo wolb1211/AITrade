@@ -52,6 +52,44 @@ def test_gl_schemas_carry_every_key_the_strategy_reads() -> None:
         assert key in _TURTLE_POSITION_REVIEW_SCHEMA
 
 
+def test_a_stray_question_mark_is_removed_from_chinese_prose() -> None:
+    """The models drop a half-width "?" where they are unsure.
+
+    It reached the customer panel as noise - "多头排列，?格局突破前高" - which reads
+    as a defect. Written Chinese uses the full-width form, so the half-width mark
+    touching Chinese text is an artefact.
+    """
+    from app.services.ai_service import _strip_placeholder_marks
+
+    assert (
+        _strip_placeholder_marks("市场结构为多头排列，?格局突破前高")
+        == "市场结构为多头排列，格局突破前高"
+    )
+    assert (
+        _strip_placeholder_marks("形态评分中等偏高，?能动能持续?")
+        == "形态评分中等偏高，能动能持续"
+    )
+    # A mark that belongs to Latin text, a figure or an identifier is left alone,
+    # so a genuine question or a value is never altered.
+    assert _strip_placeholder_marks("Why?") == "Why?"
+    assert _strip_placeholder_marks("评分 72? ") == "评分 72? "
+    assert _strip_placeholder_marks("RSI?超买") == "RSI?超买"
+
+
+def test_the_parser_cleans_the_reason_it_returns() -> None:
+    """The scrub runs where every decision's text is finalised."""
+    from app.services.ai_service import _extract_json_object
+
+    parsed = _extract_json_object(
+        '{"close_now":false,"allow_add":true,"reason":"?趋势仍在修复上行",'
+        '"analysis":"市场结构为多头排列，?格局突破前高，浮盈不足以提前止盈。"}',
+        endpoint="position",
+    )
+
+    assert parsed["reason"] == "趋势仍在修复上行"
+    assert parsed["analysis"] == "市场结构为多头排列，格局突破前高，浮盈不足以提前止盈。"
+
+
 def test_a_chat_call_carries_the_caller_schema_end_to_end(tmp_path: Path, monkeypatch) -> None:
     """The whole call chain must accept the schema and act on it.
 

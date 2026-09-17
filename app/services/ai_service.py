@@ -1715,6 +1715,7 @@ _PLAIN_CHINESE_RULE = (
     "Write reason and analysis in plain Chinese trading language only. Never output internal field names, "
     "JSON keys, snake_case identifiers, or English parameter names (write 浮盈ATR倍数, not favorable_atr); "
     "refer to concepts by their Chinese trading names instead. "
+    "Never write a question mark or any other placeholder where you are unsure - state only what you concluded. "
 )
 
 
@@ -3520,6 +3521,26 @@ def _scrub_internal_field_names(text: str) -> str:
     return _FIELD_NAME_PATTERN.sub(lambda match: _INTERNAL_FIELD_NAMES[match.group(1)], text)
 
 
+# CJK text plus the full-width punctuation block, used to tell a placeholder
+# question mark apart from one that belongs to a Latin sentence.
+_CJK_RANGE = "\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef"
+
+
+def _strip_placeholder_marks(text: str) -> str:
+    """Remove the lone "?" a model sprinkles through Chinese prose.
+
+    The models in use write a half-width question mark where they are unsure and
+    it reaches the customer panel as noise: "多头排列，?格局突破前高". Written Chinese
+    uses the full-width form, so a half-width mark touching Chinese text is not
+    punctuation the sentence needs; one touching Latin text or digits is left
+    alone, so a genuine question survives.
+    """
+    if not text:
+        return text
+    text = re.sub(rf"(?<=[{_CJK_RANGE}])[?]+(?![0-9A-Za-z])", "", text)
+    return re.sub(rf"(?<![0-9A-Za-z])[?]+(?=[{_CJK_RANGE}])", "", text)
+
+
 def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") -> None:
     if endpoint == "pa_diag":
         # The diagnosis stage carries no reason/analysis fields. Injecting the
@@ -3527,7 +3548,7 @@ def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") ->
         # model never produced, which is exactly what the log is meant to prove.
         reasoning = parsed.get("reasoning")
         if isinstance(reasoning, str):
-            parsed["reasoning"] = _scrub_internal_field_names(reasoning)
+            parsed["reasoning"] = _strip_placeholder_marks(_scrub_internal_field_names(reasoning))
         return
     reason = str(parsed.get("reason") or "").strip()
     analysis = str(parsed.get("analysis") or "").strip()
@@ -3565,8 +3586,8 @@ def _normalize_decision_reason(parsed: dict[str, Any], *, endpoint: str = "") ->
         reason = reason[:90]
     if len(analysis) < 16:
         analysis = default_analysis
-    parsed["reason"] = _scrub_internal_field_names(reason[:120])
-    parsed["analysis"] = _scrub_internal_field_names(analysis[:800])
+    parsed["reason"] = _strip_placeholder_marks(_scrub_internal_field_names(reason[:120]))
+    parsed["analysis"] = _strip_placeholder_marks(_scrub_internal_field_names(analysis[:800]))
 
 
 def _recover_decision_from_text(content: str, *, endpoint: str = "") -> dict[str, Any] | None:
