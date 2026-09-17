@@ -102,6 +102,7 @@
 | `break_even_offset` | 0.0 | 保本额外偏移 |
 | `trailing_start_atr` | 1.5 | 跟踪触发 |
 | `trailing_distance_atr` | **1.0** | 跟踪距离 |
+| `trailing_min_step_atr` | **0.2** | 跟踪最小步长（新）：新止损要比现有好这么多才下发（0 = 每次都移）|
 | `basket_stop_floor` | `first_entry` | 篮子止损下限（新）|
 | `give_back_ratio` | **0.5** | 浮盈回吐比例（新）|
 | `spike_bar_atr` | 2.0 | 尖峰K线阈值 |

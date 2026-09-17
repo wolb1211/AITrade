@@ -147,6 +147,38 @@ def test_a_client_without_a_stops_level_still_gets_a_floor() -> None:
     ) == pytest.approx(2.5)
 
 
+def test_a_stop_only_moves_when_it_is_worth_sending() -> None:
+    """A stop that improves by a tick costs a round trip for nothing.
+
+    Production saw eighteen modifications in forty minutes on one symbol, and on
+    some brokers every extra modification is another chance of a refused stop.
+    """
+    request = _request()  # bid 4310.0, so a 1.0 ATR target with ATR 2.0 is 4308.0
+
+    # 0.2 ATR step = 0.4, so an improvement of 1.0 goes through.
+    assert turtle_agent._trailing_stop_decision(request, _position(sl=4307.0), {}, 2.0) is not None
+    # An improvement of 0.2 does not.
+    assert turtle_agent._trailing_stop_decision(request, _position(sl=4307.8), {}, 2.0) is None
+    # With the step switched off, the small one moves again. No broker minimum
+    # here, otherwise the clamp would pull the target below the stop in force.
+    assert turtle_agent._trailing_stop_decision(
+        _request(symbol_info={}), _position(sl=4307.9), {"trailing_min_step_atr": 0}, 2.0
+    ) is not None
+
+
+def test_the_stop_improvement_rule_never_loosens_a_stop() -> None:
+    assert turtle_agent._stop_improves(4300.0, None, side="BUY", minimum_gain=0.5) is True
+    assert turtle_agent._stop_improves(4300.4, 4300.0, side="BUY", minimum_gain=0.5) is False
+    assert turtle_agent._stop_improves(4300.5, 4300.0, side="BUY", minimum_gain=0.5) is True
+    # Without a step the move still has to be strictly better than what is there.
+    assert turtle_agent._stop_improves(4300.0, 4300.0, side="BUY", minimum_gain=0.0) is False
+    assert turtle_agent._stop_improves(4300.1, 4300.0, side="BUY", minimum_gain=0.0) is True
+    # Sells mirror it: a lower stop is the improvement.
+    assert turtle_agent._stop_improves(4299.6, 4300.0, side="SELL", minimum_gain=0.5) is False
+    assert turtle_agent._stop_improves(4299.5, 4300.0, side="SELL", minimum_gain=0.5) is True
+    assert turtle_agent._stop_improves(4300.0, 4300.0, side="SELL", minimum_gain=0.0) is False
+
+
 def test_the_add_step_is_half_the_stop_distance() -> None:
     """A quarter left a full basket risking more than twice one unit.
 

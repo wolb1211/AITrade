@@ -43,6 +43,11 @@ DEFAULT_BREAK_EVEN_OFFSET = 0.0      # extra offset from entry, on top of the sp
 BREAK_EVEN_SPREAD_BUFFER = 1.5       # break-even must clear this many times the spread
 DEFAULT_TRAILING_START_ATR = 1.5     # favourable move that starts trailing
 DEFAULT_TRAILING_DISTANCE_ATR = 1.0  # trailing distance behind the current price
+# How much better a trailing stop has to become before the modification is sent.
+# Without it any new high, even by a tick, triggers another round trip to the
+# broker - and one more chance of a stop the broker refuses. 0 restores the
+# continuous behaviour.
+DEFAULT_TRAILING_MIN_STEP_ATR = 0.2
 
 # Adding units.
 MAX_UNITS = 4                        # this strategy never pyramids beyond this
@@ -1006,6 +1011,17 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
 def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, config: dict[str, Any], atr: float) -> TradeDecision | None:
     start = _positive_float(config.get("trailing_start_atr"), default=DEFAULT_TRAILING_START_ATR)
     distance = _positive_float(config.get("trailing_distance_atr"), default=DEFAULT_TRAILING_DISTANCE_ATR)
+    # An explicit 0 goes back to moving on every new high, so absent and zero are
+    # told apart rather than both falling back to the default.
+    configured_step = config.get("trailing_min_step_atr")
+    if configured_step is None:
+        step = DEFAULT_TRAILING_MIN_STEP_ATR
+    else:
+        try:
+            step = float(configured_step)
+        except (TypeError, ValueError):
+            step = DEFAULT_TRAILING_MIN_STEP_ATR
+    minimum_gain = max(step, 0.0) * atr
     if start <= 0 or distance <= 0 or atr <= 0:
         return None
     current_sl = position.sl if position.sl and position.sl > 0 else None
@@ -1033,10 +1049,14 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
         # refuse it; the stop in force stays until the market allows the move.
         return None
     if position.side == "BUY":
-        if target <= position.open_price or (current_sl is not None and target <= current_sl):
+        if target <= position.open_price or not _stop_improves(
+            target, current_sl, side="BUY", minimum_gain=minimum_gain
+        ):
             return None
     else:
-        if target >= position.open_price or (current_sl is not None and target >= current_sl):
+        if target >= position.open_price or not _stop_improves(
+            target, current_sl, side="SELL", minimum_gain=minimum_gain
+        ):
             return None
     return TradeDecision(
         decision_id=_id(), request_id=request.request_id, status="APPROVED",
@@ -1053,6 +1073,27 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
             ),
         },
     )
+
+
+def _stop_improves(
+    target: float,
+    current: float | None,
+    *,
+    side: str,
+    minimum_gain: float,
+) -> bool:
+    """Whether a new stop is worth sending to the broker.
+
+    It must be strictly better than the stop already in force - a stop is never
+    loosened - and, once a minimum gain is set, better by at least that much. A
+    stop that improves by a tick has no trading value but costs a round trip and,
+    on some brokers, another chance of a refused modification.
+    """
+    if not current or current <= 0:
+        return True
+    if side == "BUY":
+        return target >= current + minimum_gain if minimum_gain > 0 else target > current
+    return target <= current - minimum_gain if minimum_gain > 0 else target < current
 
 
 def _basket_stop_floor(*, positions: list[Any], side: str, config: dict[str, Any]) -> float:
