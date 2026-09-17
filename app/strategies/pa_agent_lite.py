@@ -10,7 +10,7 @@ from uuid import uuid4
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision, UsageSummary
 from app.services.ai_service import AiDecisionClient
 from app.strategies import pa_knowledge
-from app.strategies.stop_rules import respect_min_stop
+from app.strategies.stop_rules import respect_min_stop, stop_is_placeable
 
 # Minimum reward-to-risk the server will accept from an AI-proposed target.
 MIN_RISK_REWARD = 1.8
@@ -955,6 +955,13 @@ def _atr_protective_stop(
         protected_sl, side=position.side, bid=request.bid, ask=request.ask,
         info=request.symbol_info,
     )
+    if not stop_is_placeable(
+        protected_sl, side=position.side, bid=request.bid, ask=request.ask,
+        info=request.symbol_info,
+    ):
+        # The market already moved past the level; keep the stop in force rather
+        # than sending a modification the broker answers with 10016.
+        return None
     if position.side == "BUY":
         if existing_sl is not None and protected_sl <= existing_sl + tolerance:
             return None

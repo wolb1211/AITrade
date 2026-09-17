@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.strategies import pa_agent_lite, turtle_agent
-from app.strategies.stop_rules import min_stop_distance, respect_min_stop
+from app.strategies.stop_rules import min_stop_distance, respect_min_stop, stop_is_placeable
 
 
 def test_min_stop_distance_prefers_the_broker_figure() -> None:
@@ -109,6 +109,21 @@ def test_pa_trailing_pulls_back_to_a_level_the_broker_accepts() -> None:
 
     assert decision is not None
     assert decision.sl == pytest.approx(4307.5)
+
+
+def test_a_stop_the_market_has_already_passed_is_not_placeable() -> None:
+    """The broker rejects a stop that is not on the market's correct side.
+
+    This symbol reported no minimum distance at all, so the side is the only
+    thing left to check - and it is the case a level computed a moment earlier
+    runs into when the market moves before the request is submitted.
+    """
+    assert stop_is_placeable(4299.0, side="BUY", bid=4301.0, ask=4301.2) is True
+    assert stop_is_placeable(4301.5, side="BUY", bid=4301.0, ask=4301.2) is False
+    assert stop_is_placeable(4301.0, side="SELL", bid=4301.0, ask=4301.2) is False
+    assert stop_is_placeable(4302.0, side="SELL", bid=4301.0, ask=4301.2) is True
+    # A zero stop is "no stop", which is never sent as a modification.
+    assert stop_is_placeable(0.0, side="BUY", bid=4301.0, ask=4301.2) is False
 
 
 def test_the_add_step_is_half_the_stop_distance() -> None:

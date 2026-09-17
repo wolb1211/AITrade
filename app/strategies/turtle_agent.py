@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision
 from app.services.ai_service import AiDecisionClient
-from app.strategies.stop_rules import respect_min_stop
+from app.strategies.stop_rules import respect_min_stop, stop_is_placeable
 
 # ---------------------------------------------------------------------------
 # Strategy parameters.
@@ -120,6 +120,14 @@ class TurtleTrendStrategy:
             bid=request.bid, ask=request.ask,
             info=request.symbol_info, config=config,
         )
+        if not stop_is_placeable(
+            sl, side="BUY" if direction == "buy" else "SELL",
+            bid=request.bid, ask=request.ask,
+            info=request.symbol_info, config=config,
+        ):
+            # The broker would answer "Invalid S/L or T/P", so there is no entry
+            # to place on this bar; say so instead of sending it anyway.
+            return _hold_open(request, "止损位不在市价正确一侧，本根不入场（等待报价更新）")
         lot, sizing = _unit_lot(request, config, entry=entry, stop_loss=sl)
         if lot <= 0:
             return _hold_open(request, "手数无法确定：当前止损距离与品种合约参数不匹配，本根不入场")
@@ -841,6 +849,13 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
         target, side=position.side, bid=request.bid, ask=request.ask,
         info=request.symbol_info, config=config,
     )
+    if not stop_is_placeable(
+        target, side=position.side, bid=request.bid, ask=request.ask,
+        info=request.symbol_info, config=config,
+    ):
+        # The market already moved past this level; the broker would refuse the
+        # modification, so keep the stop that is in force until it can hold.
+        return None
     if position.side == "BUY":
         if current_sl is not None and current_sl >= target:
             return None
@@ -884,6 +899,13 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
         target, side=position.side, bid=request.bid, ask=request.ask,
         info=request.symbol_info, config=config,
     )
+    if not stop_is_placeable(
+        target, side=position.side, bid=request.bid, ask=request.ask,
+        info=request.symbol_info, config=config,
+    ):
+        # Price has already run past the trailing level, so the broker would
+        # refuse it; the stop in force stays until the market allows the move.
+        return None
     if position.side == "BUY":
         if target <= position.open_price or (current_sl is not None and target <= current_sl):
             return None
@@ -939,6 +961,13 @@ def _maybe_add(
         stop_loss, side=action, bid=request.bid, ask=request.ask,
         info=request.symbol_info, config=config,
     )
+    if not stop_is_placeable(
+        stop_loss, side=action, bid=request.bid, ask=request.ask,
+        info=request.symbol_info, config=config,
+    ):
+        # A basket stop the broker refuses would leave every unit unprotected at
+        # the new level, so the add is skipped and the old stops stay in force.
+        return None, "加仓止损位不在市价正确一侧（报价可能已过期），本次不加仓"
     lot, sizing = _unit_lot(request, config, entry=entry, stop_loss=stop_loss)
     if lot <= 0:
         return None, (

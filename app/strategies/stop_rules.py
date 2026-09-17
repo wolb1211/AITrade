@@ -77,6 +77,31 @@ def respect_min_stop(
     return sl, 0.0
 
 
+def stop_is_placeable(
+    sl: float,
+    *,
+    side: str,
+    bid: float,
+    ask: float,
+    info: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> bool:
+    """Whether the broker would accept this stop as things stand right now.
+
+    Besides its own minimum distance, MT5 rejects a stop that is not on the
+    correct side of the market (retcode 10016 again). A trailing level computed
+    a moment earlier can already be behind the market when the request is
+    submitted, and sending it costs a round trip and an error. Callers use this
+    to leave the existing stop in place instead until the market allows it.
+    """
+    level, _ = respect_min_stop(sl, side=side, bid=bid, ask=ask, info=info, config=config)
+    if float(level or 0) <= 0:
+        return False
+    if str(side or "").upper() == "BUY":
+        return float(level) < float(bid)
+    return float(level) > float(ask)
+
+
 def _positive(source: Mapping[str, Any], *keys: str) -> float:
     for key in keys:
         try:
