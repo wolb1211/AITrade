@@ -10,6 +10,7 @@ from uuid import uuid4
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision, UsageSummary
 from app.services.ai_service import AiDecisionClient
 from app.strategies import pa_knowledge
+from app.strategies.stop_rules import respect_min_stop
 
 # Minimum reward-to-risk the server will accept from an AI-proposed target.
 MIN_RISK_REWARD = 1.8
@@ -936,8 +937,6 @@ def _atr_protective_stop(
         if current_price - protected_sl >= atr:
             protected_sl = max(protected_sl, current_price - atr * 0.5)
             reason = "当前价格与止损相距达到1 ATR，止损跟进至距当前价格0.5 ATR"
-        if existing_sl is not None and protected_sl <= existing_sl + tolerance:
-            return None
     else:
         current_price = request.ask
         if position.open_price - current_price < atr * 0.5:
@@ -947,6 +946,19 @@ def _atr_protective_stop(
         if protected_sl - current_price >= atr:
             protected_sl = min(protected_sl, current_price + atr * 0.5)
             reason = "当前价格与止损相距达到1 ATR，止损跟进至距当前价格0.5 ATR"
+
+    # The 0.5 ATR trailing distance is tighter than a broker's minimum on some
+    # symbols, and MT5 answers such a modification with "Invalid S/L or T/P"
+    # (10016) so the position keeps its old stop. Pull the level back to one the
+    # broker accepts before deciding whether it is still an improvement.
+    protected_sl, _clamped = respect_min_stop(
+        protected_sl, side=position.side, bid=request.bid, ask=request.ask,
+        info=request.symbol_info,
+    )
+    if position.side == "BUY":
+        if existing_sl is not None and protected_sl <= existing_sl + tolerance:
+            return None
+    else:
         if existing_sl is not None and protected_sl >= existing_sl - tolerance:
             return None
 

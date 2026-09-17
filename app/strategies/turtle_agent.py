@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision
 from app.services.ai_service import AiDecisionClient
+from app.strategies.stop_rules import respect_min_stop
 
 # ---------------------------------------------------------------------------
 # Strategy parameters.
@@ -44,7 +45,13 @@ DEFAULT_TRAILING_DISTANCE_ATR = 1.0  # trailing distance behind the current pric
 
 # Adding units.
 MAX_UNITS = 4                        # this strategy never pyramids beyond this
-DEFAULT_ADD_STEP_ATR = 0.5           # extension beyond the furthest entry allowing an add
+# Extension beyond the furthest entry that allows another unit. Half the stop
+# distance rather than a quarter: at 0.5 ATR a four-unit basket added its units
+# while the basket stop rose only 0.5 ATR each time, so a full basket could be
+# stopped out 4.5 ATR below its first entry - more than twice one unit's risk. At
+# 1.0 the stop ends up above the first entry and a full basket costs about one
+# unit's risk.
+DEFAULT_ADD_STEP_ATR = 1.0           # extension beyond the furthest entry allowing an add
 
 # Proactive exit requested by the AI review.  The protective stop and the exit
 # channel stay in force regardless, so declining to close is always safe.
@@ -106,6 +113,13 @@ class TurtleTrendStrategy:
             return _hold_open(request, "趋势尚未形成：区间突破与回调结构均未成立，继续等待")
         entry = request.ask if direction == "buy" else request.bid
         sl = entry - STOP_ATR * atr if direction == "buy" else entry + STOP_ATR * atr
+        # A stop the broker will refuse is worse than a wider usable one, so the
+        # entry stop respects the minimum distance too.
+        sl, clamped = respect_min_stop(
+            sl, side="BUY" if direction == "buy" else "SELL",
+            bid=request.bid, ask=request.ask,
+            info=request.symbol_info, config=config,
+        )
         lot, sizing = _unit_lot(request, config, entry=entry, stop_loss=sl)
         if lot <= 0:
             return _hold_open(request, "手数无法确定：当前止损距离与品种合约参数不匹配，本根不入场")
@@ -124,6 +138,10 @@ class TurtleTrendStrategy:
                 # one fired and whether they ever disagreed.
                 "swing_direction": swing_direction,
                 "donchian_direction": donchian_direction,
+                # Non-zero when the broker's minimum stop distance moved this
+                # entry's stop, so a wider stop than the ATR rule implies is
+                # explainable from the decision alone.
+                "min_stop_distance_enforced": round(clamped, 5),
             },
         )
         if self.ai_client is not None:
@@ -811,12 +829,22 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
         if request.bid - position.open_price < trigger * atr:
             return None
         target = position.open_price + offset
-        if current_sl is not None and current_sl >= target:
-            return None
     else:
         if position.open_price - request.ask < trigger * atr:
             return None
         target = position.open_price - offset
+    # A live gold basket never reached break-even because every request was
+    # refused with "Invalid S/L or T/P": the target sat closer to the market than
+    # the broker allows. Pull it back to a level the broker accepts, and if that
+    # leaves no improvement over the stop already in place, send nothing.
+    target, clamped = respect_min_stop(
+        target, side=position.side, bid=request.bid, ask=request.ask,
+        info=request.symbol_info, config=config,
+    )
+    if position.side == "BUY":
+        if current_sl is not None and current_sl >= target:
+            return None
+    else:
         if current_sl is not None and current_sl <= target:
             return None
     return TradeDecision(
@@ -829,6 +857,7 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
             "break_even_atr": trigger,
             "break_even_offset": offset,
             "break_even_spread": spread,
+            "min_stop_distance_enforced": round(clamped, 5),
         },
     )
 
@@ -844,13 +873,21 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
         if favorable < start * atr:
             return None
         target = request.bid - distance * atr
-        if target <= position.open_price or (current_sl is not None and target <= current_sl):
-            return None
     else:
         favorable = position.open_price - request.ask
         if favorable < start * atr:
             return None
         target = request.ask + distance * atr
+    # Same broker limit as break-even: a trailing level the broker refuses leaves
+    # the position on its old stop, which is what made gold look untrailed.
+    target, clamped = respect_min_stop(
+        target, side=position.side, bid=request.bid, ask=request.ask,
+        info=request.symbol_info, config=config,
+    )
+    if position.side == "BUY":
+        if target <= position.open_price or (current_sl is not None and target <= current_sl):
+            return None
+    else:
         if target >= position.open_price or (current_sl is not None and target >= current_sl):
             return None
     return TradeDecision(
@@ -858,7 +895,12 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
         action="MODIFY_SL", symbol=request.symbol, confidence=1.0,
         reason=f"浮盈达{start:g}倍ATR，止损跟进至现价回撤{distance:g}倍ATR处",
         expires_at=_expires(), position_ticket=position.ticket, sl=target, tp=position.tp,
-        metadata={"strategy_code": "GL_TREND_V1", "trailing_start_atr": start, "trailing_distance_atr": distance},
+        metadata={
+            "strategy_code": "GL_TREND_V1",
+            "trailing_start_atr": start,
+            "trailing_distance_atr": distance,
+            "min_stop_distance_enforced": round(clamped, 5),
+        },
     )
 
 
@@ -891,6 +933,12 @@ def _maybe_add(
         if request.ask > anchor - step * atr:
             return None, ""
         entry, action, stop_loss = request.bid, "SELL", request.bid + STOP_ATR * atr
+    # The added unit carries the basket stop, which the broker has to accept as
+    # well; sizing then uses the distance the broker will actually hold.
+    stop_loss, stop_clamped = respect_min_stop(
+        stop_loss, side=action, bid=request.bid, ask=request.ask,
+        info=request.symbol_info, config=config,
+    )
     lot, sizing = _unit_lot(request, config, entry=entry, stop_loss=stop_loss)
     if lot <= 0:
         return None, (
@@ -932,6 +980,7 @@ def _maybe_add(
         metadata={"strategy_code": "GL_TREND_V1", "position_sizing": sizing,
                   "unit_index": len(request.positions) + 1, "max_units": _max_units(config),
                   "unified_stop": stop_loss,
+                  "min_stop_distance_enforced": round(stop_clamped, 5),
                   "batch_actions": batch_actions,
                   },
     ), ""
