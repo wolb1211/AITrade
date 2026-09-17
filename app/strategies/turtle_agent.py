@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision
 from app.services.ai_service import AiDecisionClient
-from app.strategies.stop_rules import respect_min_stop, stop_is_placeable
+from app.strategies.stop_rules import min_stop_distance, respect_min_stop, stop_is_placeable
 
 # ---------------------------------------------------------------------------
 # Strategy parameters.
@@ -150,6 +150,15 @@ class TurtleTrendStrategy:
                 # entry's stop, so a wider stop than the ATR rule implies is
                 # explainable from the decision alone.
                 "min_stop_distance_enforced": round(clamped, 5),
+            "min_stop_distance_used": round(
+                min_stop_distance(request.symbol_info, config, atr=atr), 5
+            ),
+                # What the server resolved from the client's symbol info and the
+                # config, so a client that reports a stops level can be told
+                # apart from one that does not without reading its payload.
+                "min_stop_distance_used": round(
+                    min_stop_distance(request.symbol_info, config, atr=atr), 5
+                ),
             },
         )
         if self.ai_client is not None:
@@ -873,6 +882,9 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
             "break_even_offset": offset,
             "break_even_spread": spread,
             "min_stop_distance_enforced": round(clamped, 5),
+            "min_stop_distance_used": round(
+                min_stop_distance(request.symbol_info, config, atr=atr), 5
+            ),
         },
     )
 
@@ -922,6 +934,9 @@ def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, con
             "trailing_start_atr": start,
             "trailing_distance_atr": distance,
             "min_stop_distance_enforced": round(clamped, 5),
+            "min_stop_distance_used": round(
+                min_stop_distance(request.symbol_info, config, atr=atr), 5
+            ),
         },
     )
 
@@ -1010,6 +1025,9 @@ def _maybe_add(
                   "unit_index": len(request.positions) + 1, "max_units": _max_units(config),
                   "unified_stop": stop_loss,
                   "min_stop_distance_enforced": round(stop_clamped, 5),
+                  "min_stop_distance_used": round(
+                      min_stop_distance(request.symbol_info, config, atr=atr), 5
+                  ),
                   "batch_actions": batch_actions,
                   },
     ), ""

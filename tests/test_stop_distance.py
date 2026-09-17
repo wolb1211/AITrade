@@ -90,6 +90,9 @@ def test_gl_trailing_pulls_back_to_a_level_the_broker_accepts() -> None:
     assert decision is not None
     assert decision.sl == pytest.approx(4307.5)
     assert decision.metadata["min_stop_distance_enforced"] == pytest.approx(2.5)
+    # The decision records what the server resolved, so a client that reports a
+    # stops level can be told apart from one that does not.
+    assert decision.metadata["min_stop_distance_used"] == pytest.approx(2.5)
 
 
 def test_gl_trailing_is_unchanged_when_the_target_is_already_far_enough() -> None:
