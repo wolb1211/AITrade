@@ -386,6 +386,77 @@ def test_future_dated_deal_still_shows_in_the_order_list(tmp_path: Path) -> None
     ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def test_switching_a_deployment_to_another_strategy_is_persisted(tmp_path: Path) -> None:
+    """The client sends strategy_code and the update used to drop it silently.
+
+    A save looked successful while the deployment kept the old strategy, which is
+    what an operator saw when switching from the price-action strategy to the
+    trend one.
+    """
+    store = SqliteStore(tmp_path / "strategy-switch.db")
+    store.initialize()
+    store.save_ai_endpoint({
+        "id": "aie_switch", "owner_type": "gl", "name": "switch", "base_url": "https://example.com/v1",
+        "model": "example-model", "api_key": "sk-switch", "strict_json": True,
+        "enabled": 1, "selectable_by_user": 1,
+    })
+    user = store.save_user({"email": "switch@example.com", "status": "active"})
+    deployment = store.upsert_web_deployment(
+        "pa_switch", user_id=str(user["id"]), strategy_code="PA_AGENT_V1",
+        strategy_name="形态策略", status="active", symbol="*", timeframe="*",
+        config={"deployment_key": "pa_switch"},
+    )
+
+    updated = store.update_user_deployment_settings(
+        user_id=int(user["id"]),
+        deployment_id=deployment["id"],
+        payload={
+            "strategy_code": "GL_TREND_V1",
+            "name": "跟踪策略",
+            "status": "active",
+            "open_ai_mode": "official",
+            "open_ai_endpoint_id": "aie_switch",
+            "position_ai_mode": "official",
+            "position_ai_endpoint_id": "aie_switch",
+        },
+    )
+
+    assert updated["strategy_code"] == "GL_TREND_V1"
+    assert updated["strategy_name"] == "跟踪策略"
+
+
+def test_an_unknown_strategy_code_is_refused(tmp_path: Path) -> None:
+    """Only strategies the platform offers can be selected."""
+    store = SqliteStore(tmp_path / "strategy-switch-invalid.db")
+    store.initialize()
+    store.save_ai_endpoint({
+        "id": "aie_switch_bad", "owner_type": "gl", "name": "bad", "base_url": "https://example.com/v1",
+        "model": "example-model", "api_key": "sk-bad", "strict_json": True,
+        "enabled": 1, "selectable_by_user": 1,
+    })
+    user = store.save_user({"email": "switch-bad@example.com", "status": "active"})
+    deployment = store.upsert_web_deployment(
+        "pa_switch_bad", user_id=str(user["id"]), strategy_code="PA_AGENT_V1",
+        strategy_name="形态策略", status="active", symbol="*", timeframe="*",
+        config={"deployment_key": "pa_switch_bad"},
+    )
+
+    with pytest.raises(RuntimeError):
+        store.update_user_deployment_settings(
+            user_id=int(user["id"]),
+            deployment_id=deployment["id"],
+            payload={
+                "strategy_code": "NOT_A_REAL_STRATEGY",
+                "name": "形态策略",
+                "status": "active",
+                "open_ai_mode": "official",
+                "open_ai_endpoint_id": "aie_switch_bad",
+                "position_ai_mode": "official",
+                "position_ai_endpoint_id": "aie_switch_bad",
+            },
+        )
+
+
 def test_order_direction_survives_the_zero_buy_type(tmp_path: Path) -> None:
     """MT5 numbers a buy as 0, which ``value or ""`` used to store as empty.
 

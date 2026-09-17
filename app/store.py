@@ -1725,13 +1725,44 @@ class SqliteStore:
         mt_login = str(payload.get("mt_login") if "mt_login" in payload else deployment.get("mt_login") or "").strip()
         now = utc_now_iso()
         with self._connect() as connection:
+            # Switching a strategy is a real edit: the client sends the code it
+            # selected, and dropping it here made the save look successful while
+            # the deployment kept the old strategy. Only codes the platform
+            # actually offers are accepted, so a stale or hand-made payload
+            # cannot point a deployment at something that does not exist.
+            requested_code = str(payload.get("strategy_code") or "").strip()
+            strategy_code = requested_code or str(deployment.get("strategy_code") or "")
+            if requested_code and requested_code != deployment.get("strategy_code"):
+                if requested_code != "CUSTOM_AI_V1":
+                    offered = connection.execute(
+                        """
+                        SELECT code FROM official_ai_strategies
+                        WHERE code = ? AND enabled = 1
+                        """,
+                        (requested_code,),
+                    ).fetchone()
+                    if offered is None:
+                        raise RuntimeError("invalid_strategy_code")
+                # A new strategy has its own switch names, so the old ones are
+                # cleared rather than left to be read by the new one.
+                for key in ("strategy_type", "workflow", "open_logic", "position_logic", "ea_description"):
+                    config.pop(key, None)
+                if requested_code == "CUSTOM_AI_V1":
+                    # Switching *to* the custom engine: its graph arrives in this
+                    # same save and has to be stored here, because the custom
+                    # branch above ran against the previous strategy code.
+                    if isinstance(payload.get("workflow"), dict):
+                        config["workflow"] = payload["workflow"]
+                    config["open_logic"] = str(payload.get("open_logic") or "").strip()
+                    config["position_logic"] = str(payload.get("position_logic") or "").strip()
+                    config["ea_description"] = str(payload.get("ea_description") or "").strip()
             connection.execute(
                 """
                 UPDATE deployments
-                SET strategy_name = ?, status = ?, mt_login = ?, config_json = ?, updated_at = ?
+                SET strategy_code = ?, strategy_name = ?, status = ?, mt_login = ?, config_json = ?, updated_at = ?
                 WHERE id = ? AND user_id = ? AND status <> 'deleted'
                 """,
-                (strategy_name, status, mt_login or None, json.dumps(config, ensure_ascii=False), now, deployment_id, str(user_id)),
+                (strategy_code, strategy_name, status, mt_login or None, json.dumps(config, ensure_ascii=False), now, deployment_id, str(user_id)),
             )
             updated = connection.execute("SELECT * FROM deployments WHERE id = ?", (deployment_id,)).fetchone()
         if updated is None:
