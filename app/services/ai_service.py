@@ -260,6 +260,7 @@ class AiDecisionClient:
                     "analysis": "detailed final Chinese market explanation",
                 },
             },
+            response_schema=_PA_OPEN_SCHEMA,
         )
 
     def generate_custom_workflow_stage(
@@ -1813,6 +1814,19 @@ _TURTLE_OPEN_RISK_SCHEMA = (
 _TURTLE_POSITION_REVIEW_SCHEMA = (
     '{"close_now":false,"allow_add":true,"risk_level":"low|medium|high",'
     '"reason":"short Chinese reason","analysis":"concise Chinese conclusion"}'
+)
+
+# The keys the price-action entry decision reads. The generic open shape has no
+# entry_price, sl_price, tp_price, order_type or estimated_win_rate, and the
+# model follows the system prompt rather than the payload hint, so PA read None
+# for all five: the entry silently fell back to the market price and the
+# win-rate guard never ran. scripts/audit_ai_contracts.py reports the drift.
+_PA_OPEN_SCHEMA = (
+    '{"should_open":false,"direction":"buy|sell|none","confidence":0.0,'
+    '"estimated_win_rate":0.0,"entry_price":0.0,"sl_price":0.0,"tp_price":0.0,'
+    '"sl_distance_price":0.0,"tp_distance_price":0.0,"lot":0.0,'
+    '"order_type":"market|limit|stop","reason":"short Chinese reason",'
+    '"analysis":"concise Chinese conclusion"}'
 )
 
 

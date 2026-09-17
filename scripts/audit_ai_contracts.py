@@ -16,6 +16,13 @@ what does not line up.
 Run it from the repository root:
 
     python scripts/audit_ai_contracts.py
+
+Known limitation: reads are attributed through the client method that produced
+the reply plus one level of helper, so when a single function calls two
+different endpoints - PA's evaluate_open asks the diagnosis endpoint and then
+the open endpoint - the diagnosis line also lists the open decision's keys.
+Verified by hand: PA's diagnosis parsing reads none of them, so that line is
+noise from the attribution, not drift in the code.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.services import ai_service  # noqa: E402
 from app.services.ai_service import (  # noqa: E402
+    _PA_OPEN_SCHEMA,
     _REQUIRED_VERDICT_KEYS,
     _TURTLE_OPEN_RISK_SCHEMA,
     _TURTLE_POSITION_REVIEW_SCHEMA,
@@ -48,25 +56,24 @@ _CONSUMERS = (
 _ENDPOINTS = ("open", "position", "pa_diag", "workflow_stage")
 
 
-def _declared_shapes() -> dict[str, list[tuple[str, frozenset[str]]]]:
-    """Keys the model is told to answer with, per endpoint and call site.
+def _declared_shapes() -> dict[tuple[str, str], frozenset[str]]:
+    """Keys the model is told to answer with, per strategy file and endpoint.
 
-    Taken from the same constants the service uses, so this audit cannot drift
-    away from the prompts it is auditing.
+    A call site may declare its own shape, which replaces the generic one for
+    that call only, so the audit has to know which file uses which. Taken from
+    the same constants the service uses, so this cannot drift from the prompts it
+    audits.
     """
+    generic_open = _keys_of(_json_api_system_prompt("open", ""))
+    generic_position = _keys_of(_json_api_system_prompt("position", ""))
     return {
-        "open": [
-            ("generic shape", _keys_of(_json_api_system_prompt("open", ""))),
-            ("GL entry gate", _keys_of(_TURTLE_OPEN_RISK_SCHEMA)),
-        ],
-        "position": [
-            ("generic shape", _keys_of(_json_api_system_prompt("position", ""))),
-            ("GL position review", _keys_of(_TURTLE_POSITION_REVIEW_SCHEMA)),
-        ],
-        "pa_diag": [("dedicated shape", _keys_of(_json_api_system_prompt("pa_diag", "")))],
-        "workflow_stage": [
-            ("dedicated shape", _keys_of(_json_api_system_prompt("workflow_stage", "")))
-        ],
+        ("turtle_agent.py", "open"): generic_open | _keys_of(_TURTLE_OPEN_RISK_SCHEMA),
+        ("turtle_agent.py", "position"): generic_position | _keys_of(_TURTLE_POSITION_REVIEW_SCHEMA),
+        ("pa_agent_lite.py", "open"): generic_open | _keys_of(_PA_OPEN_SCHEMA),
+        ("pa_agent_lite.py", "position"): generic_position,
+        ("pa_agent_lite.py", "pa_diag"): _keys_of(_json_api_system_prompt("pa_diag", "")),
+        ("custom_ai.py", "open"): generic_open,
+        ("custom_ai.py", "position"): generic_position,
     }
 
 
@@ -170,18 +177,43 @@ def _call_sites() -> list[dict[str, Any]]:
             return names
 
         per_endpoint: dict[str, set[str]] = {}
-        for node in functions.values():
-            for name in calls_in(node):
-                endpoint = _METHOD_ENDPOINTS.get(name)
+        # Which call sites serve which endpoint, so a helper shared by two of
+        # them can be excluded instead of crediting its keys to both.
+        callers_per_endpoint: dict[str, set[str]] = {}
+        own_reads: dict[str, set[str]] = {}
+        for name, node in functions.items():
+            for called in calls_in(node):
+                endpoint = _METHOD_ENDPOINTS.get(called)
                 if endpoint is None:
                     continue
-                keys = _string_keys(node, _content_names(node))
-                # One level of callee, which is where the reply is usually parsed.
+                callers_per_endpoint.setdefault(endpoint, set()).add(name)
+                own_reads.setdefault(endpoint, set()).update(
+                    _string_keys(node, _content_names(node))
+                )
+
+        for endpoint, callers in callers_per_endpoint.items():
+            keys = set(own_reads.get(endpoint, set()))
+            for caller in callers:
+                node = functions.get(caller)
+                if node is None:
+                    continue
                 for callee in calls_in(node):
                     helper = functions.get(callee)
-                    if helper is not None:
-                        keys |= _string_keys(helper, _content_names(helper))
-                per_endpoint.setdefault(endpoint, set()).update(keys)
+                    if helper is None:
+                        continue
+                    # Only helpers this endpoint alone reaches: a shared one may
+                    # serve another endpoint, and its keys would be miscredited.
+                    serves_others = any(
+                        callee in calls_in(functions[other])
+                        for other_endpoint, others in callers_per_endpoint.items()
+                        if other_endpoint != endpoint
+                        for other in others
+                        if other in functions
+                    )
+                    if serves_others:
+                        continue
+                    keys |= _string_keys(helper, _content_names(helper))
+            per_endpoint[endpoint] = keys
 
         if per_endpoint:
             sites.append({"file": path.name, "endpoints": per_endpoint})
@@ -193,20 +225,23 @@ def main() -> int:
     declared_shapes = _declared_shapes()
     problems = 0
     for endpoint in _ENDPOINTS:
-        declared: set[str] = set()
-        for _label, keys in declared_shapes.get(endpoint, []):
-            declared |= set(keys)
         required = set(_REQUIRED_VERDICT_KEYS.get(endpoint, ()))
         read: set[str] = set()
-        print(f"\n=== {endpoint} ===")
-        print(f"  prompt asks for : {', '.join(sorted(declared)) or '-'}")
-        print(f"  parser requires : {', '.join(sorted(required)) or '(none, any object)'}")
+        declared: set[str] = set()
+        readers: list[tuple[str, set[str]]] = []
         for site in sites:
             keys = site["endpoints"].get(endpoint)
             if keys is None:
                 continue
+            readers.append((site["file"], keys))
             read |= keys
-            print(f"  reads in {site['file']}")
+            declared |= set(declared_shapes.get((site["file"], endpoint), frozenset()))
+
+        print(f"\n=== {endpoint} ===")
+        print(f"  prompt asks for : {', '.join(sorted(declared)) or '-'}")
+        print(f"  parser requires : {', '.join(sorted(required)) or '(none, any object)'}")
+        for name, _keys in readers:
+            print(f"  reads in {name}")
 
         # A reader must only touch names the prompt actually offers, or it will
         # silently read nothing when the model answers as instructed.
