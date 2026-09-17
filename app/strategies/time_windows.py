@@ -24,6 +24,15 @@ _US_EASTERN_STANDARD = timedelta(hours=-5)
 _US_EASTERN_DAYLIGHT = timedelta(hours=-4)
 
 
+def now_utc() -> datetime:
+    """The current instant in UTC.
+
+    Indirected so a caller - or a test - can decide what "now" means without
+    touching the clock, which keeps a strategy run reproducible.
+    """
+    return datetime.now(timezone.utc)
+
+
 def _nth_sunday(year: int, month: int, n: int) -> date:
     first = date(year, month, 1)
     # weekday(): Monday is 0, Sunday is 6.

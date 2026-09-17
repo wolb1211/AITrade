@@ -216,7 +216,7 @@ def _cautious_entry_conditions(
 
     boundaries = _us_window_boundaries(config)
     if boundaries is not None and time_windows.in_us_entry_window(
-        datetime.now(timezone.utc), start=boundaries[0], end=boundaries[1]
+        time_windows.now_utc(), start=boundaries[0], end=boundaries[1]
     ):
         return True, None, "美盘数据/开盘窗口内不追单"
 

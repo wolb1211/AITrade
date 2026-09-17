@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as clock_time, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, TradeDecision
 from app.services.ai_service import AiDecisionClient
+from app.strategies import time_windows
 from app.strategies.stop_rules import min_stop_distance, respect_min_stop, stop_is_placeable
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,23 @@ class TurtleTrendStrategy:
         else:
             return _hold_open(request, "趋势尚未形成：区间突破与回调结构均未成立，继续等待")
         entry = request.ask if direction == "buy" else request.bid
+        # The US data/open window and a spike bar both mean the move has just
+        # happened; those entries wait for a pullback at the level that was
+        # broken instead of buying the top of it.
+        waits, anchor, wait_reason = _pending_entry_conditions(
+            candles=candles, direction=direction, upper=upper, lower=lower,
+            donchian_fired=bool(donchian_direction), atr=atr, config=config,
+        )
+        order_type = "market"
+        wait_note = ""
+        if waits and anchor > 0:
+            # A limit only works when it sits behind the market, which is the case
+            # these conditions describe; otherwise the market entry stands.
+            behind_market = anchor < request.bid if direction == "buy" else anchor > request.ask
+            if behind_market:
+                order_type = "limit"
+                entry = anchor
+                wait_note = f"（{wait_reason}，改为限价挂单等待回调）"
         sl = entry - STOP_ATR * atr if direction == "buy" else entry + STOP_ATR * atr
         # A stop the broker will refuse is worse than a wider usable one, so the
         # entry stop respects the minimum distance too.
@@ -134,7 +152,7 @@ class TurtleTrendStrategy:
         decision = TradeDecision(
             decision_id=_id(), request_id=request.request_id, status="APPROVED",
             action="BUY" if direction == "buy" else "SELL", symbol=request.symbol,
-            confidence=1.0, reason=entry_analysis,
+            confidence=1.0, reason=entry_analysis + wait_note,
             expires_at=_expires(), lot=lot, entry=entry, sl=sl, tp=None,
             metadata={
                 "strategy_code": self.code,
@@ -146,6 +164,7 @@ class TurtleTrendStrategy:
                 # one fired and whether they ever disagreed.
                 "swing_direction": swing_direction,
                 "donchian_direction": donchian_direction,
+                "order_type": order_type,
                 # Non-zero when the broker's minimum stop distance moved this
                 # entry's stop, so a wider stop than the ATR rule implies is
                 # explainable from the decision alone.
@@ -451,6 +470,89 @@ class TurtleTrendStrategy:
             + (f"：{ai_text}" if ai_text else ""),
             result.usage,
         )
+
+
+# A closed bar this many times wider than the ATR is the move itself - a release
+# spike or an opening drive - and entering at market there enters at its end.
+DEFAULT_SPIKE_BAR_ATR = 2.0
+
+
+def _pending_entry_conditions(
+    *,
+    candles: list[Any],
+    direction: str,
+    upper: float,
+    lower: float,
+    donchian_fired: bool,
+    atr: float,
+    config: dict[str, Any],
+) -> tuple[bool, float, str]:
+    """Whether this entry must wait for a pullback, and at what price.
+
+    Only the two "the move just finished" cases are checked for this strategy:
+    the US data/open window and a spike bar. A generic chase limit is not applied
+    here on purpose - a trend entry is expected to be some way beyond the level
+    it broke, and refusing those would remove the breakout entries the strategy
+    exists for.
+
+    The anchor is the level that was broken, which is where a retest would come
+    back to. When the bar that just closed is itself the spike, its middle wins:
+    that is the level the newest move would retrace to, and it sits nearer the
+    market, so the order is more likely to be filled than one parked at the
+    channel.
+    """
+    if atr <= 0:
+        return False, 0.0, ""
+
+    anchor = 0.0
+    if donchian_fired and upper > 0 and lower > 0:
+        anchor = float(upper) if direction == "buy" else float(lower)
+
+    boundaries = _us_window_boundaries(config)
+    in_window = boundaries is not None and time_windows.in_us_entry_window(
+        time_windows.now_utc(), start=boundaries[0], end=boundaries[1]
+    )
+
+    spike = False
+    spike_mid = 0.0
+    if candles:
+        bar = candles[-1]
+        bar_range = max(float(bar.high) - float(bar.low), 0.0)
+        spike_limit = _positive_float(config.get("spike_bar_atr"), default=DEFAULT_SPIKE_BAR_ATR)
+        if spike_limit > 0 and bar_range > spike_limit * atr:
+            spike = True
+            spike_mid = (float(bar.high) + float(bar.low)) / 2.0
+            anchor = spike_mid
+
+    if not in_window and not spike:
+        return False, 0.0, ""
+    if anchor <= 0:
+        return False, 0.0, ""
+    reason = "上一根K线振幅偏大（尖峰），不追单" if spike else "美盘数据/开盘窗口内不追单"
+    return True, anchor, reason
+
+
+def _us_window_boundaries(config: dict[str, Any]) -> tuple[Any, Any] | None:
+    """The cautious window in US Eastern time, or None when it is switched off."""
+    if config.get("us_window_guard") in (False, 0, "0", "false", "off", "no"):
+        return None
+    start = _clock_time(config.get("us_window_start"), time_windows.DEFAULT_WINDOW_START)
+    end = _clock_time(config.get("us_window_end"), time_windows.DEFAULT_WINDOW_END)
+    if start is None or end is None or start >= end:
+        return None
+    return start, end
+
+
+def _clock_time(value: Any, fallback: Any) -> Any:
+    """Parse an "HH:MM" deployment setting, falling back when it is unusable."""
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    try:
+        hour, _, minute = text.partition(":")
+        return clock_time(int(hour), int(minute or 0))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _ordered(candles):
