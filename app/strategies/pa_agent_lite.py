@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as clock_time, timedelta, timezone
 import math
 from typing import Any
 from uuid import uuid4
@@ -10,6 +10,7 @@ from uuid import uuid4
 from app.models import Candle, OpenEvaluateRequest, PositionEvaluateRequest, PositionSnapshot, TradeDecision, UsageSummary
 from app.services.ai_service import AiDecisionClient
 from app.strategies import pa_knowledge
+from app.strategies import time_windows
 from app.strategies.stop_rules import respect_min_stop, stop_is_placeable
 
 # Minimum reward-to-risk the server will accept from an AI-proposed target.
@@ -125,6 +126,12 @@ def _order_type_code(value: Any) -> str:
 MAX_MARKET_CHASE_ATR = 0.5
 
 
+# A closed bar this many times wider than the ATR means the move just happened:
+# a release spike or an opening drive. Entering at market there is entering at
+# the end of it, which is where production kept getting stopped.
+DEFAULT_SPIKE_BAR_ATR = 2.0
+
+
 def _avoid_chasing_entry(
     *,
     order_type: str,
@@ -133,6 +140,9 @@ def _avoid_chasing_entry(
     ideal_entry: float | None,
     atr: float,
     config: dict[str, Any],
+    force_pending: bool = False,
+    pending_price: float | None = None,
+    force_reason: str = "",
 ) -> tuple[str, float | None, str]:
     """Send a chased market order as a pending one at the level it missed.
 
@@ -141,8 +151,23 @@ def _avoid_chasing_entry(
     so the pending price sits behind the market rather than in front of it.
     Returns the order type to use, the entry price for it, and a panel note; an
     empty order type means the deployment prefers to stand aside instead.
+
+    ``force_pending`` converts regardless of distance, for the two windows where
+    the move has just finished - the US release/opening window and a spike bar.
     """
-    if order_type != "market" or atr <= 0:
+    if order_type != "market":
+        return order_type, ai_entry, ""
+
+    if force_pending and atr > 0:
+        target = pending_price if pending_price and pending_price > 0 else None
+        if target is None:
+            target = ai_entry if ai_entry and ai_entry > 0 else ideal_entry
+        if target and target > 0:
+            note = force_reason or "行情刚走完一段"
+            return "limit", float(target), f"（{note}，改为限价挂单等待回调）"
+        return order_type, ai_entry, ""
+
+    if atr <= 0:
         return order_type, ai_entry, ""
 
     # An explicit 0 switches the rule off, so absent and zero are told apart
@@ -170,6 +195,70 @@ def _avoid_chasing_entry(
     if str(config.get("chase_fallback") or "limit").strip().lower() == "reject":
         return "", ai_entry, f"{distance_note}，本根不追单，等待回调"
     return "limit", float(target), f"（{distance_note}，改为限价挂单等待回调）"
+
+
+def _cautious_entry_conditions(
+    *,
+    request: OpenEvaluateRequest,
+    config: dict[str, Any],
+    atr: float,
+) -> tuple[bool, float | None, str]:
+    """Whether this entry must wait, and at what price.
+
+    Two things mean the move has just happened: the US release/opening window,
+    where a drive is entered exactly as it finishes, and a closed bar far wider
+    than the ATR, which is what a release spike leaves behind. In both cases the
+    entry is placed at a pullback level - the middle of the spike bar, or the
+    level the server wanted - instead of at market.
+    """
+    if atr <= 0:
+        return False, None, ""
+
+    boundaries = _us_window_boundaries(config)
+    if boundaries is not None and time_windows.in_us_entry_window(
+        datetime.now(timezone.utc), start=boundaries[0], end=boundaries[1]
+    ):
+        return True, None, "美盘数据/开盘窗口内不追单"
+
+    spike_limit = _optional_float(config.get("spike_bar_atr"))
+    if spike_limit is None:
+        spike_limit = DEFAULT_SPIKE_BAR_ATR
+    if spike_limit <= 0:
+        return False, None, ""
+
+    candles = list(request.candles or [])
+    if not candles:
+        return False, None, ""
+    bar = candles[-1]
+    bar_range = max(float(bar.high) - float(bar.low), 0.0)
+    if bar_range <= spike_limit * atr:
+        return False, None, ""
+    return True, (float(bar.high) + float(bar.low)) / 2.0, (
+        f"上一根K线振幅 {bar_range / atr:.1f} 倍ATR（尖峰），不追单"
+    )
+
+
+def _us_window_boundaries(config: dict[str, Any]) -> tuple[Any, Any] | None:
+    """The cautious window in US Eastern time, or None when it is switched off."""
+    if config.get("us_window_guard") in (False, 0, "0", "false", "off", "no"):
+        return None
+    start = _clock_time(config.get("us_window_start"), time_windows.DEFAULT_WINDOW_START)
+    end = _clock_time(config.get("us_window_end"), time_windows.DEFAULT_WINDOW_END)
+    if start is None or end is None or start >= end:
+        return None
+    return start, end
+
+
+def _clock_time(value: Any, fallback: Any) -> Any:
+    """Parse an "HH:MM" deployment setting, falling back when it is unusable."""
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    try:
+        hour, _, minute = text.partition(":")
+        return clock_time(int(hour), int(minute or 0))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _order_type_label(code: str) -> str:
@@ -633,6 +722,11 @@ class PaAgentLiteStrategy:
             market_entry = request.bid
 
         ai_entry = _optional_float(content.get("entry_price"))
+        force_pending, pending_price, force_reason = _cautious_entry_conditions(
+            request=request,
+            config=config,
+            atr=features.atr14,
+        )
         order_type, ai_entry, chase_note = _avoid_chasing_entry(
             order_type=order_type,
             ai_entry=ai_entry,
@@ -640,6 +734,9 @@ class PaAgentLiteStrategy:
             ideal_entry=_optional_float(getattr(local_decision, "entry", None)),
             atr=features.atr14,
             config=config,
+            force_pending=force_pending,
+            pending_price=pending_price,
+            force_reason=force_reason,
         )
         if not order_type:
             return _hold(
