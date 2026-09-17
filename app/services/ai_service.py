@@ -3413,6 +3413,18 @@ def _compact_workflow_indicators(indicators: dict[str, Any], *, limit: int) -> d
     return {"order": "oldest_to_latest", "values": compact_values}
 
 
+# A reply only has to carry one of the vocabularies its caller actually reads.
+# Requiring one exact name rejected a valid GL position review that answered
+# close_now and allow_add, and the rejection reached the operator as "not
+# standard JSON", which sent the investigation after a syntax problem that was
+# never there. The strategies read the keys listed against their endpoint:
+# GL/PA review close_now/allow_add/risk_level, the custom engine reads action.
+_REQUIRED_VERDICT_KEYS: dict[str, tuple[str, ...]] = {
+    "open": ("should_open", "allow_open"),
+    "position": ("action", "close_now", "allow_add"),
+}
+
+
 def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
     stripped = content.strip()
     if not stripped:
@@ -3430,9 +3442,9 @@ def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
         parsed = json.loads(json_object)
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
-    required_key = "should_open" if endpoint == "open" else "action" if endpoint == "position" else ""
-    if required_key and required_key not in parsed:
-        raise ValueError(f"AI response missing required key: {required_key}")
+    required_keys = _REQUIRED_VERDICT_KEYS.get(endpoint, ())
+    if required_keys and not any(key in parsed for key in required_keys):
+        raise ValueError(f"AI response missing required key: {' or '.join(required_keys)}")
     _normalize_decision_reason(parsed, endpoint=endpoint)
     return parsed
 
