@@ -117,6 +117,61 @@ def _order_type_code(value: Any) -> str:
     return _ORDER_TYPE_CODES.get(raw, "market")
 
 
+# A market order is only acceptable while the price is still near the entry the
+# server computed. Past this many ATR the setup is being chased, and a chased
+# entry lands at the end of the move where the first pullback stops it out -
+# which is what production showed: the price-action strategy entered at market
+# every time (the model's order_type never reached it) and lost on most symbols.
+MAX_MARKET_CHASE_ATR = 0.5
+
+
+def _avoid_chasing_entry(
+    *,
+    order_type: str,
+    ai_entry: float | None,
+    market_entry: float,
+    ideal_entry: float | None,
+    atr: float,
+    config: dict[str, Any],
+) -> tuple[str, float | None, str]:
+    """Send a chased market order as a pending one at the level it missed.
+
+    A limit at the ideal entry is always on the right side here: the conversion
+    only happens once the price has moved away from it in the trade's direction,
+    so the pending price sits behind the market rather than in front of it.
+    Returns the order type to use, the entry price for it, and a panel note; an
+    empty order type means the deployment prefers to stand aside instead.
+    """
+    if order_type != "market" or atr <= 0:
+        return order_type, ai_entry, ""
+
+    # An explicit 0 switches the rule off, so absent and zero are told apart
+    # rather than both falling back to the default.
+    configured = config.get("max_market_chase_atr")
+    if configured is None:
+        limit = MAX_MARKET_CHASE_ATR
+    else:
+        try:
+            limit = float(configured)
+        except (TypeError, ValueError):
+            limit = MAX_MARKET_CHASE_ATR
+    if limit <= 0:
+        return order_type, ai_entry, ""
+
+    target = ai_entry if ai_entry and ai_entry > 0 else ideal_entry
+    if not target or target <= 0:
+        return order_type, ai_entry, ""
+
+    chase = abs(float(market_entry) - float(target))
+    if chase <= limit * atr:
+        return order_type, ai_entry, ""
+
+    distance_note = f"价格已追离理想入场位 {chase / atr:.1f} 倍ATR"
+    if str(config.get("chase_fallback") or "limit").strip().lower() == "reject":
+        return "", ai_entry, f"{distance_note}，本根不追单，等待回调"
+    return "limit", float(target), f"（{distance_note}，改为限价挂单等待回调）"
+
+
 def _order_type_label(code: str) -> str:
     return _ORDER_TYPE_LABELS.get(code, "市价单")
 
@@ -577,11 +632,29 @@ class PaAgentLiteStrategy:
             action = "SELL"
             market_entry = request.bid
 
+        ai_entry = _optional_float(content.get("entry_price"))
+        order_type, ai_entry, chase_note = _avoid_chasing_entry(
+            order_type=order_type,
+            ai_entry=ai_entry,
+            market_entry=market_entry,
+            ideal_entry=_optional_float(getattr(local_decision, "entry", None)),
+            atr=features.atr14,
+            config=config,
+        )
+        if not order_type:
+            return _hold(
+                request,
+                self._decision_id(),
+                chase_note,
+                confidence=min(confidence, 0.4),
+                usage=usage,
+            )
+
         entry, entry_error = _resolve_entry_price(
             order_type=order_type,
             direction=direction,
             market_entry=market_entry,
-            ai_entry=_optional_float(content.get("entry_price")),
+            ai_entry=ai_entry,
         )
         if entry_error:
             return _hold(
@@ -658,6 +731,8 @@ class PaAgentLiteStrategy:
 
         metadata = _setup_metadata(features)
         metadata["order_type"] = order_type
+        if chase_note:
+            metadata["chase_note"] = chase_note
         metadata.update(_diagnosis_metadata(diagnosis))
         return TradeDecision(
             decision_id=self._decision_id(),
@@ -666,7 +741,8 @@ class PaAgentLiteStrategy:
             action=action,
             symbol=request.symbol,
             confidence=confidence,
-            reason=_panel_reason(_order_type_label(order_type), content, stage1_text, "AI 策略批准开仓"),
+            reason=_panel_reason(_order_type_label(order_type), content, stage1_text, "AI 策略批准开仓")
+            + chase_note,
             expires_at=self._expires_at(),
             lot=lot,
             entry=entry,
