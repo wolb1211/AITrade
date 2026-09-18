@@ -53,6 +53,8 @@ from app.services.custom_indicators import public_indicator_catalog
 from app.services.custom_workflow import workflow_catalog, workflow_json_schema, workflow_validation_result
 from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
 from app.store import SqliteStore
+from app.strategies import turtle_agent
+from app.strategies.pending_orders import cancel_stale_pending_orders
 
 logger = logging.getLogger("gainlab.mt5")
 
@@ -583,18 +585,31 @@ def create_mt5_router(
             for item in request.positions
             if not _is_pending_mt_type(item.mt_type)
         ]
+        # A pending order is not a position and must never be managed as one, but
+        # it is still the client's exposure: when the level it waits for is gone,
+        # the server says so and the client deletes it. The client keeps sending
+        # them in the same list, so nothing has to change on its side.
+        pending_snapshots = [
+            _position_snapshot(item, bid=request.market.bid, ask=request.market.ask)
+            for item in request.positions
+            if _is_pending_mt_type(item.mt_type)
+        ]
+        cancel_actions = _pending_cancel_actions(request, deployment, pending_snapshots)
         if not open_positions:
             # A client holding only pending orders: there is nothing to manage,
             # and the strategy request requires at least one position.
             return Mt5PositionDecisionResponse(
                 status="ok",
-                has_action=False,
-                description="当前只有挂单、没有持仓，本轮无需管理",
+                has_action=bool(cancel_actions),
+                description=(
+                    cancel_actions[0].comment if cancel_actions
+                    else "当前只有挂单、没有持仓，本轮无需管理"
+                ),
                 spread=request.market.spread,
                 decision_id=f"dec_no_positions_{sha256(request_id.encode('utf-8')).hexdigest()[:24]}",
                 request_id=request_id,
-                actions_count=0,
-                actions=[],
+                actions_count=len(cancel_actions),
+                actions=cancel_actions,
             )
 
         evaluate_request = PositionEvaluateRequest(
@@ -623,6 +638,7 @@ def create_mt5_router(
             spread=request.market.spread,
             positions=request.positions,
             metadata=request.market.metadata,
+            cancel_actions=cancel_actions,
         )
 
     return router
@@ -1957,18 +1973,55 @@ def _mt5_open_random_response(
     )
 
 
+def _pending_cancel_actions(
+    request: Mt5PositionDecisionRequest,
+    deployment: dict[str, Any],
+    pending: list[PositionSnapshot],
+) -> list[Mt5PositionAction]:
+    """Cancel actions for the client's pending orders, decided here."""
+    if not pending:
+        return []
+    config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+    try:
+        period = max(1, int(config.get("atr_period") or 20))
+    except (TypeError, ValueError):
+        period = 20
+    candles = _candles(request.market.bars)
+    atr = turtle_agent._atr(candles, period) if candles else 0.0
+    decided = cancel_stale_pending_orders(
+        pending,
+        bid=request.market.bid,
+        ask=request.market.ask,
+        atr=atr,
+        config=config,
+        timeframe=request.timeframe,
+        now_epoch=int(time.time()),
+    )
+    return [
+        Mt5PositionAction(
+            action="cancel",
+            ticket=str(item.get("ticket") or ""),
+            direction=item.get("direction"),
+            price=float(item.get("price") or 0),
+            comment=str(item.get("comment") or "挂单失效取消"),
+        )
+        for item in decided
+    ]
+
+
 def _mt5_position_response(
     decision: TradeDecision,
     *,
     spread: float,
     positions: list[Mt5Position],
     metadata: Any = None,
+    cancel_actions: list[Mt5PositionAction] | None = None,
 ) -> Mt5PositionDecisionResponse:
     notice = _ea_update_notice(metadata)
     description = _panel_description(decision)
     if notice:
         description = f"{description}；{notice}"
-    actions: list[Mt5PositionAction] = []
+    actions: list[Mt5PositionAction] = list(cancel_actions or [])
     batch_actions = decision.metadata.get("batch_actions") if isinstance(decision.metadata, dict) else None
     if isinstance(batch_actions, list):
         for item in batch_actions:
