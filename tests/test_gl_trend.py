@@ -1098,6 +1098,60 @@ def test_cautious_verdict_still_opens_and_explains_the_gate() -> None:
     assert "AI 仅在判定高风险时才阻止开仓" in decision.reason
 
 
+def _confirm_bar(open_: float, high: float, low: float, close: float, index: int = 0) -> Candle:
+    return Candle(
+        timestamp=1_700_000_000 + index * 900, open=open_, high=high, low=low,
+        close=close, volume=1.0,
+    )
+
+
+def _flat_bars(count: int, start: int = 0) -> list[Candle]:
+    return [_confirm_bar(100.0, 100.5, 99.5, 100.0, start + i) for i in range(count)]
+
+
+def test_two_conditions_with_one_on_the_newest_bar_confirm() -> None:
+    """The source design: at least two conditions inside the window, one of them now."""
+    from app.strategies import turtle_agent
+
+    # A bullish pin bar two bars back, then a bearish bar, then a bullish engulfing
+    # on the newest bar. Two distinct conditions, and the newest bar carries one.
+    candles = _flat_bars(5)
+    candles.append(_confirm_bar(100.0, 100.5, 95.0, 100.4, 5))    # pin bar
+    candles.append(_confirm_bar(101.0, 101.2, 99.8, 100.0, 6))    # bearish
+    candles.append(_confirm_bar(99.9, 101.5, 99.5, 101.3, 7))     # engulfing (newest)
+
+    text = turtle_agent._confirmation_text(candles, 5, "buy", 2)
+
+    assert "Pin Bar" in text
+    assert "吞没" in text
+
+
+def test_a_single_condition_is_no_longer_enough() -> None:
+    """One condition used to be enough, which is what made entries late."""
+    from app.strategies import turtle_agent
+
+    candles = _flat_bars(6)
+    candles.append(_confirm_bar(101.0, 101.2, 99.8, 100.0, 6))
+    candles.append(_confirm_bar(99.9, 101.5, 99.5, 101.3, 7))     # engulfing only
+
+    assert turtle_agent._confirmation_text(candles, 5, "buy", 2) == ""
+    # The setting restores the old behaviour when a deployment wants it.
+    assert turtle_agent._confirmation_text(candles, 5, "buy", 1) != ""
+
+
+def test_two_conditions_both_in_the_past_do_not_confirm() -> None:
+    """A condition from several bars ago must not count as a fresh trigger."""
+    from app.strategies import turtle_agent
+
+    candles = _flat_bars(3)
+    candles.append(_confirm_bar(100.0, 100.5, 95.0, 100.4, 3))    # pin bar, 4 bars back
+    candles.append(_confirm_bar(101.0, 101.2, 99.8, 100.0, 4))
+    candles.append(_confirm_bar(99.9, 101.5, 99.5, 101.3, 5))     # engulfing, 2 bars back
+    candles.append(_confirm_bar(101.0, 101.2, 100.0, 100.5, 6))    # nothing on the newest
+
+    assert turtle_agent._confirmation_text(candles, 5, "buy", 2) == ""
+
+
 def test_the_breakout_wording_follows_the_direction() -> None:
     """A sell breaks the low, and worded as a high it reads as a calculation error.
 

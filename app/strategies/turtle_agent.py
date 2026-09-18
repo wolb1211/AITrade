@@ -33,6 +33,12 @@ SWING_MIN_BARS = 30             # closed bars required before pivots are trusted
 SWING_PIVOT_SPAN = 2            # bars required on each side of a confirmed pivot
 SWING_PULLBACK_MIN_ATR = 0.5    # smallest pullback depth that qualifies
 SWING_CONFIRMATION_BARS = 5     # window searched for a confirmation bar
+# How many distinct confirmation conditions have to appear inside that window, and
+# one of them on the newest bar. Requiring only one, anywhere in the window, let a
+# condition from five bars ago count as a fresh entry - the trigger then fired
+# several bars after the move started, which is what the operator saw on the chart.
+# 1 restores the old behaviour.
+SWING_CONFIRM_MIN_SIGNALS = 2
 SWING_EMA_FAST = 5              # confirmation EMA cross, fast period
 SWING_EMA_SLOW = 10             # confirmation EMA cross, slow period
 PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
@@ -621,6 +627,9 @@ def _swing_pullback_signal(candles, atr: float, config: dict[str, Any]) -> tuple
     pivot_span = _positive_int(config.get("swing_pivot_span"), SWING_PIVOT_SPAN)
     min_pullback = _positive_float(config.get("pullback_min_atr"), default=SWING_PULLBACK_MIN_ATR)
     confirmation_window = _positive_int(config.get("swing_confirmation_bars"), SWING_CONFIRMATION_BARS)
+    confirm_min_signals = _positive_int(
+        config.get("swing_confirm_min_signals"), SWING_CONFIRM_MIN_SIGNALS
+    )
     points = _confirmed_pivots(candles, pivot_span)
     highs = [item for item in points if item[1] == "high"]
     lows = [item for item in points if item[1] == "low"]
@@ -635,7 +644,7 @@ def _swing_pullback_signal(candles, atr: float, config: dict[str, Any]) -> tuple
     if bullish_structure and last_low[0] > last_high[0]:
         pullback_size = last_high[2] - last_low[2]
         crossed = close > last_high[2] and _crossed_recently(candles, last_high[2], "buy", confirmation_window)
-        confirmation = _bullish_confirmation(candles, confirmation_window)
+        confirmation = _bullish_confirmation(candles, confirmation_window, confirm_min_signals)
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "buy", (
                 f"低点与高点同步抬高（{previous_low[2]:g}→{last_low[2]:g}，{previous_high[2]:g}→{last_high[2]:g}）；"
@@ -646,7 +655,7 @@ def _swing_pullback_signal(candles, atr: float, config: dict[str, Any]) -> tuple
     if bearish_structure and last_high[0] > last_low[0]:
         pullback_size = last_high[2] - last_low[2]
         crossed = close < last_low[2] and _crossed_recently(candles, last_low[2], "sell", confirmation_window)
-        confirmation = _bearish_confirmation(candles, confirmation_window)
+        confirmation = _bearish_confirmation(candles, confirmation_window, confirm_min_signals)
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "sell", (
                 f"高点与低点同步走低（{previous_high[2]:g}→{last_high[2]:g}，{previous_low[2]:g}→{last_low[2]:g}）；"
@@ -727,9 +736,67 @@ def _ema_series(values: list[float], period: int) -> list[float]:
     return result
 
 
-def _bullish_confirmation(candles, window: int) -> str:
-    event = _bullish_confirmation_event(candles, window)
-    return event[1] if event is not None else ""
+def _confirmation_signals(candles, window: int, direction: str) -> list[tuple[int, str]]:
+    """Every confirmation hit in the window, oldest first, as (bar index, kind).
+
+    Each condition is reported separately so the caller can require more than one
+    of them, and can require the newest bar to carry one - which is what makes the
+    entry punctual instead of firing several bars after the move started.
+    """
+    start = max(1, len(candles) - max(1, window))
+    hits: list[tuple[int, str]] = []
+    bullish = direction == "buy"
+    for index in range(start, len(candles)):
+        if _ema_cross(candles, SWING_EMA_FAST, SWING_EMA_SLOW, direction, index):
+            hits.append((index, "短均线上穿（金叉）" if bullish else "短均线下穿（死叉）"))
+            continue
+        previous, current = candles[index - 1], candles[index]
+        if bullish and previous.close < previous.open and current.close > current.open \
+                and current.open <= previous.close and current.close >= previous.open:
+            hits.append((index, "看涨吞没"))
+            continue
+        if not bullish and previous.close > previous.open and current.close < current.open \
+                and current.open >= previous.close and current.close <= previous.open:
+            hits.append((index, "看跌吞没"))
+            continue
+        body = abs(current.close - current.open)
+        if body > 0 and bullish:
+            wick = min(current.open, current.close) - current.low
+            if wick >= body * PIN_BAR_WICK_RATIO and current.close > (current.high + current.low) / 2:
+                hits.append((index, "看涨长下影（Pin Bar）"))
+        elif body > 0:
+            wick = current.high - max(current.open, current.close)
+            if wick >= body * PIN_BAR_WICK_RATIO and current.close < (current.high + current.low) / 2:
+                hits.append((index, "看跌长上影（Pin Bar）"))
+    return hits
+
+
+def _confirmation_text(candles, window: int, direction: str, min_signals: int) -> str:
+    """The confirmation wording, or an empty string when the bar does not qualify.
+
+    Two requirements, both from the source design: at least ``min_signals``
+    distinct conditions inside the window, and one of them on the newest bar. The
+    second is what stops a condition from five bars ago still counting as a fresh
+    entry - the trigger has to be happening now.
+    """
+    hits = _confirmation_signals(candles, window, direction)
+    if not hits:
+        return ""
+    kinds = list(dict.fromkeys(text for _, text in hits))
+    if len(kinds) < max(1, min_signals):
+        return ""
+    newest = len(candles) - 1
+    if not any(index == newest for index, _ in hits):
+        return ""
+    return "、".join(kinds)
+
+
+def _bullish_confirmation(candles, window: int, min_signals: int = 2) -> str:
+    return _confirmation_text(candles, window, "buy", min_signals)
+
+
+def _bearish_confirmation(candles, window: int, min_signals: int = 2) -> str:
+    return _confirmation_text(candles, window, "sell", min_signals)
 
 
 def _bullish_confirmation_event(candles, window: int) -> tuple[int, str] | None:
@@ -745,11 +812,6 @@ def _bullish_confirmation_event(candles, window: int) -> tuple[int, str] | None:
         if body > 0 and lower_wick >= body * PIN_BAR_WICK_RATIO and current.close > (current.high + current.low) / 2:
             return index, "看涨长下影（Pin Bar）确认"
     return None
-
-
-def _bearish_confirmation(candles, window: int) -> str:
-    event = _bearish_confirmation_event(candles, window)
-    return event[1] if event is not None else ""
 
 
 def _bearish_confirmation_event(candles, window: int) -> tuple[int, str] | None:
