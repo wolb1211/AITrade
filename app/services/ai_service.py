@@ -3543,6 +3543,7 @@ def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
         parsed = json.loads(json_object)
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
+    parsed = _translate_key_aliases(parsed)
     required_keys = _REQUIRED_VERDICT_KEYS.get(endpoint, ())
     if required_keys and not any(key in parsed for key in required_keys):
         raise ValueError(f"AI response missing required key: {' or '.join(required_keys)}")
@@ -3590,6 +3591,45 @@ _INTERNAL_FIELD_NAMES: dict[str, str] = {
     "max_units": "最大持仓数",
     "units_open": "已持仓数",
 }
+
+# Chinese spellings seen in real answers, including the variants models produce on
+# their own ("是否平仓" rather than the payload's "是否立即平仓").
+_CHINESE_KEY_ALIASES: dict[str, str] = {
+    **{chinese: english for english, chinese in _INTERNAL_FIELD_NAMES.items()},
+    "是否平仓": "close_now",
+    "是否立即平仓": "close_now",
+    "是否允许加仓": "allow_add",
+    "是否加仓": "allow_add",
+    "是否开仓": "should_open",
+    "是否允许开仓": "allow_open",
+    "允许开仓": "allow_open",
+    "开仓方向": "direction",
+    "交易方向": "direction",
+    "操作": "action",
+    "动作": "action",
+    "置信度": "confidence",
+    "理由": "reason",
+    "分析": "analysis",
+    "风险等级": "risk_level",
+}
+
+
+def _translate_key_aliases(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Accept an answer whose keys the model wrote in Chinese.
+
+    One model returned {"是否平仓": false, "是否允许加仓": true, ...} instead of the
+    English keys the prompt asks for, and the whole verdict was discarded as "not
+    standard JSON": a genuine close instruction would have been dropped silently.
+    Known Chinese names add the canonical key, and an English key the model did
+    send always wins.
+    """
+    translated = dict(parsed)
+    for key, value in parsed.items():
+        canonical = _CHINESE_KEY_ALIASES.get(str(key).strip())
+        if canonical and canonical not in translated:
+            translated[canonical] = value
+    return translated
+
 
 # Longest first so "bar_by_bar_summary" wins over "bar_by_bar". The lookarounds
 # replace \b, which fails next to CJK characters (the common real-world case).

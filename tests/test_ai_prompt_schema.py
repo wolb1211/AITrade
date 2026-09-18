@@ -76,6 +76,38 @@ def test_a_stray_question_mark_is_removed_from_chinese_prose() -> None:
     assert _strip_placeholder_marks("RSI?超买") == "RSI?超买"
 
 
+def test_an_answer_whose_keys_are_chinese_is_still_read() -> None:
+    """One model translated our key names; the verdict was discarded as malformed.
+
+    A genuine close instruction would have been dropped silently, and the panel
+    then said "AI返回格式异常" while the model had in fact answered.
+    """
+    from app.services.ai_service import _extract_json_object
+
+    parsed = _extract_json_object(
+        '{"是否平仓":false,"是否允许加仓":true,"风险等级":"medium","置信度":0.65,'
+        '"理由":"未出现破坏性结构，暂不平仓","分析":"市场结构：多头趋势仍在，价格在区间上方盘整后维持上涨。"}',
+        endpoint="position",
+    )
+
+    assert parsed["close_now"] is False
+    assert parsed["allow_add"] is True
+    assert parsed["risk_level"] == "medium"
+    assert parsed["confidence"] == 0.65
+    assert parsed["reason"] == "未出现破坏性结构，暂不平仓"
+    assert parsed["analysis"] == "市场结构：多头趋势仍在，价格在区间上方盘整后维持上涨。"
+
+
+def test_an_english_key_the_model_did_send_wins() -> None:
+    from app.services.ai_service import _extract_json_object
+
+    parsed = _extract_json_object(
+        '{"close_now":true,"是否平仓":false,"reason":"平掉"}', endpoint="position"
+    )
+
+    assert parsed["close_now"] is True
+
+
 def test_the_parser_cleans_the_reason_it_returns() -> None:
     """The scrub runs where every decision's text is finalised."""
     from app.services.ai_service import _extract_json_object
