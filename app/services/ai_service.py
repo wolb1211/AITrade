@@ -1303,7 +1303,19 @@ class AiDecisionClient:
                         usage,
                         request_payload=user_payload,
                         request_snapshot=request_snapshot,
-                        success=True,
+                        # The answer could not be read as the contract asks, so this
+                        # is not a successful call however intact the JSON looked:
+                        # the operator read "成功" next to a panel that said the
+                        # format was unreadable and ignored it.
+                        success=_has_required_verdict(recovered, endpoint),
+                        error_message=(
+                            ""
+                            if _has_required_verdict(recovered, endpoint)
+                            else "AI 回答无法按约定字段读取，已按保守风控兜底"
+                        ),
+                        response_source=(
+                            "recovered" if _has_required_verdict(recovered, endpoint) else "fallback"
+                        ),
                         is_custom=is_custom,
                         response_preview=response_preview,
                         cache_id=cache_id,
@@ -3526,6 +3538,12 @@ _REQUIRED_VERDICT_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _has_required_verdict(parsed: dict[str, Any], endpoint: str) -> bool:
+    """Whether the answer carries a key this endpoint's verdict can be read from."""
+    required = _REQUIRED_VERDICT_KEYS.get(endpoint, ())
+    return not required or any(key in parsed for key in required)
+
+
 def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
     stripped = content.strip()
     if not stripped:
@@ -3544,8 +3562,8 @@ def _extract_json_object(content: str, *, endpoint: str = "") -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("AI response must be a JSON object")
     parsed = _translate_key_aliases(parsed)
-    required_keys = _REQUIRED_VERDICT_KEYS.get(endpoint, ())
-    if required_keys and not any(key in parsed for key in required_keys):
+    if not _has_required_verdict(parsed, endpoint):
+        required_keys = _REQUIRED_VERDICT_KEYS.get(endpoint, ())
         raise ValueError(f"AI response missing required key: {' or '.join(required_keys)}")
     _normalize_decision_reason(parsed, endpoint=endpoint)
     return parsed
