@@ -1109,6 +1109,32 @@ def _flat_bars(count: int, start: int = 0) -> list[Candle]:
     return [_confirm_bar(100.0, 100.5, 99.5, 100.0, start + i) for i in range(count)]
 
 
+def test_a_single_condition_is_enough_when_it_is_on_the_newest_bar() -> None:
+    """The count is the signal's strength and goes to the AI, not a local cut-off.
+
+    One condition is allowed through as long as it is the newest bar, so the entry
+    is not late; whether one condition is strong enough to trade is the AI's call.
+    """
+    from app.strategies import turtle_agent
+
+    candles = _flat_bars(6)
+    candles.append(_confirm_bar(101.0, 101.2, 99.8, 100.0, 6))
+    candles.append(_confirm_bar(99.9, 101.5, 99.5, 101.3, 7))     # engulfing on the newest
+
+    assert turtle_agent.SWING_CONFIRM_MIN_SIGNALS == 1
+    assert turtle_agent._confirmation_text(candles, 5, "buy", 1) != ""
+
+
+def test_the_risk_gate_prompt_weighs_the_confirmation_strength() -> None:
+    """The AI is told how to use one condition versus several."""
+    from app.services.ai_service import _turtle_open_risk_system_prompt
+
+    prompt = _turtle_open_risk_system_prompt()
+    assert "That list is the signal's strength" in prompt
+    assert "single condition is weak" in prompt
+    assert "already gone stale" in prompt
+
+
 def test_two_conditions_with_one_on_the_newest_bar_confirm() -> None:
     """The source design: at least two conditions inside the window, one of them now."""
     from app.strategies import turtle_agent

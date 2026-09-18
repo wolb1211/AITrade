@@ -34,11 +34,13 @@ SWING_PIVOT_SPAN = 2            # bars required on each side of a confirmed pivo
 SWING_PULLBACK_MIN_ATR = 0.5    # smallest pullback depth that qualifies
 SWING_CONFIRMATION_BARS = 5     # window searched for a confirmation bar
 # How many distinct confirmation conditions have to appear inside that window, and
-# one of them on the newest bar. Requiring only one, anywhere in the window, let a
-# condition from five bars ago count as a fresh entry - the trigger then fired
-# several bars after the move started, which is what the operator saw on the chart.
-# 1 restores the old behaviour.
-SWING_CONFIRM_MIN_SIGNALS = 2
+# one of them on the newest bar. The timing requirement is the hard one: the newest
+# bar must carry a condition, or the trigger fires several bars after the move
+# started, which is what the operator saw on the chart. The count is left at 1 on
+# purpose - how many conditions fired is the signal's strength, and that is handed
+# to the AI to weigh rather than used as a local cut-off. Setting it to 2 makes a
+# deployment require two conditions before the AI is even asked.
+SWING_CONFIRM_MIN_SIGNALS = 1
 SWING_EMA_FAST = 5              # confirmation EMA cross, fast period
 SWING_EMA_SLOW = 10             # confirmation EMA cross, slow period
 PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body

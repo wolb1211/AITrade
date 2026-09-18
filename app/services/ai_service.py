@@ -1850,6 +1850,14 @@ def _turtle_open_risk_system_prompt() -> str:
         "entry, an extreme volatility spike, or a violent opposite reaction on the latest bars. "
         "Do not use medium or high merely because the trend is unclear, the setup is imperfect, or you would have picked a "
         "different entry. Never propose a different direction, price, stop or volume. "
+        # The confirmation list is the strategy's own read on signal strength, so it
+        # is handed over as a score rather than used as a local cut-off: one
+        # condition is allowed through to you, several should be treated as strong.
+        "entry_analysis names the confirmation conditions that fired on the newest bar - 看涨吞没、短均线上穿（金叉）、"
+        "看涨长下影（Pin Bar）and so on. That list is the signal's strength and you must weigh it: two or more conditions "
+        "is a strong signal and the usual structural checks are enough, while a single condition is weak and should pass "
+        "only when the structure is unusually clean and the room to the target is clearly sufficient. A trigger that has "
+        "already gone stale never qualifies. "
         # The gate lets an entry through when the model answers "not high", so a
         # verdict that warns in prose while reporting a low level silently opens
         # the trade. Require the two halves of the answer to agree.
