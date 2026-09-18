@@ -214,7 +214,11 @@ def test_the_whole_basket_goes_to_break_even_together() -> None:
     ]
     request = _request(positions, bid=4308.0, ask=4308.2)
 
-    decision = turtle_agent._protection_batch_decision(request, {}, 4.0)
+    decision = turtle_agent._protection_batch_decision(
+        request,
+        {"break_even_atr": 1.0, "trailing_start_atr": 1.5, "trailing_distance_atr": 1.0},
+        4.0,
+    )
 
     assert decision is not None
     levels = {item["ticket"]: item["sl"] for item in decision.metadata["batch_actions"]}

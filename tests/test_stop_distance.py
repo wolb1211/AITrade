@@ -96,7 +96,10 @@ def test_gl_trailing_pulls_back_to_a_level_the_broker_accepts() -> None:
 
 
 def test_gl_trailing_is_unchanged_when_the_target_is_already_far_enough() -> None:
-    decision = turtle_agent._trailing_stop_decision(_request(), _position(), {}, 6.0)
+    # The 1.0 ATR distance this test is about, pinned rather than defaulted.
+    decision = turtle_agent._trailing_stop_decision(
+        _request(), _position(), {"trailing_distance_atr": 1.0, "trailing_start_atr": 1.5}, 6.0
+    )
 
     assert decision is not None
     assert decision.sl == pytest.approx(4304.0)

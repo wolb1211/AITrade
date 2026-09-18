@@ -46,15 +46,15 @@ SWING_EMA_SLOW = 10             # confirmation EMA cross, slow period
 PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
 
 # Protection ladder: break-even first, then a trailing stop.
-DEFAULT_BREAK_EVEN_ATR = 1.0         # favourable move that triggers break-even
+DEFAULT_BREAK_EVEN_ATR = 0.5         # favourable move that triggers break-even
 DEFAULT_BREAK_EVEN_OFFSET = 0.0      # extra offset from entry, on top of the spread buffer
 # Favourable move of the WHOLE basket that moves every unit to the volume-weighted
 # average entry. Per-unit protection leaves the newest unit naked until it earns
 # its own ATR, which is where a pullback turns a winning basket into a losing one.
 DEFAULT_BASKET_BREAK_EVEN_ATR = 1.0
 BREAK_EVEN_SPREAD_BUFFER = 1.5       # break-even must clear this many times the spread
-DEFAULT_TRAILING_START_ATR = 1.5     # favourable move that starts trailing
-DEFAULT_TRAILING_DISTANCE_ATR = 1.0  # trailing distance behind the current price
+DEFAULT_TRAILING_START_ATR = 1.0     # favourable move that starts trailing
+DEFAULT_TRAILING_DISTANCE_ATR = 0.5  # trailing distance behind the current price
 # How much better a trailing stop has to become before the modification is sent.
 # Without it any new high, even by a tick, triggers another round trip to the
 # broker - and one more chance of a stop the broker refuses. 0 restores the

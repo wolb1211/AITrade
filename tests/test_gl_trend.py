@@ -29,6 +29,22 @@ _PRICE_LOW = 100.0
 _PRICE_HIGH = 110.0
 
 
+def _legacy(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The protection thresholds these tests were written against.
+
+    Break-even and the trailing start are deployment settings now, and their
+    defaults were tightened once the entry fixes were in. A test that exercises
+    the add rule, the break-even rule or the trailing rule should not start
+    behaving differently because a default moved, so it pins the values it means.
+    """
+    return {
+        "break_even_atr": 1.0,
+        "trailing_start_atr": 1.5,
+        "trailing_distance_atr": 1.0,
+        **(config or {}),
+    }
+
+
 def _candles(count: int = 25) -> list[Candle]:
     return [
         Candle(
@@ -105,7 +121,7 @@ def test_channel_exit_closes_the_whole_basket() -> None:
         ]
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": {}})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy()})
 
     assert decision.action == "CLOSE"
     assert "趋势转弱" in decision.reason
@@ -124,7 +140,7 @@ def test_unified_stop_closes_the_whole_basket() -> None:
         ]
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": {}})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy()})
 
     assert decision.action == "CLOSE"
     assert "触发保护止损" in decision.reason
@@ -141,7 +157,7 @@ def test_channel_exit_closes_the_whole_basket_for_sell_side() -> None:
         ]
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": {}})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy()})
 
     assert decision.action == "CLOSE"
     assert "趋势转强" in decision.reason
@@ -164,7 +180,7 @@ def test_add_is_refused_once_the_strategy_cap_is_reached() -> None:
         ask=111.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     # 4 units open == the strategy cap, so the add-on extension must be refused.
     assert decision.action == "HOLD"
@@ -184,7 +200,7 @@ def test_add_is_refused_when_the_user_lowered_the_limit() -> None:
         ask=111.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "HOLD"
 
@@ -203,7 +219,7 @@ def test_add_below_the_cap_uses_the_user_limit() -> None:
         ask=111.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "BUY"
     assert decision.lot == 0.01
@@ -257,7 +273,7 @@ def test_add_moves_every_unit_onto_the_new_unified_stop() -> None:
         ask=111.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "BUY"
     assert decision.lot == 0.01
@@ -289,7 +305,7 @@ def test_add_does_not_loosen_an_already_tighter_stop() -> None:
     protected.sl = 110.0
     request = _position_request([protected], bid=111.0, ask=111.1)
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "BUY"
     actions = decision.metadata["batch_actions"]
@@ -319,7 +335,7 @@ def test_add_wins_over_a_simultaneous_trailing_update() -> None:
         ask=120.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "BUY", "the add must win over the trailing update"
     assert decision.metadata["batch_actions"][0]["action"] == "add"
@@ -340,7 +356,7 @@ def test_protection_still_fires_when_no_add_candidate_exists() -> None:
         ask=120.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "MODIFY_SL"
     assert decision.sl == pytest.approx(110.0)
@@ -415,7 +431,7 @@ def test_break_even_clears_the_spread() -> None:
         ask=116.2,  # spread 0.2 -> offset must clear it
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": {}})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy()})
 
     assert decision.action == "MODIFY_SL"
     # entry 105 + 0.2 * BREAK_EVEN_SPREAD_BUFFER
@@ -433,7 +449,7 @@ def test_larger_configured_break_even_offset_wins() -> None:
     )
 
     decision = TurtleTrendStrategy().evaluate_position(
-        request, {"config": {"break_even_offset": 2.0}}
+        request, {"config": _legacy({"break_even_offset": 2.0})}
     )
 
     assert decision.action == "MODIFY_SL"
@@ -454,7 +470,7 @@ def test_break_even_fires_for_sell_side_clearing_the_spread() -> None:
         ask=104.0,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": {}})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy()})
 
     assert decision.action == "MODIFY_SL"
     assert decision.sl == pytest.approx(115.0 - 0.2 * 1.5)
@@ -465,9 +481,9 @@ def test_stop_distance_follows_the_module_constant(monkeypatch) -> None:
     request = _open_request(last_close=112.5, last_high=113.0, last_low=104.0)
     config = {"entry_period": 20, "atr_period": 20}
 
-    default_stop = TurtleTrendStrategy().evaluate_open(request, {"config": config})
+    default_stop = TurtleTrendStrategy().evaluate_open(request, {"config": _legacy(config)})
     monkeypatch.setattr(turtle_agent, "STOP_ATR", 1.0)
-    halved_stop = TurtleTrendStrategy().evaluate_open(request, {"config": config})
+    halved_stop = TurtleTrendStrategy().evaluate_open(request, {"config": _legacy(config)})
 
     assert default_stop.sl is not None and halved_stop.sl is not None
     distance_default = default_stop.entry - default_stop.sl
@@ -979,7 +995,7 @@ def test_add_explains_why_the_position_size_could_not_be_computed() -> None:
         ask=111.1,
     )
 
-    decision = TurtleTrendStrategy().evaluate_position(request, {"config": config})
+    decision = TurtleTrendStrategy().evaluate_position(request, {"config": _legacy(config)})
 
     assert decision.action == "HOLD"
     assert "加仓手数无法确定" in decision.reason
@@ -1207,6 +1223,20 @@ def test_the_breakout_wording_follows_the_direction() -> None:
     assert "下破" in decision.reason
     assert "区间低点" in decision.reason
     assert "上破" not in decision.reason
+
+
+def test_the_default_protection_thresholds_are_the_tightened_ones() -> None:
+    """The operator's settings: break even at 0.5, trail from 1.0 at 0.5 behind.
+
+    Every test that needs the older thresholds pins them through _legacy, so this
+    is the one place that says what a deployment gets without any configuration.
+    """
+    from app.strategies import turtle_agent
+
+    assert turtle_agent.DEFAULT_BREAK_EVEN_ATR == 0.5
+    assert turtle_agent.DEFAULT_TRAILING_START_ATR == 1.0
+    assert turtle_agent.DEFAULT_TRAILING_DISTANCE_ATR == 0.5
+    assert turtle_agent.DEFAULT_TRAILING_MIN_STEP_ATR == 0.2
 
 
 def test_the_position_review_prompt_binds_its_answer_to_its_analysis() -> None:
