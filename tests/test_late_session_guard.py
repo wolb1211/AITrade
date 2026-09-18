@@ -60,6 +60,55 @@ def test_the_trend_strategy_refuses_to_open_in_the_late_window(monkeypatch) -> N
     assert "尾盘" in decision.reason
 
 
+def test_the_asian_morning_hour_is_closed_too() -> None:
+    """UTC 02:00-03:00 (Beijing 10:00) is the other hour the data condemns.
+
+    Two independent samples agree: 77 deals at a 22% win rate, then 84 across the
+    symbols at 11% to 24%, worst on gold. Tokyo has no daylight saving, so unlike
+    the US windows this one is written in UTC and stays put all year.
+    """
+    assert time_windows.in_utc_window(
+        _utc("2026-07-15T02:30:00"),
+        start=time_windows.DEFAULT_ASIAN_LULL_START,
+        end=time_windows.DEFAULT_ASIAN_LULL_END,
+    ) is True
+    assert time_windows.in_utc_window(
+        _utc("2026-07-15T03:30:00"),
+        start=time_windows.DEFAULT_ASIAN_LULL_START,
+        end=time_windows.DEFAULT_ASIAN_LULL_END,
+    ) is False
+    assert time_windows.asian_lull_window({}) is not None
+    assert time_windows.asian_lull_window({"asian_lull_guard": "off"}) is None
+
+
+def test_the_closed_window_reason_names_which_window() -> None:
+    # 18:00 UTC in July is 14:00 New York - the US late window.
+    assert "尾盘" in time_windows.closed_window_reason({}, _utc("2026-07-15T18:00:00"))
+    # 02:30 UTC is the Asian morning - the other one.
+    assert "亚洲盘" in time_windows.closed_window_reason({}, _utc("2026-07-15T02:30:00"))
+    # Anything else is open.
+    assert time_windows.closed_window_reason({}, _utc("2026-07-15T09:00:00")) == ""
+    # Both can be switched off.
+    off = {"late_session_guard": False, "asian_lull_guard": False}
+    assert time_windows.closed_window_reason(off, _utc("2026-07-15T18:00:00")) == ""
+    assert time_windows.closed_window_reason(off, _utc("2026-07-15T02:30:00")) == ""
+
+
+def test_the_price_action_strategy_refuses_to_open_in_the_early_window(monkeypatch) -> None:
+    from app.strategies import pa_agent_lite
+
+    monkeypatch.setattr(time_windows, "now_utc", lambda: _utc("2026-07-15T02:30:00"))
+    request = SimpleNamespace(
+        request_id="early-window-001", symbol="XAUUSD.c", timeframe="M5",
+        bid=4300.0, ask=4300.2, candles=[],
+    )
+
+    decision = pa_agent_lite.PaAgentLiteStrategy().evaluate_open(request, {"config": {}})
+
+    assert decision.status == "HOLD"
+    assert "亚洲盘" in decision.reason
+
+
 def test_the_price_action_strategy_refuses_to_open_in_the_late_window(monkeypatch) -> None:
     from app.strategies import pa_agent_lite
 

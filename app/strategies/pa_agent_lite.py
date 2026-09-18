@@ -517,21 +517,12 @@ class PaAgentLiteStrategy:
         request: OpenEvaluateRequest,
         deployment: dict[str, Any],
     ) -> TradeDecision:
-        # The quiet end of the US session is closed to new entries: the ATR
-        # contracts there, which tightens the stop with it, and the measured win
-        # rate across those hours was well under anything the strategy accepts.
-        # Checked first so a closed window costs neither features nor tokens.
+        # Every no-new-entry window is checked first: a closed window costs
+        # neither features nor tokens, and open positions keep their levels.
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
-        late = time_windows.late_window(config)
-        if late and time_windows.in_us_late_window(
-            time_windows.now_utc(), start=late[0], end=late[1]
-        ):
-            return _hold(
-                request,
-                self._decision_id(),
-                f"美盘尾盘清淡时段（美东 {late[0]:%H:%M}–{late[1]:%H:%M}）不开新仓，等待下一段行情",
-                confidence=0.3,
-            )
+        closed = time_windows.closed_window_reason(config, time_windows.now_utc())
+        if closed:
+            return _hold(request, self._decision_id(), closed, confidence=0.3)
 
         features = _compute_features(request.candles)
         if features is None:

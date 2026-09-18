@@ -28,6 +28,13 @@ DEFAULT_WINDOW_END = time(10, 30)
 DEFAULT_LATE_WINDOW_START = time(13, 0)
 DEFAULT_LATE_WINDOW_END = time(16, 0)
 
+# The Asian mid-morning hour, in UTC. Two independent samples agree on it: a
+# counters of 77 deals at a 22% win rate, then 84 more across the symbols at 11%
+# to 24%, worst on gold. Unlike the US windows this one needs no Eastern
+# conversion - Tokyo does not observe daylight saving, so the hour is stable.
+DEFAULT_ASIAN_LULL_START = time(2, 0)
+DEFAULT_ASIAN_LULL_END = time(3, 0)
+
 _US_EASTERN_STANDARD = timedelta(hours=-5)
 _US_EASTERN_DAYLIGHT = timedelta(hours=-4)
 
@@ -119,3 +126,42 @@ def late_window(config: dict[str, Any]) -> tuple[time, time] | None:
     if start >= end:
         return None
     return start, end
+
+
+def asian_lull_window(config: dict[str, Any]) -> tuple[time, time] | None:
+    """The Asian mid-morning hour a deployment closes, in UTC, or None when off."""
+    if not guard_enabled(config, "asian_lull_guard"):
+        return None
+    start = clock_time(config.get("asian_lull_start"), DEFAULT_ASIAN_LULL_START)
+    end = clock_time(config.get("asian_lull_end"), DEFAULT_ASIAN_LULL_END)
+    if start >= end:
+        return None
+    return start, end
+
+
+def in_utc_window(
+    now_utc: datetime,
+    *,
+    start: time,
+    end: time,
+    enabled: bool = True,
+) -> bool:
+    """Whether a window written in UTC is in force right now."""
+    if not enabled:
+        return False
+    return start <= now_utc.astimezone(timezone.utc).time() < end
+
+
+def closed_window_reason(config: dict[str, Any], now_utc: datetime) -> str:
+    """Why no new entry may be taken right now, or an empty string.
+
+    Every no-new-entry window lives here, so both strategies answer the same way
+    and adding another is a change in this file only.
+    """
+    late = late_window(config)
+    if late and in_us_late_window(now_utc, start=late[0], end=late[1]):
+        return f"美盘尾盘清淡时段（美东 {late[0]:%H:%M}–{late[1]:%H:%M}）不开新仓，等待下一段行情"
+    asian = asian_lull_window(config)
+    if asian and in_utc_window(now_utc, start=asian[0], end=asian[1]):
+        return f"亚洲盘上午清淡时段（UTC {asian[0]:%H:%M}–{asian[1]:%H:%M}）不开新仓，等待下一段行情"
+    return ""
