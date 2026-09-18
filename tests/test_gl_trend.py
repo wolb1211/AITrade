@@ -608,13 +608,24 @@ def test_open_ai_text_false_is_not_treated_as_approval() -> None:
     assert "本次不开仓" in decision.reason
 
 
-def test_open_ai_failure_still_opens() -> None:
+def test_open_ai_failure_holds_unless_the_deployment_says_otherwise() -> None:
+    """The gate is the risk check, so a provider outage defaults to no entry.
+
+    It used to fall through and open on the local rules alone, which is the one
+    outcome a risk gate must not produce. A deployment that would rather keep
+    trading can set ai_gate_fail_open.
+    """
     gate = _FakeRiskGate(fail=True)
 
-    decision = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
+    held = TurtleTrendStrategy(gate).evaluate_open(_breakout_request(), {"config": {}})
+    assert held.action == "HOLD"
+    assert "保守不开仓" in held.reason
 
-    assert decision.action == "BUY"
-    assert "AI 未返回结果" in decision.metadata["ai_risk"]
+    opened = TurtleTrendStrategy(gate).evaluate_open(
+        _breakout_request(), {"config": {"ai_gate_fail_open": True}}
+    )
+    assert opened.action == "BUY"
+    assert "放行" in opened.metadata["ai_risk"]
 
 
 def test_open_ai_cannot_reshape_the_order() -> None:

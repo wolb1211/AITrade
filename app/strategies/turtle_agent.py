@@ -491,11 +491,23 @@ class TurtleTrendStrategy:
             "swing_direction": candidate.metadata.get("swing_direction"),
             "donchian_direction": candidate.metadata.get("donchian_direction"),
         }
-        result = self.ai_client.turtle_open_risk_decision(
-            deployment=deployment, request_payload=request, signal=signal,
-        )
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        # What a provider outage means for the entry. The gate is the risk check,
+        # so the default leaves the entry unapproved; a deployment that would
+        # rather keep trading on its own rules can set ai_gate_fail_open.
+        fail_open = config.get("ai_gate_fail_open") in (True, 1, "1", "true", "on", "yes")
+        try:
+            result = self.ai_client.turtle_open_risk_decision(
+                deployment=deployment, request_payload=request, signal=signal,
+            )
+        except Exception as exc:  # noqa: BLE001 - the gate must survive a provider outage
+            if fail_open:
+                return True, f"AI 服务不可用（{type(exc).__name__}），按配置放行本次开仓", None
+            return False, f"AI 服务不可用（{type(exc).__name__}），本次保守不开仓", None
         if result is None:
-            return True, "AI 未返回结果，按策略规则开仓", None
+            if fail_open:
+                return True, "AI 未返回结果，按配置放行本次开仓", None
+            return False, "AI 未返回结果，本次保守不开仓", None
         outcome = _open_risk_outcome(result)
         if outcome is not None:
             return outcome
