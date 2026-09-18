@@ -82,10 +82,10 @@ def test_the_asian_morning_hour_is_closed_too() -> None:
 
 
 def test_the_closed_window_reason_names_which_window() -> None:
-    # 18:00 UTC in July is 14:00 New York - the US late window.
-    assert "尾盘" in time_windows.closed_window_reason({}, _utc("2026-07-15T18:00:00"))
+    # 18:00 UTC in July is 14:00 New York - the late window.
+    assert "动力不足" in time_windows.closed_window_reason({}, _utc("2026-07-15T18:00:00"))
     # 02:30 UTC is the Asian morning - the other one.
-    assert "亚洲盘" in time_windows.closed_window_reason({}, _utc("2026-07-15T02:30:00"))
+    assert "假信号" in time_windows.closed_window_reason({}, _utc("2026-07-15T02:30:00"))
     # Anything else is open.
     assert time_windows.closed_window_reason({}, _utc("2026-07-15T09:00:00")) == ""
     # Both can be switched off.
@@ -106,7 +106,7 @@ def test_the_price_action_strategy_refuses_to_open_in_the_early_window(monkeypat
     decision = pa_agent_lite.PaAgentLiteStrategy().evaluate_open(request, {"config": {}})
 
     assert decision.status == "HOLD"
-    assert "亚洲盘" in decision.reason
+    assert "假信号" in decision.reason
 
 
 def test_the_price_action_strategy_refuses_to_open_in_the_late_window(monkeypatch) -> None:

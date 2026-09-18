@@ -160,8 +160,8 @@ def closed_window_reason(config: dict[str, Any], now_utc: datetime) -> str:
     """
     late = late_window(config)
     if late and in_us_late_window(now_utc, start=late[0], end=late[1]):
-        return f"美盘尾盘清淡时段（美东 {late[0]:%H:%M}–{late[1]:%H:%M}）不开新仓，等待下一段行情"
+        return f"尾盘清淡时段（美东 {late[0]:%H:%M}–{late[1]:%H:%M}）：行情动力不足，观望"
     asian = asian_lull_window(config)
     if asian and in_utc_window(now_utc, start=asian[0], end=asian[1]):
-        return f"亚洲盘上午清淡时段（UTC {asian[0]:%H:%M}–{asian[1]:%H:%M}）不开新仓，等待下一段行情"
+        return f"高风险时段（UTC {asian[0]:%H:%M}–{asian[1]:%H:%M}）：易出现假信号，暂时观望"
     return ""
