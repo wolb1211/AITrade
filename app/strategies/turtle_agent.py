@@ -40,6 +40,10 @@ PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
 # Protection ladder: break-even first, then a trailing stop.
 DEFAULT_BREAK_EVEN_ATR = 1.0         # favourable move that triggers break-even
 DEFAULT_BREAK_EVEN_OFFSET = 0.0      # extra offset from entry, on top of the spread buffer
+# Favourable move of the WHOLE basket that moves every unit to the volume-weighted
+# average entry. Per-unit protection leaves the newest unit naked until it earns
+# its own ATR, which is where a pullback turns a winning basket into a losing one.
+DEFAULT_BASKET_BREAK_EVEN_ATR = 1.0
 BREAK_EVEN_SPREAD_BUFFER = 1.5       # break-even must clear this many times the spread
 DEFAULT_TRAILING_START_ATR = 1.5     # favourable move that starts trailing
 DEFAULT_TRAILING_DISTANCE_ATR = 1.0  # trailing distance behind the current price
@@ -926,8 +930,51 @@ def _max_units(config: dict[str, Any]) -> int:
     return max(1, min(requested, MAX_UNITS))
 
 
+def _basket_break_even_level(
+    request: PositionEvaluateRequest,
+    config: dict[str, Any],
+    atr: float,
+) -> tuple[float, float] | None:
+    """The whole basket's break-even stop and how far ahead it is, or None.
+
+    Per-unit protection leaves the newest unit unprotected until it earns its own
+    ATR: a two-unit basket at +83 and +22 points had the first protected and the
+    second a full stop away from its own, so a pullback stopped the second at a
+    loss. Once the basket as a whole is ahead by ``basket_breakeven_atr`` (1.0 by
+    default, 0 to switch it off) every unit moves to the volume-weighted average
+    entry, so the same pullback exits flat instead.
+    """
+    trigger = _config_number(config, "basket_breakeven_atr", DEFAULT_BASKET_BREAK_EVEN_ATR)
+    if trigger <= 0 or atr <= 0 or len(request.positions) < 2:
+        return None
+    total_volume = sum(float(item.volume) for item in request.positions)
+    if total_volume <= 0:
+        return None
+    weighted = sum(
+        float(item.open_price) * float(item.volume) for item in request.positions
+    ) / total_volume
+    side = str(request.positions[0].side).upper()
+    price = float(request.bid) if side == "BUY" else float(request.ask)
+    favorable = (price - weighted) if side == "BUY" else (weighted - price)
+    if favorable < trigger * atr:
+        return None
+    # A stop has to sit behind the market, which the average entry does once the
+    # basket is ahead of it.
+    if side == "BUY" and weighted >= price:
+        return None
+    if side == "SELL" and weighted <= price:
+        return None
+    return weighted, favorable / atr
+
+
 def _protection_batch_decision(request: PositionEvaluateRequest, config: dict[str, Any], atr: float) -> TradeDecision | None:
     actions: list[dict[str, Any]] = []
+    # The basket-wide level competes with each unit's own target and the better one
+    # wins. Unit-by-unit protection leaves the newest unit naked until it earns its
+    # own 1.0 ATR: a two-unit basket at +83 and +22 points had the first protected
+    # and the second still a full stop from its own, so an ordinary pullback
+    # stopped the second at a loss while the first kept its profit.
+    basket = _basket_break_even_level(request, config, atr)
     for position in request.positions:
         # Evaluate both protection stages on every request.  When price has
         # already reached the trailing threshold, do not first apply the
@@ -943,14 +990,29 @@ def _protection_batch_decision(request: PositionEvaluateRequest, config: dict[st
             candidate = max(candidates, key=lambda item: float(item.sl)) if candidates else None
         else:
             candidate = min(candidates, key=lambda item: float(item.sl)) if candidates else None
-        if candidate is not None and candidate.sl is not None:
-            actions.append({
-                "action": "modify",
-                "ticket": str(position.ticket),
-                "sl": candidate.sl,
-                "tp": candidate.tp,
-                "comment": candidate.reason,
-            })
+        target = float(candidate.sl) if candidate is not None and candidate.sl is not None else None
+        comment = candidate.reason if candidate is not None else ""
+        if basket is not None:
+            level, favorable = basket
+            current = float(position.sl) if position.sl and float(position.sl) > 0 else None
+            better = (
+                level > current if position.side == "BUY" else level < current
+            ) if current is not None else True
+            if better and (
+                target is None
+                or (level > target if position.side == "BUY" else level < target)
+            ):
+                target = level
+                comment = f"整篮保本：持仓整体浮盈 {favorable:.1f} 倍ATR，全部止损移至加权成本"
+        if target is None:
+            continue
+        actions.append({
+            "action": "modify",
+            "ticket": str(position.ticket),
+            "sl": target,
+            "tp": candidate.tp if candidate is not None else None,
+            "comment": comment,
+        })
     if not actions:
         return None
     first = actions[0]

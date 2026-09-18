@@ -201,6 +201,79 @@ def test_a_stale_quote_stops_the_server_acting() -> None:
     assert turtle_agent._quote_divergence(stale, {"max_quote_divergence_atr": 0}, 0.0011) is None
 
 
+def test_the_whole_basket_goes_to_break_even_together() -> None:
+    """The newest unit is the one a pullback kills while the older keeps its profit.
+
+    Live case: two units at +83 and +22 points, the first past its own ATR and the
+    second nowhere near, so a pullback stopped the second at a loss. Once the
+    basket as a whole is ahead, every unit moves to the weighted average entry.
+    """
+    positions = [
+        _snapshot(entry=4300.0, current=4308.0),        # well ahead of its own entry
+        _snapshot("2", entry=4306.0, current=4308.0),   # barely ahead
+    ]
+    request = _request(positions, bid=4308.0, ask=4308.2)
+
+    decision = turtle_agent._protection_batch_decision(request, {}, 4.0)
+
+    assert decision is not None
+    levels = {item["ticket"]: item["sl"] for item in decision.metadata["batch_actions"]}
+    # The second unit has no target of its own yet, so the basket level protects it:
+    # weighted average entry = (4300 + 4306) / 2 = 4303, and the basket is 5 points
+    # ahead of it, over the 1.0 ATR trigger at ATR 4.
+    assert levels["2"] == pytest.approx(4303.0)
+    # The first unit is already 2 ATR ahead, so its own trailing stop is tighter and
+    # wins: 4308 - 1.0 ATR = 4304. Nothing is loosened.
+    assert levels["1"] == pytest.approx(4304.0)
+
+
+def test_a_basket_barely_ahead_is_left_alone() -> None:
+    positions = [
+        _snapshot(entry=4300.0, current=4301.0),
+        _snapshot("2", entry=4300.0, current=4301.0),
+    ]
+    request = _request(positions, bid=4301.0, ask=4301.2)
+
+    assert turtle_agent._protection_batch_decision(request, {}, 4.0) is None
+
+
+def test_a_single_unit_does_not_use_the_basket_rule() -> None:
+    """With one unit the per-unit rules already cover it."""
+    request = _request([_snapshot(entry=4300.0, current=4310.0)], bid=4310.0, ask=4310.2)
+
+    assert turtle_agent._basket_break_even_level(request, {}, 4.0) is None
+
+
+def test_the_basket_rule_can_be_switched_off_and_tuned() -> None:
+    positions = [
+        _snapshot(entry=4300.0, current=4308.0),
+        _snapshot("2", entry=4306.0, current=4308.0),
+    ]
+    request = _request(positions, bid=4308.0, ask=4308.2)
+
+    assert turtle_agent._basket_break_even_level(request, {"basket_breakeven_atr": 0}, 4.0) is None
+    # 1.25 ATR ahead: inside the default 1.0, outside a tightened 1.5.
+    assert turtle_agent._basket_break_even_level(
+        request, {"basket_breakeven_atr": 1.5}, 4.0
+    ) is None
+    assert turtle_agent._basket_break_even_level(
+        request, {"basket_breakeven_atr": 1.2}, 4.0
+    ) is not None
+
+
+def test_a_sell_basket_mirrors_it() -> None:
+    positions = [
+        _snapshot(entry=4310.0, side="SELL", current=4304.0),
+        _snapshot("2", entry=4308.0, side="SELL", current=4304.0),
+    ]
+    request = _request(positions, bid=4304.0, ask=4304.2)
+
+    level, favorable = turtle_agent._basket_break_even_level(request, {}, 4.0)
+
+    assert level == pytest.approx(4309.0)    # weighted average entry
+    assert favorable == pytest.approx(1.2)   # (4309 - 4304.2) / 4, measured from the ask
+
+
 def test_a_sell_basket_is_measured_the_same_way() -> None:
     positions = [_snapshot(entry=4310.0, side="SELL"), _snapshot("2", entry=4300.0, side="SELL")]
     candles = [_bar(1100, 4310.0, 4260.0)]  # peak 50 below the first entry
