@@ -1293,9 +1293,11 @@ def _maybe_add(
     # added units from being stopped below where it started. With a single unit
     # there is nothing to protect against and it would simply place the stop at
     # the entry itself, which the broker refuses.
+    floor_used = 0.0
     if len(request.positions) > 1:
         floor = _basket_stop_floor(positions=request.positions, side=side, config=config)
         if floor > 0:
+            floor_used = floor
             stop_loss = max(stop_loss, floor) if side == "BUY" else min(stop_loss, floor)
     # The added unit carries the basket stop, which the broker has to accept as
     # well; sizing then uses the distance the broker will actually hold.
@@ -1359,6 +1361,12 @@ def _maybe_add(
                   "add_atr": round(float(atr), 6),
                   "add_stop_before_floor": round(stop_before_floor, 6),
                   "add_quote_divergence_atr": round(divergence_atr, 3),
+                  # The entries the stop was anchored on. A client reported a cost
+                  # basis the server did not agree with, and the level it produced
+                  # matched the position's stop rather than its entry, so what the
+                  # server actually received is recorded here.
+                  "add_entries": [round(float(item.open_price), 6) for item in request.positions],
+                  "add_floor": round(floor_used, 6),
                   "min_stop_distance_enforced": round(stop_clamped, 5),
                   "min_stop_distance_used": round(
                       min_stop_distance(request.symbol_info, config, atr=atr), 5
