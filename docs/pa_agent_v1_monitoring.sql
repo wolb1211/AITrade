@@ -5,8 +5,13 @@
 -- 市价追"的残缺策略跑出来的，不能作为调参依据。9-18 起这些参数、追单保护、
 -- 尖峰/美盘窗口、回吐保护才真正生效。
 --
--- 使用：把 :deployment_id 换成 PA 部署的 id（或删掉该条件按策略统计），
---       时间起点按要对比的区间改。
+-- 使用：把 :deployment_id 换成 PA 部署的 id，时间起点按要对比的区间改。
+--
+-- ⚠️ 两个必读注意：
+--   1) 统计口径：平均盈亏会被【个别大手数账户】带偏（曾有一笔 3 手黄金 -4197，
+--      把 5 单的小时平均拉到 -804）。所以【胜率】和【每 0.01 手盈亏】才是主口径，
+--      平均盈亏只在同一个部署内看才有意义。
+--   2) 别名里带点号必须加反引号（`每0.01手盈亏`），否则 MySQL 报 #1064。
 
 -- =====================================================================
 -- ① 每日趋势（最先看这条：单数、胜率、平均、总盈亏）
@@ -16,10 +21,12 @@ SELECT DATE(created_at)                                    AS 日期,
        COUNT(*)                                            AS 单数,
        ROUND(SUM(net_profit > 0) / COUNT(*) * 100, 1)      AS 胜率百分比,
        ROUND(AVG(net_profit), 2)                           AS 平均盈亏,
+       ROUND(AVG(net_profit / NULLIF(volume, 0) * 0.01), 2) AS `每0.01手盈亏`,
        ROUND(SUM(net_profit), 2)                           AS 总盈亏
 FROM mt5_history_deals
 WHERE deployment_id = 'PA部署ID'
   AND entry IN ('out', 'out_by', 'inout')
+  AND volume > 0
   AND close_time >= UNIX_TIMESTAMP('2026-09-18')
 GROUP BY 日期 ORDER BY 日期;
 
@@ -30,11 +37,13 @@ GROUP BY 日期 ORDER BY 日期;
 SELECT symbol                                              AS 品种,
        COUNT(*)                                            AS 单数,
        ROUND(SUM(net_profit > 0) / COUNT(*) * 100, 1)      AS 胜率百分比,
-       ROUND(AVG(net_profit), 2)                           AS 平均盈亏,
+       ROUND(AVG(net_profit), 2)                           AS 平均盈亏_易受大单影响,
+       ROUND(AVG(net_profit / NULLIF(volume, 0) * 0.01), 2) AS `每0.01手盈亏`,
        ROUND(SUM(net_profit), 2)                           AS 总盈亏
 FROM mt5_history_deals
 WHERE deployment_id = 'PA部署ID'
   AND entry IN ('out', 'out_by', 'inout')
+  AND volume > 0
   AND close_time >= UNIX_TIMESTAMP('2026-09-18')
 GROUP BY 品种 ORDER BY 总盈亏;
 
@@ -46,10 +55,12 @@ GROUP BY 品种 ORDER BY 总盈亏;
 SELECT HOUR(FROM_UNIXTIME(close_time - 3 * 3600))          AS UTC小时,
        COUNT(*)                                            AS 单数,
        ROUND(SUM(net_profit > 0) / COUNT(*) * 100, 1)      AS 胜率百分比,
-       ROUND(AVG(net_profit), 2)                           AS 平均盈亏
+       ROUND(AVG(net_profit), 2)                           AS 平均盈亏_易受大单影响,
+       ROUND(AVG(net_profit / NULLIF(volume, 0) * 0.01), 2) AS `每0.01手盈亏`
 FROM mt5_history_deals
 WHERE deployment_id = 'PA部署ID'
   AND entry IN ('out', 'out_by', 'inout')
+  AND volume > 0
   AND close_time >= UNIX_TIMESTAMP('2026-09-18')
 GROUP BY UTC小时 ORDER BY UTC小时;
 
