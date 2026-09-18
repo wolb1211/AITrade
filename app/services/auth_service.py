@@ -41,6 +41,10 @@ class UserAuthService:
     def register(self, *, email: str, password: str, invite_code: str = "") -> dict[str, Any]:
         normalized = self._email(email)
         self._password(password)
+        # Invite-only: an empty code is refused here rather than accepted and left
+        # without a referrer, so every account that exists came through an agent.
+        if self.settings.registration_requires_invite and not str(invite_code or "").strip():
+            raise AuthError("invite_code_required", 400)
         try:
             user = self.store.prepare_registration(
                 email=normalized,

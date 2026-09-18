@@ -57,6 +57,10 @@ class Settings:
     admin_jwt_secret: str = ""
     session_days: int = 30
     verification_minutes: int = 10
+    # Registration is invite-only: only the code of an active agent admits a new
+    # account, because that code is also what links the account to its referrer.
+    # The first agent is created from the admin side, which does not use this path.
+    registration_requires_invite: bool = True
     mail_host: str = ""
     mail_port: int = 465
     mail_user: str = ""

@@ -25,8 +25,38 @@ def create_service(tmp_path: Path) -> tuple[UserAuthService, FakeEmailService]:
     store = SqliteStore(tmp_path / "auth.db")
     store.initialize()
     email = FakeEmailService()
-    settings = Settings(auth_secret="test-auth-secret", verification_minutes=10, session_days=30)
+    settings = Settings(
+        auth_secret="test-auth-secret",
+        verification_minutes=10,
+        session_days=30,
+        # The invite requirement has its own test below; the rest of the suite
+        # covers what happens after a registration, so the gate is off here.
+        registration_requires_invite=False,
+    )
     return UserAuthService(store, settings, email), email
+
+
+def test_registration_requires_an_invite_code(tmp_path: Path) -> None:
+    """Registration is invite-only: without an agent's code there is no account."""
+    store = SqliteStore(tmp_path / "auth.db")
+    store.initialize()
+    email = FakeEmailService()
+    settings = Settings(auth_secret="test-auth-secret", verification_minutes=10, session_days=30)
+    assert settings.registration_requires_invite is True
+    service = UserAuthService(store, settings, email)
+
+    with pytest.raises(AuthError) as exc_info:
+        service.register(email="walkin@example.com", password="Password123")
+    assert exc_info.value.code == "invite_code_required"
+    assert store.get_auth_user_by_email("walkin@example.com") is None
+
+    # An agent created from the admin side carries a code, and that code admits.
+    agent = store.save_user({"email": "agent2@example.com", "agent_level": 1, "status": "active"})
+    assert agent["invite_code"].startswith("GL")
+    prepared = service.register(
+        email="invited2@example.com", password="Password123", invite_code=agent["invite_code"]
+    )
+    assert prepared["user_id"] > 0
 
 
 def test_register_password_and_code_login(tmp_path: Path) -> None:
