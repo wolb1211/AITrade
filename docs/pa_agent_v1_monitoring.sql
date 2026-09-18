@@ -81,7 +81,8 @@ SELECT DATE(created_at) AS 日期,
        SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%尖峰%')           AS 尖峰过滤,
        SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%止盈离场%')       AS AI主动止盈,
        SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%浮盈回吐保护%')   AS 回吐保护,
-       SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%尾盘清淡时段%')   AS 尾盘封禁,
+       SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%动力不足%')       AS 尾盘封禁,
+       SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%假信号%')         AS 高风险时段封禁,
        SUM(JSON_UNQUOTE(JSON_EXTRACT(response_json, '$.reason')) LIKE '%挂单失效取消%')   AS 挂单取消
 FROM decisions
 WHERE created_at >= '2026-09-18'
