@@ -1208,6 +1208,18 @@ def _config_number(config: dict[str, Any], key: str, default: float) -> float:
         return default
 
 
+def _quote_gap_atr(request: PositionEvaluateRequest, atr: float) -> float:
+    """How far the request's quote sits from its own positions' price, in ATR."""
+    if atr <= 0:
+        return 0.0
+    prices = [float(item.current_price) for item in request.positions if item.current_price]
+    if not prices:
+        return 0.0
+    reference = sum(prices) / len(prices)
+    quote = (float(request.bid) + float(request.ask)) / 2.0
+    return abs(quote - reference) / atr
+
+
 def _quote_divergence(
     request: PositionEvaluateRequest,
     config: dict[str, Any],
@@ -1272,6 +1284,11 @@ def _maybe_add(
         if request.ask > anchor - step * atr:
             return None, ""
         entry, action, stop_loss = request.bid, "SELL", request.bid + STOP_ATR * atr
+    # Recorded before the floor is applied so the raw level can be told apart
+    # from the floored one, and the quote gap is recorded so a request whose
+    # market block disagrees with its own positions is visible in the log.
+    stop_before_floor = stop_loss
+    divergence_atr = _quote_gap_atr(request, atr)
     # The floor exists for a pyramided basket: it keeps a basket that has already
     # added units from being stopped below where it started. With a single unit
     # there is nothing to protect against and it would simply place the stop at
@@ -1334,6 +1351,14 @@ def _maybe_add(
         metadata={"strategy_code": "GL_TREND_V1", "position_sizing": sizing,
                   "unit_index": len(request.positions) + 1, "max_units": _max_units(config),
                   "unified_stop": stop_loss,
+                  # The inputs the stop came from, so a level that looks wrong on
+                  # the client can be checked against what the server actually
+                  # used instead of being inferred from the order log.
+                  "add_bid": round(float(request.bid), 6),
+                  "add_ask": round(float(request.ask), 6),
+                  "add_atr": round(float(atr), 6),
+                  "add_stop_before_floor": round(stop_before_floor, 6),
+                  "add_quote_divergence_atr": round(divergence_atr, 3),
                   "min_stop_distance_enforced": round(stop_clamped, 5),
                   "min_stop_distance_used": round(
                       min_stop_distance(request.symbol_info, config, atr=atr), 5
