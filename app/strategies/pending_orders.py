@@ -22,6 +22,11 @@ from typing import Any
 
 DEFAULT_PENDING_MAX_DISTANCE_ATR = 1.5
 DEFAULT_PENDING_MAX_BARS = 3
+# How far the open basket may be underwater before its pending add-ons stop being
+# worth keeping. Adding is only justified while the basket is winning, so once it
+# is losing the order is waiting for a setup that no longer exists - and filling it
+# would add a unit into a loss.
+DEFAULT_PENDING_CANCEL_LOSS_ATR = 1.0
 
 _TIMEFRAME_SECONDS = {
     "M1": 60,
@@ -59,14 +64,27 @@ def cancel_stale_pending_orders(
     config: dict[str, Any],
     timeframe: str = "",
     now_epoch: int = 0,
+    basket_profit_atr: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Return a cancel action for every pending order that no longer applies."""
+    """Return a cancel action for every pending order that no longer applies.
+
+    ``basket_profit_atr`` is the open basket's weakest unit in ATR, sent by the
+    caller that can see the positions. Once that is under the loss limit, every
+    pending add-on is withdrawn: the add it was placed for is only justified while
+    the basket is winning.
+    """
     if not pending or not _guard_enabled(config):
         return []
 
     max_distance = _number(config, "pending_max_distance_atr", DEFAULT_PENDING_MAX_DISTANCE_ATR)
     max_bars = _number(config, "pending_max_bars", DEFAULT_PENDING_MAX_BARS)
+    loss_limit = _number(config, "pending_cancel_loss_atr", DEFAULT_PENDING_CANCEL_LOSS_ATR)
     bar_seconds = _TIMEFRAME_SECONDS.get(str(timeframe or "").upper(), 0)
+    basket_losing = (
+        loss_limit > 0
+        and basket_profit_atr is not None
+        and basket_profit_atr < -loss_limit
+    )
 
     actions: list[dict[str, Any]] = []
     for item in pending:
@@ -77,6 +95,8 @@ def cancel_stale_pending_orders(
         market = float(bid) if side == "BUY" else float(ask)
         reasons: list[str] = []
 
+        if basket_losing:
+            reasons.append(f"持仓已浮亏 {-basket_profit_atr:.1f} 倍ATR，加仓依据消失")
         if max_distance > 0 and atr > 0:
             distance = abs(market - price)
             if distance > max_distance * atr:

@@ -98,6 +98,44 @@ def test_the_limits_can_be_tuned() -> None:
     )) == 1
 
 
+def test_a_losing_basket_withdraws_its_pending_add_ons() -> None:
+    """A pending add-on waits for a setup that a losing basket no longer has.
+
+    Live case: a limit order the price came back to filled while the basket was
+    underwater, which is adding a unit into a loss.
+    """
+    pending = [_pending(price=1.3000)]
+    actions = cancel_stale_pending_orders(
+        pending, bid=1.3000, ask=1.3002, atr=0.0010, config={},
+        basket_profit_atr=-1.4,
+    )
+
+    assert len(actions) == 1
+    assert "浮亏" in actions[0]["comment"]
+
+
+def test_a_basket_only_slightly_down_keeps_its_pending() -> None:
+    """Noise around break-even must not withdraw the order."""
+    pending = [_pending(price=1.3000)]
+    assert cancel_stale_pending_orders(
+        pending, bid=1.3000, ask=1.3002, atr=0.0010, config={},
+        basket_profit_atr=-0.4,
+    ) == []
+    # And the limit can be switched off entirely.
+    assert cancel_stale_pending_orders(
+        pending, bid=1.3000, ask=1.3002, atr=0.0010,
+        config={"pending_cancel_loss_atr": 0}, basket_profit_atr=-5.0,
+    ) == []
+
+
+def test_a_winning_basket_keeps_its_pending() -> None:
+    pending = [_pending(price=1.3000)]
+    assert cancel_stale_pending_orders(
+        pending, bid=1.3000, ask=1.3002, atr=0.0010, config={},
+        basket_profit_atr=1.2,
+    ) == []
+
+
 def test_a_sell_pending_order_is_measured_from_the_ask() -> None:
     pending = [SimpleNamespace(
         ticket="9002", symbol="GBPUSD.c", side="SELL", volume=0.1,

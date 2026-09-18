@@ -594,7 +594,9 @@ def create_mt5_router(
             for item in request.positions
             if _is_pending_mt_type(item.mt_type)
         ]
-        cancel_actions = _pending_cancel_actions(request, deployment, pending_snapshots)
+        cancel_actions = _pending_cancel_actions(
+            request, deployment, pending_snapshots, open_positions
+        )
         if not open_positions:
             # A client holding only pending orders: there is nothing to manage,
             # and the strategy request requires at least one position.
@@ -1977,6 +1979,7 @@ def _pending_cancel_actions(
     request: Mt5PositionDecisionRequest,
     deployment: dict[str, Any],
     pending: list[PositionSnapshot],
+    open_positions: list[PositionSnapshot] | None = None,
 ) -> list[Mt5PositionAction]:
     """Cancel actions for the client's pending orders, decided here."""
     if not pending:
@@ -1988,6 +1991,17 @@ def _pending_cancel_actions(
         period = 20
     candles = _candles(request.market.bars)
     atr = turtle_agent._atr(candles, period) if candles else 0.0
+    # The weakest open unit, so a basket that has gone underwater withdraws the
+    # add-ons it is no longer justified in taking.
+    basket_profit_atr: float | None = None
+    if open_positions and atr > 0:
+        excursions = [
+            (float(item.current_price) - float(item.open_price))
+            if str(item.side).upper() == "BUY"
+            else (float(item.open_price) - float(item.current_price))
+            for item in open_positions
+        ]
+        basket_profit_atr = min(excursions) / atr
     decided = cancel_stale_pending_orders(
         pending,
         bid=request.market.bid,
@@ -1996,6 +2010,7 @@ def _pending_cancel_actions(
         config=config,
         timeframe=request.timeframe,
         now_epoch=int(time.time()),
+        basket_profit_atr=basket_profit_atr,
     )
     return [
         Mt5PositionAction(
