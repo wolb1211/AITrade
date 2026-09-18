@@ -1025,6 +1025,75 @@ class AiDecisionClient:
             response_schema=_TURTLE_OPEN_RISK_SCHEMA,
         )
 
+    def _chat_with_model_fallback(
+        self,
+        *,
+        deployment: dict[str, Any],
+        endpoint: str,
+        system_prompt: str,
+        user_payload: dict[str, Any],
+        model: str,
+        user_image_url: str = "",
+        response_schema: str = "",
+        cache_key: str | None = None,
+        cache_ttl_seconds: int | None = None,
+    ) -> AiCallResult | None:
+        """Run the call, and on a provider failure retry once on the backup model.
+
+        Only technical failures trigger it - a rate limit, a timeout or a 5xx. A
+        model that answers "no" is a verdict and must never be re-asked elsewhere,
+        or the risk gate could be talked past by simply switching model.
+        """
+        def call(chosen: str) -> AiCallResult | None:
+            kwargs: dict[str, Any] = {
+                "deployment": deployment,
+                "endpoint": endpoint,
+                "system_prompt": system_prompt,
+                "user_payload": user_payload,
+                "model": chosen,
+                "user_image_url": user_image_url,
+                "response_schema": response_schema,
+            }
+            if cache_key is not None:
+                kwargs["cache_key"] = cache_key
+                kwargs["cache_ttl_seconds"] = cache_ttl_seconds
+            return self._chat_json_uncached(**kwargs)
+
+        try:
+            return call(model)
+        except Exception as exc:  # noqa: BLE001 - any provider failure is a reason to retry
+            backup = self._fallback_model(deployment, endpoint, model)
+            if not backup:
+                raise
+            logger.warning(
+                "AI model %s failed (%s); retrying on %s", model, type(exc).__name__, backup
+            )
+            result = call(backup)
+            if result is not None and isinstance(result.content, dict):
+                note = (
+                    f"模型 {model} 出错，本次已改用 {backup} 完成判断，请尽快查原因或更换模型。"
+                )
+                existing = str(result.content.get("analysis") or "")
+                result.content["analysis"] = f"{note}{existing}"
+            return result
+
+    def _fallback_model(
+        self, deployment: dict[str, Any], endpoint: str, model: str
+    ) -> str:
+        """The backup model for this deployment, or an empty string when disabled.
+
+        qwen-plus by default because it answers in about six seconds at a good
+        price, which matters: the client EA waits for this call. An empty setting
+        switches the fallback off, and the model already in use is never retried
+        against itself.
+        """
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        configured = config.get("fallback_model")
+        backup = str(configured if configured is not None else "qwen-plus").strip()
+        if not backup or backup == model:
+            return ""
+        return backup
+
     def _chat_json(
         self,
         *,
@@ -1041,7 +1110,7 @@ class AiDecisionClient:
 
         cache_settings = self.store.get_ai_cache_settings()
         if not bool(cache_settings.get("enabled", True)):
-            return self._chat_json_uncached(
+            return self._chat_with_model_fallback(
                 deployment=deployment,
                 endpoint=endpoint,
                 system_prompt=system_prompt,
@@ -1082,7 +1151,7 @@ class AiDecisionClient:
                     model=model,
                     cached=cached,
                 )
-            return self._chat_json_uncached(
+            return self._chat_with_model_fallback(
                 deployment=deployment,
                 endpoint=endpoint,
                 system_prompt=system_prompt,
