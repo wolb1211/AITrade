@@ -133,9 +133,17 @@ class TurtleTrendStrategy:
             direction, entry_analysis = swing_direction, f"回调趋势确认：{swing_analysis}"
         elif donchian_direction:
             direction = donchian_direction
-            entry_analysis = (
-                f"突破趋势确认：收盘价{close:g}上破前{period}根 K 线区间高点{upper:g}，顺势入场"
-            )
+            # The wording has to follow the direction: a sell breaks the LOW, and
+            # worded as "上破…区间高点" it reads as a calculation error. Production
+            # showed sells reported with a close below the high they "broke".
+            if direction == "buy":
+                entry_analysis = (
+                    f"突破趋势确认：收盘价{close:g}上破前{period}根 K 线区间高点{upper:g}，顺势入场"
+                )
+            else:
+                entry_analysis = (
+                    f"突破趋势确认：收盘价{close:g}下破前{period}根 K 线区间低点{lower:g}，顺势入场"
+                )
         else:
             return _hold_open(request, "趋势尚未形成：区间突破与回调结构均未成立，继续等待")
         entry = request.ask if direction == "buy" else request.bid

@@ -1098,6 +1098,26 @@ def test_cautious_verdict_still_opens_and_explains_the_gate() -> None:
     assert "AI 仅在判定高风险时才阻止开仓" in decision.reason
 
 
+def test_the_breakout_wording_follows_the_direction() -> None:
+    """A sell breaks the low, and worded as a high it reads as a calculation error.
+
+    Production showed sells reported as 收盘价 7646.59 上破…区间高点 7672.84 - a close
+    below the level it supposedly broke.
+    """
+    from app.strategies import turtle_agent
+
+    # A close under the 20-bar low is the sell side of the turtle breakout.
+    request = _open_request(last_close=98.0, last_high=99.5, last_low=97.5)
+
+    decision = turtle_agent.TurtleTrendStrategy().evaluate_open(request, {"config": {}})
+
+    assert decision.status == "APPROVED"
+    assert decision.action == "SELL"
+    assert "下破" in decision.reason
+    assert "区间低点" in decision.reason
+    assert "上破" not in decision.reason
+
+
 def test_the_position_review_prompt_binds_its_answer_to_its_analysis() -> None:
     """The review must not describe a broken structure while answering false.
 
