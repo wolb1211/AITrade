@@ -95,6 +95,17 @@ class TurtleTrendStrategy:
 
     def evaluate_open(self, request: OpenEvaluateRequest, deployment: dict[str, Any]) -> TradeDecision:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        # The quiet end of the US session is closed to new entries for this
+        # strategy: measured over the recent history its win rate there was 14% to
+        # 38% and the hours cost more than the good ones earned.
+        late = time_windows.late_window(config)
+        if late and time_windows.in_us_late_window(
+            time_windows.now_utc(), start=late[0], end=late[1]
+        ):
+            return _hold_open(
+                request,
+                f"美盘尾盘清淡时段（美东 {late[0]:%H:%M}–{late[1]:%H:%M}）不开新仓，等待下一段行情",
+            )
         period = _positive_int(config.get("entry_period"), DEFAULT_ENTRY_PERIOD)
         atr_period = _positive_int(config.get("atr_period"), DEFAULT_ATR_PERIOD)
         candles = _ordered(request.candles)
@@ -1267,6 +1278,12 @@ def _maybe_add(
     silently ignored: the operator sees why nothing was added.
     """
     if not bool(config.get("allow_add", False)) or atr <= 0 or len(request.positions) >= _max_units(config):
+        return None, ""
+    # An add-on is a new entry, so the closed late-session window applies to it too.
+    late = time_windows.late_window(config)
+    if late and time_windows.in_us_late_window(
+        time_windows.now_utc(), start=late[0], end=late[1]
+    ):
         return None, ""
     sides = {item.side for item in request.positions}
     if len(sides) != 1:
