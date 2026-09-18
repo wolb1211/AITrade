@@ -63,6 +63,10 @@ DEFAULT_ADD_STEP_ATR = 1.0           # extension beyond the furthest entry allow
 # four-unit basket peaked well in profit and gave all of it back, because nothing
 # looked at the give-back at all. 0 switches the rule off.
 DEFAULT_GIVE_BACK_RATIO = 0.5
+# How far the request's market quote may sit from the positions' own price before
+# the server refuses to act on it. A client sent a quote forty points from the
+# live price and everything computed from it was worthless.
+DEFAULT_MAX_QUOTE_DIVERGENCE_ATR = 1.0
 # The peak has to be worth protecting before the rule may fire, so ordinary early
 # noise is left alone.
 GIVE_BACK_MIN_ATR = 1.5
@@ -216,6 +220,12 @@ class TurtleTrendStrategy:
                 f"行情数据不足：已收盘 K 线少于{max(period + 1, atr_period + 2)}根，暂不判断离场",
             )
         atr = _atr(candles, atr_period)
+        # Stale market data has to be refused before anything is decided from it:
+        # one client sent a quote forty points from the live price, so the basket
+        # stop it produced sat above the market and every order was refused.
+        stale = _quote_divergence(request, config, atr)
+        if stale is not None:
+            return _hold_position(request, first_ticket, stale)
         window = candles[-period - 1:-1]
         channel_low = min(item.low for item in window)
         channel_high = max(item.high for item in window)
@@ -1011,16 +1021,10 @@ def _break_even_decision(request: PositionEvaluateRequest, position: Any, config
 def _trailing_stop_decision(request: PositionEvaluateRequest, position: Any, config: dict[str, Any], atr: float) -> TradeDecision | None:
     start = _positive_float(config.get("trailing_start_atr"), default=DEFAULT_TRAILING_START_ATR)
     distance = _positive_float(config.get("trailing_distance_atr"), default=DEFAULT_TRAILING_DISTANCE_ATR)
-    # An explicit 0 goes back to moving on every new high, so absent and zero are
-    # told apart rather than both falling back to the default.
     configured_step = config.get("trailing_min_step_atr")
-    if configured_step is None:
-        step = DEFAULT_TRAILING_MIN_STEP_ATR
-    else:
-        try:
-            step = float(configured_step)
-        except (TypeError, ValueError):
-            step = DEFAULT_TRAILING_MIN_STEP_ATR
+    step = DEFAULT_TRAILING_MIN_STEP_ATR if configured_step is None else _config_number(
+        config, "trailing_min_step_atr", DEFAULT_TRAILING_MIN_STEP_ATR
+    )
     minimum_gain = max(step, 0.0) * atr
     if start <= 0 or distance <= 0 or atr <= 0:
         return None
@@ -1142,16 +1146,8 @@ def _give_back_decision(
     default, 0 to switch it off). Nothing fires until the peak itself was worth
     protecting, so ordinary early noise is left alone.
     """
-    # An explicit 0 switches the rule off, so absent and zero are told apart
-    # rather than both falling back to the default.
-    configured = config.get("give_back_ratio")
-    if configured is None:
-        ratio = DEFAULT_GIVE_BACK_RATIO
-    else:
-        try:
-            ratio = float(configured)
-        except (TypeError, ValueError):
-            ratio = DEFAULT_GIVE_BACK_RATIO
+    # An explicit 0 switches the rule off.
+    ratio = _config_number(config, "give_back_ratio", DEFAULT_GIVE_BACK_RATIO)
     if ratio <= 0 or ratio >= 1 or atr <= 0 or not positions:
         return None
 
@@ -1196,6 +1192,57 @@ def _give_back_decision(
     )
 
 
+def _config_number(config: dict[str, Any], key: str, default: float) -> float:
+    """A numeric deployment setting where an explicit 0 means zero.
+
+    _positive_float treats 0 as unusable and returns the default, which is wrong
+    for the switches that use 0 to mean "off". That mistake has been made three
+    times in this file, so the settings that need it go through here.
+    """
+    value = config.get(key)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _quote_divergence(
+    request: PositionEvaluateRequest,
+    config: dict[str, Any],
+    atr: float,
+) -> str | None:
+    """Refuse to act when the request's quote disagrees with its own positions.
+
+    A client sent market data about forty points away from the live price, and on
+    the same symbol twice a day apart, so the basket stop computed from it sat
+    above the market for a long basket and every add-on and modification was
+    refused as invalid. The quote and the per-position price come from different
+    fields of the same payload, which is what makes a large gap informative:
+    acting on a quote that stale is worse than doing nothing, and the stops
+    already held by the broker stay in force either way.
+
+    ``max_quote_divergence_atr`` sets the tolerance (1.0 ATR by default, 0 to
+    switch the check off).
+    """
+    limit = _config_number(config, "max_quote_divergence_atr", DEFAULT_MAX_QUOTE_DIVERGENCE_ATR)
+    if limit <= 0 or atr <= 0 or not request.positions:
+        return None
+    prices = [float(item.current_price) for item in request.positions if item.current_price]
+    if not prices:
+        return None
+    reference = sum(prices) / len(prices)
+    quote = (float(request.bid) + float(request.ask)) / 2.0
+    divergence = abs(quote - reference)
+    if divergence <= limit * atr:
+        return None
+    return (
+        f"行情报价 {quote:.5f} 与持仓现价 {reference:.5f} 相差 {divergence / atr:.1f} 倍ATR，"
+        "疑似数据过期，本轮不动作"
+    )
+
+
 def _maybe_add(
     request: PositionEvaluateRequest,
     config: dict[str, Any],
@@ -1225,12 +1272,14 @@ def _maybe_add(
         if request.ask > anchor - step * atr:
             return None, ""
         entry, action, stop_loss = request.bid, "SELL", request.bid + STOP_ATR * atr
-    # A young basket starts with its stop below where it opened, so the whole
-    # basket could be stopped at a loss after being well in profit. The floor
-    # names the level the stop may not go beyond.
-    floor = _basket_stop_floor(positions=request.positions, side=side, config=config)
-    if floor > 0:
-        stop_loss = max(stop_loss, floor) if side == "BUY" else min(stop_loss, floor)
+    # The floor exists for a pyramided basket: it keeps a basket that has already
+    # added units from being stopped below where it started. With a single unit
+    # there is nothing to protect against and it would simply place the stop at
+    # the entry itself, which the broker refuses.
+    if len(request.positions) > 1:
+        floor = _basket_stop_floor(positions=request.positions, side=side, config=config)
+        if floor > 0:
+            stop_loss = max(stop_loss, floor) if side == "BUY" else min(stop_loss, floor)
     # The added unit carries the basket stop, which the broker has to accept as
     # well; sizing then uses the distance the broker will actually hold.
     stop_loss, stop_clamped = respect_min_stop(

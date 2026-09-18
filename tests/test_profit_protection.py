@@ -25,6 +25,7 @@ def _snapshot(
     side: str = "BUY",
     entry: float = 4300.0,
     opened_at: int = 1000,
+    current: float | None = None,
 ) -> PositionSnapshot:
     return PositionSnapshot(
         ticket=ticket,
@@ -32,7 +33,7 @@ def _snapshot(
         side=side,
         volume=0.10,
         open_price=entry,
-        current_price=entry,
+        current_price=entry if current is None else current,
         profit=0.0,
         open_time=opened_at,
     )
@@ -157,6 +158,47 @@ def test_without_an_open_time_the_rule_stands_down() -> None:
     request = _request(positions, bid=4312.0, ask=4312.2)
 
     assert turtle_agent._give_back_decision(request, positions, {}, 10.0, candles) is None
+
+
+def test_a_single_unit_add_keeps_the_two_atr_stop() -> None:
+    """The floor must not raise the stop to the entry when there is one unit.
+
+    Production saw a long basket whose add-on carried a stop above the market:
+    it had been raised to the entry price itself, only a fraction of an ATR from
+    the new entry, and the broker refused every order as an invalid stop.
+    """
+    positions = [_snapshot(entry=1.33477)]
+    # The add needs the price 1.0 ATR beyond the entry, so the entry sits 1.2 ATR
+    # below the market - exactly where the floor used to take over.
+    request = _request(positions, bid=1.33610, ask=1.33620)
+    config = {"allow_add": True, "max_positions": 4, "add_step_atr": 1.0}
+
+    decision, _reason = turtle_agent._maybe_add(request, config, 0.0011)
+
+    assert decision is not None
+    assert decision.sl == pytest.approx(1.33620 - 2 * 0.0011)
+    # The entry is nowhere near the stop: the old behaviour put it at the entry.
+    assert decision.sl < positions[0].open_price
+
+
+def test_a_stale_quote_stops_the_server_acting() -> None:
+    """One client sent a quote about forty points from its own live price.
+
+    Both values come from the same payload, so a gap that large means the quote
+    is stale and anything computed from it - like a basket stop - is worthless.
+    """
+    positions = [_snapshot(entry=1.33477, current=1.33700)]
+    stale = _request(positions, bid=1.34120, ask=1.34140)
+
+    reason = turtle_agent._quote_divergence(stale, {}, 0.0011)
+    assert reason is not None
+    assert "数据过期" in reason
+    # A quote that agrees with the positions is accepted.
+    assert turtle_agent._quote_divergence(
+        _request(positions, bid=1.33700, ask=1.33710), {}, 0.0011
+    ) is None
+    # And the check can be switched off.
+    assert turtle_agent._quote_divergence(stale, {"max_quote_divergence_atr": 0}, 0.0011) is None
 
 
 def test_a_sell_basket_is_measured_the_same_way() -> None:
