@@ -3546,13 +3546,23 @@ _CACHE_SYMBOL_SEPARATORS = (".", "_", "-", "#")
 
 
 def _cache_symbol(value: Any) -> str:
-    """The instrument name without the broker's account-type suffix."""
-    text = str(value or "").strip().upper()
+    """The instrument name without the broker's account-type suffix.
+
+    Brokers tag the account type onto the name in two shapes: behind a separator
+    (XAUUSD.c) or as a single lower-case letter (XAUUSDm, XAUUSDs). Only those are
+    removed. A bare trailing letter is not stripped in general, because EURUSD and
+    USDJPY end in one too - the letter is only dropped when the rest of the name is
+    upper case, which is how these tags are written.
+    """
+    text = str(value or "").strip()
     for separator in _CACHE_SYMBOL_SEPARATORS:
         head, found, tail = text.rpartition(separator)
         if found and head and 0 < len(tail) <= 3:
-            return head
-    return text
+            text = head
+            break
+    if len(text) >= 3 and text[-1].islower() and text[:-1].isupper():
+        text = text[:-1]
+    return text.upper()
 
 
 def _cache_fingerprint(payload: Any) -> Any:

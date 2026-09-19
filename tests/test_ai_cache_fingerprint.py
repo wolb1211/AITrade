@@ -27,17 +27,28 @@ def _request(bid: float, ask: float, closes: list[float], login: str = "111") ->
     }
 
 
-def test_a_cent_account_symbol_matches_the_plain_one() -> None:
-    """XAUUSD.c quotes the same gold as XAUUSD, so the verdict is the same."""
+def test_the_account_type_suffix_is_ignored() -> None:
+    """Gold arrives as XAUUSD, XAUUSD.c, XAUUSDm or XAUUSDs - all one market."""
     closes = [4374.6, 4375.1]
-    plain = _request(4374.63, 4374.85, closes)
-    cent = {**_request(4374.63, 4374.85, closes), "symbol": "XAUUSD.c"}
-    suffixed = {**_request(4374.63, 4374.85, closes), "symbol": "XAUUSDs"}
+    plain = _cache_fingerprint(_request(4374.63, 4374.85, closes))
+    for suffix in (".c", "m", "s", ".f", "_c", "#c"):
+        other = _cache_fingerprint(
+            {**_request(4374.63, 4374.85, closes), "symbol": f"XAUUSD{suffix}"}
+        )
+        assert other == plain, suffix
 
-    assert _cache_fingerprint(plain) == _cache_fingerprint(cent)
-    # A bare trailing letter is part of the name: EURUSD ends in one too, so it is
-    # never stripped.
-    assert _cache_fingerprint(plain) != _cache_fingerprint(suffixed)
+
+def test_the_tag_rule_leaves_real_instrument_names_alone() -> None:
+    """EURUSD and USDJPY end in a letter and are already upper case, so the tag
+    rule - a lower-case letter after an upper-case name - never touches them."""
+    from app.services.ai_service import _cache_symbol
+
+    assert _cache_symbol("EURUSD") == "EURUSD"
+    assert _cache_symbol("USDJPY") == "USDJPY"
+    assert _cache_symbol("NAS100") == "NAS100"
+    assert _cache_symbol("XAUUSDm") == "XAUUSD"
+    assert _cache_symbol("XAUUSDs") == "XAUUSD"
+    assert _cache_symbol("US30cash") == "US30CASH"
 
 
 def test_two_different_instruments_do_not_merge() -> None:
