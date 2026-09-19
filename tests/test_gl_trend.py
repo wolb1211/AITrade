@@ -1225,6 +1225,76 @@ def test_the_breakout_wording_follows_the_direction() -> None:
     assert "上破" not in decision.reason
 
 
+def _retest_candles(pullback: str) -> list[Candle]:
+    """A channel at 100.5, a close above it, then one bar that behaves a certain way.
+
+    The channel comes from twenty flat bars, so the level is exact and the test
+    says nothing about how the channel is calculated.
+    """
+    bars = _flat_bars(20)
+    bars.append(_confirm_bar(100.4, 101.5, 100.3, 101.2, 20))     # closes above 100.5
+    if pullback == "holds":
+        bars.append(_confirm_bar(101.1, 101.3, 100.55, 100.9, 21))
+    elif pullback == "fails":
+        bars.append(_confirm_bar(101.1, 101.3, 100.55, 99.8, 21))
+    else:                                                        # never comes back
+        bars.append(_confirm_bar(101.2, 101.6, 101.1, 101.5, 21))
+    bars.append(_confirm_bar(101.4, 101.8, 101.2, 101.7, 22))
+    bars.append(_confirm_bar(101.7, 102.0, 101.5, 101.9, 23))
+    return bars
+
+
+def test_a_pullback_to_the_broken_level_is_a_confirmation() -> None:
+    """The anti-chase evidence: the level was given back once and held."""
+    from app.strategies import turtle_agent
+
+    hit = turtle_agent._retest_hit(
+        _retest_candles("holds"), "buy", config={"entry_period": 20, "retest_max_wait_bars": 3}, tolerance=0.5
+    )
+
+    assert hit is not None
+    assert "回踩" in hit[1]
+
+
+def test_a_breakout_that_never_comes_back_is_not_a_retest() -> None:
+    from app.strategies import turtle_agent
+
+    assert turtle_agent._retest_hit(
+        _retest_candles("runs"), "buy", config={"entry_period": 20, "retest_max_wait_bars": 3}, tolerance=0.5
+    ) is None
+
+
+def test_a_pullback_that_closes_back_below_the_level_is_not_a_retest() -> None:
+    from app.strategies import turtle_agent
+
+    assert turtle_agent._retest_hit(
+        _retest_candles("fails"), "buy", config={"entry_period": 20, "retest_max_wait_bars": 3}, tolerance=0.5
+    ) is None
+
+
+def test_the_retest_condition_can_be_switched_off() -> None:
+    from app.strategies import turtle_agent
+
+    assert turtle_agent._retest_hit(
+        _retest_candles("holds"), "buy",
+        config={"entry_period": 20, "retest_enabled": False, "entry_period": 20, "retest_max_wait_bars": 3}, tolerance=0.5,
+    ) is None
+
+
+def test_a_retest_is_evidence_and_never_the_trigger() -> None:
+    """It is reported at the bar that held the level, not the newest bar."""
+    from app.strategies import turtle_agent
+
+    candles = _retest_candles("holds")
+    hits = turtle_agent._confirmation_signals(
+        candles, 5, "buy", 0.0, 0.0, None, {"entry_period": 20, "retest_max_wait_bars": 3}, 0.5
+    )
+    retest = [item for item in hits if "回踩" in item[1]]
+
+    assert retest
+    assert not any(index == len(candles) - 1 for index, _ in retest)
+
+
 def _star_candles() -> list[Candle]:
     """A decline, then a small-bodied bar at the low, then a reversal bar."""
     bars = _flat_bars(4)

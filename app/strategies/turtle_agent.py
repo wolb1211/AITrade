@@ -56,6 +56,10 @@ DEFAULT_STAR_TREND_BARS = 3
 # does not, which warns of a turn before any candle pattern shows it.
 DEFAULT_DIVERGENCE_PERIOD = 14
 DEFAULT_DIVERGENCE_MIN_GAP = 3
+# The anti-chase evidence: how long after a breakout a pullback to the broken level
+# still counts, and how close to that level the pullback has to come.
+DEFAULT_RETEST_MAX_WAIT = 10
+DEFAULT_RETEST_TOLERANCE_ATR = 0.2
 # How far an engulfing body edge may miss the previous body by. A bar still moving
 # at its close makes the next bar open a tick or three above that close, which is
 # the common case in a live market; demanding an exact cover filtered real
@@ -174,6 +178,16 @@ class TurtleTrendStrategy:
                 entry_analysis = (
                     f"突破趋势确认：收盘价{close:g}下破前{period}根 K 线区间低点{lower:g}，顺势入场"
                 )
+            # This branch is the one that chases, so the retest evidence matters most
+            # here: it says the level was already given back and held once.
+            retest = _retest_hit(
+                candles, direction, config=config,
+                tolerance=atr * _config_number(
+                    config, "retest_tolerance_atr", DEFAULT_RETEST_TOLERANCE_ATR
+                ),
+            )
+            if retest is not None:
+                entry_analysis = f"{entry_analysis}；{retest[1]}"
         else:
             return _hold_open(request, "当前无合适入场点：等突破关键位、或回调到位后再进场")
         entry = request.ask if direction == "buy" else request.bid
@@ -685,6 +699,9 @@ def _swing_pullback_signal(
     # A pin-bar wick also has to reach this share of the ATR, so that a body of one
     # tick cannot make a two-tick wick a pattern.
     pin_min_wick = atr * _config_number(config, "pin_bar_min_atr", DEFAULT_PIN_BAR_MIN_ATR)
+    retest_tolerance = atr * _config_number(
+        config, "retest_tolerance_atr", DEFAULT_RETEST_TOLERANCE_ATR
+    )
     star_settings = {
         "star_inner_body_share": _config_number(
             config, "star_inner_body_share", DEFAULT_STAR_INNER_BODY_SHARE
@@ -710,7 +727,7 @@ def _swing_pullback_signal(
         crossed = close > last_high[2] and _crossed_recently(candles, last_high[2], "buy", confirmation_window)
         confirmation = _bullish_confirmation(
             candles, confirmation_window, confirm_min_signals, engulf_tolerance,
-            pin_min_wick, star_settings, config,
+            pin_min_wick, star_settings, config, retest_tolerance,
         )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "buy", (
@@ -724,7 +741,7 @@ def _swing_pullback_signal(
         crossed = close < last_low[2] and _crossed_recently(candles, last_low[2], "sell", confirmation_window)
         confirmation = _bearish_confirmation(
             candles, confirmation_window, confirm_min_signals, engulf_tolerance,
-            pin_min_wick, star_settings, config,
+            pin_min_wick, star_settings, config, retest_tolerance,
         )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "sell", (
@@ -828,6 +845,64 @@ def _rsi_series(values: list[float], period: int) -> list[float]:
         else:
             result[index] = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
     return result
+
+
+def _retest_hit(
+    candles, direction: str, *, config: dict[str, Any], tolerance: float = 0.0
+) -> tuple[int, str] | None:
+    """A breakout, a pullback to the broken level, and a close that holds above it.
+
+    This is the anti-chase evidence: the level came from the same channel the
+    breakout uses, so no plumbing is needed. Reported at the bar that held the
+    level rather than the newest bar, because it is evidence about the move and not
+    a live trigger - the entry still needs a candle pattern happening now.
+    """
+    if not _config_flag(config, "retest_enabled", True):
+        return None
+    period = _positive_int(config.get("entry_period"), DEFAULT_ENTRY_PERIOD)
+    wait = int(_config_number(config, "retest_max_wait_bars", DEFAULT_RETEST_MAX_WAIT))
+    now = len(candles) - 1
+    if wait < 1 or now < period + wait:
+        return None
+    bullish = direction == "buy"
+
+    # The channel as it stood before the window, so the level is fixed and a bar
+    # cannot break "its own" channel the way every bar after a breakout does.
+    start = now - wait
+    window = candles[start - period:start]
+    if bullish:
+        level = max(float(item.high) for item in window)
+    else:
+        level = min(float(item.low) for item in window)
+
+    def beyond(index: int) -> bool:
+        close = float(candles[index].close)
+        return close > level if bullish else close < level
+
+    breaks = [index for index in range(start, now + 1) if beyond(index)]
+    if not breaks:
+        return None
+    first = breaks[0]
+    if first >= now:
+        return None
+
+    for index in range(first + 1, now + 1):
+        bar = candles[index]
+        touched = (
+            float(bar.low) <= level + tolerance
+            if bullish
+            else float(bar.high) >= level - tolerance
+        )
+        held = beyond(index) or abs(float(bar.close) - level) <= tolerance
+        held_after = all(
+            beyond(item) or abs(float(candles[item].close) - level) <= tolerance
+            for item in range(index, now + 1)
+        )
+        if touched and held and held_after:
+            return index, (
+                f"回踩{level:g}不破后站住" if bullish else f"反抽{level:g}不破后压住"
+            )
+    return None
 
 
 def _divergence_hit(candles, direction: str, *, config: dict[str, Any]) -> tuple[int, str] | None:
@@ -938,6 +1013,7 @@ def _confirmation_signals(
     pin_min_wick: float = 0.0,
     settings: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
+    retest_tolerance: float = 0.0,
 ) -> list[tuple[int, str]]:
     """Every confirmation hit in the window, oldest first, as (bar index, kind).
 
@@ -986,13 +1062,16 @@ def _confirmation_signals(
         divergence = _divergence_hit(candles, direction, config=config)
         if divergence is not None:
             hits.append(divergence)
+        retest = _retest_hit(candles, direction, config=config, tolerance=retest_tolerance)
+        if retest is not None:
+            hits.append(retest)
     return hits
 
 
 def _confirmation_text(
     candles, window: int, direction: str, min_signals: int, engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
-    config: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None, retest_tolerance: float = 0.0,
 ) -> str:
     """The confirmation wording, or an empty string when the bar does not qualify.
 
@@ -1002,7 +1081,8 @@ def _confirmation_text(
     entry - the trigger has to be happening now.
     """
     hits = _confirmation_signals(
-        candles, window, direction, engulf_tolerance, pin_min_wick, star_settings, config
+        candles, window, direction, engulf_tolerance, pin_min_wick, star_settings, config,
+        retest_tolerance,
     )
     if not hits:
         return ""
@@ -1018,20 +1098,22 @@ def _confirmation_text(
 def _bullish_confirmation(
     candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
-    config: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None, retest_tolerance: float = 0.0,
 ) -> str:
     return _confirmation_text(
-        candles, window, "buy", min_signals, engulf_tolerance, pin_min_wick, star_settings, config
+        candles, window, "buy", min_signals, engulf_tolerance, pin_min_wick, star_settings, config,
+        retest_tolerance,
     )
 
 
 def _bearish_confirmation(
     candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
-    config: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None, retest_tolerance: float = 0.0,
 ) -> str:
     return _confirmation_text(
-        candles, window, "sell", min_signals, engulf_tolerance, pin_min_wick, star_settings, config
+        candles, window, "sell", min_signals, engulf_tolerance, pin_min_wick, star_settings, config,
+        retest_tolerance,
     )
 
 
