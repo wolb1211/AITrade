@@ -153,7 +153,7 @@ class TurtleTrendStrategy:
                     f"突破趋势确认：收盘价{close:g}下破前{period}根 K 线区间低点{lower:g}，顺势入场"
                 )
         else:
-            return _hold_open(request, "趋势尚未形成：区间突破与回调结构均未成立，继续等待")
+            return _hold_open(request, "当前无合适入场点：等突破关键位、或回调到位后再进场")
         entry = request.ask if direction == "buy" else request.bid
         # The US data/open window and a spike bar both mean the move has just
         # happened; those entries wait for a pullback at the level that was
