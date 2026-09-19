@@ -1425,7 +1425,7 @@ class AiDecisionClient:
             api_key_hash = sha256(str(model.get("provider_api_key") or "").encode("utf-8")).hexdigest()
             scope = f"custom:{deployment.get('user_id', '')}:{api_key_hash}"
         material = {
-            "cache_version": 1,
+            "cache_version": 2,
             "scope": scope,
             "endpoint": endpoint,
             "provider_id": str(model.get("provider_id") or ""),
@@ -1436,7 +1436,7 @@ class AiDecisionClient:
                 system_prompt,
                 literal_user_rules=_uses_literal_user_rules(deployment),
             ),
-            "user_payload": user_payload,
+            "user_payload": _cache_fingerprint(user_payload),
             # Screenshot bytes are part of the request semantics. Include a
             # digest rather than the base64 itself so different chart images
             # cannot reuse a previous strategy result during the cache TTL.
@@ -3504,6 +3504,66 @@ def _empty_content_error(parsed: Any, raw_response: str) -> str:
             f"原始返回: {_preview_text(raw_response)}"
         )
     return f"AI provider response content empty: {_preview_text(raw_response)}"
+
+
+# Fields that differ between accounts or moments without changing what the verdict
+# should be. Dropping them is what lets two deployments on the same symbol and
+# timeframe share one answer.
+_CACHE_VOLATILE_KEYS = frozenset({
+    # Per account: same book, different numbers.
+    "ticket", "position_ticket", "login", "account_login", "server", "mt_login", "mt_server",
+    "volume", "lot", "lots", "units", "profit", "net_profit", "commission", "swap",
+    "balance", "equity", "margin", "free_margin", "comment", "open_time", "close_time",
+    # Quotes arrive with the candles, and the broker's contract figures do not
+    # change the shape of the market.
+    "bid", "ask", "spread", "point", "tick_size", "tick_value", "value_per_point",
+    "value_per_price", "contract_size", "stops_level", "open_price", "current_price",
+    # Snapshot timestamps: two feeds describe the same bars a second apart.
+    "time", "timestamp", "bar_time", "created_at", "updated_at",
+})
+# Five significant digits is a tenth of a point on gold, which is the order of the
+# difference between two brokers quoting the same bar.
+CACHE_PRICE_PRECISION = 5
+
+
+def _cache_fingerprint(payload: Any) -> Any:
+    """Reduce a request to the part that decides the verdict.
+
+    Two deployments on the same symbol and timeframe send the same trend with the
+    prices a few points apart, and the account-specific fields differ outright.
+    Keeping the request whole made that impossible to match, which is why the cache
+    hardly ever hit. Timestamps and per-account numbers are dropped and prices are
+    rounded, so the same market state produces the same key.
+
+    A list of positions collapses to (symbol, side) counts: the same book held on
+    another account, in another size, is the same situation to review.
+    """
+    if isinstance(payload, bool):
+        return payload
+    if isinstance(payload, dict):
+        compact: dict[str, Any] = {}
+        for key, value in payload.items():
+            if str(key).strip().lower() in _CACHE_VOLATILE_KEYS:
+                continue
+            compact[key] = _cache_fingerprint(value)
+        return compact
+    if isinstance(payload, (list, tuple)):
+        reduced = [_cache_fingerprint(item) for item in payload]
+        if reduced and all(isinstance(item, dict) and "symbol" in item for item in reduced):
+            counted: dict[str, int] = {}
+            for item in reduced:
+                side = item.get("side") or item.get("direction") or ""
+                label = f"{item.get('symbol')}|{side}"
+                counted[label] = counted.get(label, 0) + 1
+            return dict(sorted(counted.items()))
+        return reduced
+    if isinstance(payload, int):
+        return payload
+    if isinstance(payload, float):
+        if payload == 0:
+            return 0
+        return float(f"{payload:.{CACHE_PRICE_PRECISION}g}")
+    return payload
 
 
 def _max_tokens_for_endpoint(endpoint: str) -> int:
