@@ -44,6 +44,14 @@ SWING_CONFIRM_MIN_SIGNALS = 1
 SWING_EMA_FAST = 5              # confirmation EMA cross, fast period
 SWING_EMA_SLOW = 10             # confirmation EMA cross, slow period
 PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
+# A pin bar judged only against its own body counts a two-tick wick when the body
+# is one tick, so the wick also has to reach this share of the ATR. 0 disables it.
+DEFAULT_PIN_BAR_MIN_ATR = 0.1
+# Morning and evening star: the middle bar is the extreme of the three, its body is
+# small against the first bar's, and the third bar reverses into the first body.
+DEFAULT_STAR_INNER_BODY_SHARE = 0.6
+DEFAULT_STAR_RECOVER_SHARE = 0.5
+DEFAULT_STAR_TREND_BARS = 3
 # How far an engulfing body edge may miss the previous body by. A bar still moving
 # at its close makes the next bar open a tick or three above that close, which is
 # the common case in a live market; demanding an exact cover filtered real
@@ -670,6 +678,18 @@ def _swing_pullback_signal(
     confirm_min_signals = _positive_int(
         config.get("swing_confirm_min_signals"), SWING_CONFIRM_MIN_SIGNALS
     )
+    # A pin-bar wick also has to reach this share of the ATR, so that a body of one
+    # tick cannot make a two-tick wick a pattern.
+    pin_min_wick = atr * _config_number(config, "pin_bar_min_atr", DEFAULT_PIN_BAR_MIN_ATR)
+    star_settings = {
+        "star_inner_body_share": _config_number(
+            config, "star_inner_body_share", DEFAULT_STAR_INNER_BODY_SHARE
+        ),
+        "star_recover_share": _config_number(
+            config, "star_recover_share", DEFAULT_STAR_RECOVER_SHARE
+        ),
+        "star_trend_bars": int(_config_number(config, "star_trend_bars", DEFAULT_STAR_TREND_BARS)),
+    }
     points = _confirmed_pivots(candles, pivot_span)
     highs = [item for item in points if item[1] == "high"]
     lows = [item for item in points if item[1] == "low"]
@@ -685,7 +705,8 @@ def _swing_pullback_signal(
         pullback_size = last_high[2] - last_low[2]
         crossed = close > last_high[2] and _crossed_recently(candles, last_high[2], "buy", confirmation_window)
         confirmation = _bullish_confirmation(
-            candles, confirmation_window, confirm_min_signals, engulf_tolerance
+            candles, confirmation_window, confirm_min_signals, engulf_tolerance,
+            pin_min_wick, star_settings,
         )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "buy", (
@@ -698,7 +719,8 @@ def _swing_pullback_signal(
         pullback_size = last_high[2] - last_low[2]
         crossed = close < last_low[2] and _crossed_recently(candles, last_low[2], "sell", confirmation_window)
         confirmation = _bearish_confirmation(
-            candles, confirmation_window, confirm_min_signals, engulf_tolerance
+            candles, confirmation_window, confirm_min_signals, engulf_tolerance,
+            pin_min_wick, star_settings,
         )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "sell", (
@@ -780,8 +802,65 @@ def _ema_series(values: list[float], period: int) -> list[float]:
     return result
 
 
+def _star_signal(candles, direction: str, *, settings: dict[str, Any]) -> bool:
+    """Whether the newest three bars form a morning or evening star.
+
+    Three parts, as the operator described it: a trend into the star, the star
+    itself as the extreme of the three, and a reversal bar after it. The star is
+    judged as a group rather than as a lone doji, because a doji on its own only
+    says the market is undecided - it is the surrounding bars that make it a turn.
+    Checking the newest three bars keeps the trigger punctual by construction.
+    """
+    if len(candles) < 4:
+        return False
+    first, star, last = candles[-3], candles[-2], candles[-1]
+    bullish = direction == "buy"
+    inner_share = float(settings.get("star_inner_body_share") or 0.6)
+    recover_share = float(settings.get("star_recover_share") or 0.5)
+    trend_bars = int(settings.get("star_trend_bars") or 3)
+
+    first_body = abs(float(first.close) - float(first.open))
+    if first_body <= 0:
+        return False
+    # The trend into the star: a run of bars in the opposite direction.
+    lookback = max(1, min(trend_bars, len(candles) - 4))
+    earlier = float(candles[-4 - lookback + 1].close) if lookback else float(candles[-4].close)
+    if bullish and not (float(candles[-4].close) < earlier or float(first.close) < float(first.open)):
+        return False
+    if not bullish and not (float(candles[-4].close) > earlier or float(first.close) > float(first.open)):
+        return False
+
+    if bullish:
+        if not (float(first.close) < float(first.open)):              # ① 阴线入星
+            return False
+        if not (float(star.low) < float(first.low) and float(star.low) < float(last.low)):
+            return False                                               # ② 星在最低点
+        body = abs(float(star.close) - float(star.open))
+        if body > first_body * inner_share:
+            return False                                               # 星是小实体
+        if not (float(last.close) > float(last.open)):                 # ③ 阳线反转
+            return False
+        return float(last.close) >= float(star.close) + first_body * recover_share
+
+    if not (float(first.close) > float(first.open)):
+        return False
+    if not (float(star.high) > float(first.high) and float(star.high) > float(last.high)):
+        return False
+    body = abs(float(star.close) - float(star.open))
+    if body > first_body * inner_share:
+        return False
+    if not (float(last.close) < float(last.open)):
+        return False
+    return float(last.close) <= float(star.close) - first_body * recover_share
+
+
 def _confirmation_signals(
-    candles, window: int, direction: str, engulf_tolerance: float = 0.0
+    candles,
+    window: int,
+    direction: str,
+    engulf_tolerance: float = 0.0,
+    pin_min_wick: float = 0.0,
+    settings: dict[str, Any] | None = None,
 ) -> list[tuple[int, str]]:
     """Every confirmation hit in the window, oldest first, as (bar index, kind).
 
@@ -792,7 +871,8 @@ def _confirmation_signals(
     ``engulf_tolerance`` forgives a body edge that misses the previous body by a
     tick. A bar that is still moving at its close makes the next bar open a tick
     above that close, which is the common case in a live market, and demanding an
-    exact cover threw those engulfings away.
+    exact cover threw those engulfings away. ``pin_min_wick`` is an absolute floor
+    for a pin bar, because a ratio against a tiny body lets a two-tick wick count.
     """
     start = max(1, len(candles) - max(1, window))
     hits: list[tuple[int, str]] = []
@@ -815,17 +895,22 @@ def _confirmation_signals(
         body = abs(current.close - current.open)
         if body > 0 and bullish:
             wick = min(current.open, current.close) - current.low
-            if wick >= body * PIN_BAR_WICK_RATIO and current.close > (current.high + current.low) / 2:
+            if wick >= max(body * PIN_BAR_WICK_RATIO, pin_min_wick) \
+                    and current.close > (current.high + current.low) / 2:
                 hits.append((index, "看涨长下影（Pin Bar）"))
         elif body > 0:
             wick = current.high - max(current.open, current.close)
-            if wick >= body * PIN_BAR_WICK_RATIO and current.close < (current.high + current.low) / 2:
+            if wick >= max(body * PIN_BAR_WICK_RATIO, pin_min_wick) \
+                    and current.close < (current.high + current.low) / 2:
                 hits.append((index, "看跌长上影（Pin Bar）"))
+    if settings is not None and _star_signal(candles, direction, settings=settings):
+        hits.append((len(candles) - 1, "启明星" if bullish else "黄昏星"))
     return hits
 
 
 def _confirmation_text(
-    candles, window: int, direction: str, min_signals: int, engulf_tolerance: float = 0.0
+    candles, window: int, direction: str, min_signals: int, engulf_tolerance: float = 0.0,
+    pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
 ) -> str:
     """The confirmation wording, or an empty string when the bar does not qualify.
 
@@ -834,7 +919,9 @@ def _confirmation_text(
     second is what stops a condition from five bars ago still counting as a fresh
     entry - the trigger has to be happening now.
     """
-    hits = _confirmation_signals(candles, window, direction, engulf_tolerance)
+    hits = _confirmation_signals(
+        candles, window, direction, engulf_tolerance, pin_min_wick, star_settings
+    )
     if not hits:
         return ""
     kinds = list(dict.fromkeys(text for _, text in hits))
@@ -846,12 +933,22 @@ def _confirmation_text(
     return "、".join(kinds)
 
 
-def _bullish_confirmation(candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0) -> str:
-    return _confirmation_text(candles, window, "buy", min_signals, engulf_tolerance)
+def _bullish_confirmation(
+    candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0,
+    pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
+) -> str:
+    return _confirmation_text(
+        candles, window, "buy", min_signals, engulf_tolerance, pin_min_wick, star_settings
+    )
 
 
-def _bearish_confirmation(candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0) -> str:
-    return _confirmation_text(candles, window, "sell", min_signals, engulf_tolerance)
+def _bearish_confirmation(
+    candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0,
+    pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
+) -> str:
+    return _confirmation_text(
+        candles, window, "sell", min_signals, engulf_tolerance, pin_min_wick, star_settings
+    )
 
 
 def _bullish_confirmation_event(candles, window: int) -> tuple[int, str] | None:

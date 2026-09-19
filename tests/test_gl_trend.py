@@ -1225,6 +1225,74 @@ def test_the_breakout_wording_follows_the_direction() -> None:
     assert "上破" not in decision.reason
 
 
+def _star_candles() -> list[Candle]:
+    """A decline, then a small-bodied bar at the low, then a reversal bar."""
+    bars = _flat_bars(4)
+    bars.append(_confirm_bar(106.0, 106.2, 105.0, 105.0, 4))     # downtrend leg
+    bars.append(_confirm_bar(105.0, 105.2, 103.0, 103.5, 5))     # first: bearish
+    bars.append(_confirm_bar(103.4, 103.6, 102.9, 103.45, 6))    # star: small body, lowest low
+    bars.append(_confirm_bar(103.5, 105.4, 103.4, 105.2, 7))     # reversal: bullish, recovers
+    return bars
+
+
+def test_a_morning_star_is_a_confirmation() -> None:
+    """A trend into a star at the low, then a reversal bar: three bars as a group.
+
+    A doji on its own only says the market is undecided, so it is judged with the
+    bars around it rather than as a lone candle.
+    """
+    from app.strategies import turtle_agent
+
+    text = turtle_agent._confirmation_text(
+        _star_candles(), 5, "buy", 1, 0.0, 0.0, {"star_trend_bars": 3}
+    )
+
+    assert "启明星" in text
+
+
+def test_a_star_without_the_reversal_bar_is_not_counted() -> None:
+    from app.strategies import turtle_agent
+
+    candles = _star_candles()
+    # The third bar closes below where it opened, so there is no reversal.
+    candles[-1] = _confirm_bar(105.0, 105.2, 103.4, 103.6, 7)
+
+    text = turtle_agent._confirmation_text(
+        candles, 5, "buy", 1, 0.0, 0.0, {"star_trend_bars": 3}
+    )
+
+    assert "启明星" not in text
+
+
+def test_a_star_that_is_not_the_low_is_not_counted() -> None:
+    from app.strategies import turtle_agent
+
+    candles = _star_candles()
+    # The middle bar is no longer the lowest of the three.
+    candles[-2] = _confirm_bar(103.4, 103.6, 103.2, 103.45, 6)
+
+    text = turtle_agent._confirmation_text(
+        candles, 5, "buy", 1, 0.0, 0.0, {"star_trend_bars": 3}
+    )
+
+    assert "启明星" not in text
+
+
+def test_a_pin_bar_wick_also_has_to_reach_a_share_of_the_atr() -> None:
+    """One tick of body and two of wick used to count as a pattern."""
+    from app.strategies import turtle_agent
+
+    candles = _flat_bars(7)
+    # Body 0.01, wick 0.02: twice the body, and closed in the upper half.
+    candles.append(_confirm_bar(100.0, 100.05, 99.97, 100.01, 7))
+
+    assert "Pin Bar" in turtle_agent._confirmation_text(candles, 5, "buy", 1)
+    # With a floor of 0.5 the two-tick wick no longer qualifies.
+    assert "Pin Bar" not in turtle_agent._confirmation_text(
+        candles, 5, "buy", 1, 0.0, 0.5
+    )
+
+
 def test_an_engulfing_may_miss_the_previous_body_by_a_few_ticks() -> None:
     """The gap is whatever the market left: one tick, or three.
 
