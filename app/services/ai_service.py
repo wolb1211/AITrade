@@ -1108,6 +1108,20 @@ class AiDecisionClient:
         if model is None:
             return None
 
+        # A user who brings their own AI key is billed by their own provider and can
+        # audit the calls there, so every request is made for real. The cache stays
+        # for the platform's own models, where it saves the provider calls.
+        if bool(model.get("is_custom")):
+            return self._chat_with_model_fallback(
+                deployment=deployment,
+                endpoint=endpoint,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                model=model,
+                user_image_url=user_image_url,
+                response_schema=response_schema,
+            )
+
         cache_settings = self.store.get_ai_cache_settings()
         if not bool(cache_settings.get("enabled", True)):
             return self._chat_with_model_fallback(
