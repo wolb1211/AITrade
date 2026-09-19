@@ -1372,6 +1372,88 @@ def test_both_ai_prompts_weigh_the_opposing_divergence() -> None:
     assert "opposing_divergence" in _turtle_position_review_prompt()
 
 
+def _drawdown_candles(high: float, low: float = 4290.0) -> list[Candle]:
+    return [
+        _confirm_bar(4300.0, 4302.0, 4298.0, 4300.5, 0),
+        _confirm_bar(4300.5, high, 4299.0, high - 0.5, 1),
+        _confirm_bar(high - 0.5, high - 0.2, low, low + 1.0, 2),
+    ]
+
+
+def _basket(entry: float = 4300.0, side: str = "BUY") -> list[Any]:
+    class _P:
+        pass
+
+    item = _P()
+    item.side = side
+    item.open_price = entry
+    item.volume = 0.1
+    return [item]
+
+
+def test_the_basket_drawdown_is_a_share_of_the_best_level() -> None:
+    """A pause from +5 ATR and a round trip from +1.5 are not the same thing."""
+    from app.strategies import turtle_agent
+
+    # Entry 4300, ATR 4: best +5.0 ATR, now +3.5 ATR, so 30% given back.
+    paused = turtle_agent._basket_drawdown(
+        _basket(), _drawdown_candles(4320.0), 4314.0, 4314.2, 4.0
+    )
+    assert paused["peak"] == pytest.approx(5.0)
+    assert paused["current"] == pytest.approx(3.5)
+    assert paused["give_back"] == pytest.approx(0.3)
+
+    # The same 1.5 ATR off a smaller peak is a full round trip.
+    spent = turtle_agent._basket_drawdown(
+        _basket(), _drawdown_candles(4306.0), 4300.0, 4300.2, 4.0
+    )
+    assert spent["peak"] == pytest.approx(1.5)
+    assert spent["give_back"] == pytest.approx(1.0)
+
+
+def _drawdown_request(high: float, bid: float) -> Any:
+    """The add-ready fixture, rescaled so the candles match the entry."""
+    request = _add_ready_request()
+    request.positions[0].open_price = 4300.0
+    request.candles = _drawdown_candles(high)
+    request.bid, request.ask = bid, bid + 0.2
+    return request
+
+
+def test_a_basket_that_gave_its_profit_back_is_not_added_to() -> None:
+    """The spacing rule alone bought the pullback; this is what stops it."""
+    from app.strategies import turtle_agent
+
+    # Best +5 ATR, now +0.5 ATR: 90% of the move given back.
+    decision, reason = turtle_agent._maybe_add(
+        _drawdown_request(4320.0, 4302.0), dict(_ADD_CONFIG), 4.0
+    )
+
+    assert decision is None
+    assert "回吐" in reason
+
+
+def test_a_basket_still_near_its_best_may_add() -> None:
+    from app.strategies import turtle_agent
+
+    decision, _ = turtle_agent._maybe_add(
+        _drawdown_request(4320.0, 4319.0), dict(_ADD_CONFIG), 4.0
+    )
+
+    assert decision is not None
+
+
+def test_the_drawdown_guard_does_not_hold_a_small_peak_against_the_basket() -> None:
+    """A basket barely in profit must still be allowed to add."""
+    from app.strategies import turtle_agent
+
+    decision, _ = turtle_agent._maybe_add(
+        _drawdown_request(4305.0, 4302.0), dict(_ADD_CONFIG), 4.0
+    )
+
+    assert decision is not None
+
+
 def test_rsi_reads_a_one_way_market() -> None:
     from app.strategies import turtle_agent
 

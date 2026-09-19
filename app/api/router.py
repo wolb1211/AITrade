@@ -331,9 +331,9 @@ def create_api_router(
                     position_ai_base_url=config.get("position_ai_base_url", ""),
                     position_ai_key=config.get("position_ai_key", ""),
                     open_data_type=config.get("open_data_type", "kline"),
-                    open_kline_count=int(config.get("open_kline_count", 100)),
+                    open_kline_count=int(config.get("open_kline_count", 200)),
                     position_data_type=config.get("position_data_type", "kline"),
-                    position_kline_count=int(config.get("position_kline_count", 100)),
+                    position_kline_count=int(config.get("position_kline_count", 200)),
                     call_mode=config.get("call_mode", "bar"),
                     call_val=float(config.get("call_val", 1)),
                     position_size_mode=config.get("position_size_mode", "fixed"),
@@ -481,9 +481,9 @@ def create_mt5_router(
                     else deployment["status"]
                 ),
                 open_data_type=config.get("open_data_type", "kline"),
-                open_kline_count=int(config.get("open_kline_count", 100)),
+                open_kline_count=int(config.get("open_kline_count", 200)),
                 position_data_type=config.get("position_data_type", "kline"),
-                position_kline_count=int(config.get("position_kline_count", 100)),
+                position_kline_count=int(config.get("position_kline_count", 200)),
                 call_mode=config.get("call_mode", "bar"),
                 call_val=float(config.get("call_val", 1)),
                 # Higher-timeframe data is not currently used by the official

@@ -60,6 +60,20 @@ DEFAULT_DIVERGENCE_MIN_GAP = 3
 # still counts, and how close to that level the pullback has to come.
 DEFAULT_RETEST_MAX_WAIT = 10
 DEFAULT_RETEST_TOLERANCE_ATR = 0.2
+# Add-on guard: how much of the basket's best level it may give back before adding
+# stops being a trend continuation. The peak has to be worth measuring first, or a
+# basket barely in profit would block its own add.
+DEFAULT_BASKET_GIVE_BACK_RATIO = 0.5
+DEFAULT_BASKET_PEAK_MIN_ATR = 1.5
+
+
+def _request_candles(request: Any) -> list[Any]:
+    """The candles the client sent, whichever shape the request carries."""
+    candles = getattr(request, "candles", None)
+    if candles:
+        return list(candles)
+    market = getattr(request, "market", None)
+    return list(getattr(market, "candles", None) or [])
 # How far an engulfing body edge may miss the previous body by. A bar still moving
 # at its close makes the next bar open a tick or three above that close, which is
 # the common case in a live market; demanding an exact cover filtered real
@@ -445,6 +459,15 @@ class TurtleTrendStrategy:
         signal["opposing_divergence"] = _opposing_divergence(
             candles, held_direction, config=deployment.get("config") or {}
         )
+        # How much of the best level the basket has given back, so the reviewer can
+        # tell a pause from a round trip instead of judging the absolute size.
+        drawdown = _basket_drawdown(
+            list(request.positions), list(candles), request.bid, request.ask, atr
+        )
+        if drawdown:
+            signal["basket_peak_atr"] = round(drawdown["peak"], 2)
+            signal["basket_now_atr"] = round(drawdown["current"], 2)
+            signal["basket_give_back_pct"] = round(drawdown["give_back"] * 100)
 
         result = self.ai_client.turtle_position_review(
             deployment=deployment,
@@ -1735,6 +1758,42 @@ def _quote_divergence(
     )
 
 
+def _basket_drawdown(
+    positions: list[Any], candles: list[Any], bid: float, ask: float, atr: float
+) -> dict[str, float]:
+    """How far the basket has given back from its best level, measured in ATR.
+
+    Both figures are distances from the weighted average entry, because the
+    absolute size says nothing on its own: giving back 1.5 ATR is a pause from
+    +5 and a full round trip from +1.5. Counting in ATR keeps it comparable across
+    symbols and avoids the contract-size arithmetic the sizing already had trouble
+    with.
+    """
+    if atr <= 0 or not positions:
+        return {}
+    side = positions[0].side
+    entries = [float(item.open_price) for item in positions]
+    volumes = [max(float(getattr(item, "volume", 0) or 0), 0.0) for item in positions]
+    total = sum(volumes)
+    weighted = (
+        sum(entry * volume for entry, volume in zip(entries, volumes)) / total
+        if total > 0
+        else sum(entries) / len(entries)
+    )
+    if side == "BUY":
+        best = max((float(item.high) for item in candles), default=bid)
+        now = float(bid)
+        peak = (best - weighted) / atr
+        current = (now - weighted) / atr
+    else:
+        best = min((float(item.low) for item in candles), default=ask)
+        now = float(ask)
+        peak = (weighted - best) / atr
+        current = (weighted - now) / atr
+    give_back = (peak - current) / peak if peak > 0 else 0.0
+    return {"peak": peak, "current": current, "give_back": max(give_back, 0.0)}
+
+
 def _maybe_add(
     request: PositionEvaluateRequest,
     config: dict[str, Any],
@@ -1751,6 +1810,20 @@ def _maybe_add(
     # An add-on is a new entry, so the closed windows apply to it too.
     if time_windows.closed_window_reason(config, time_windows.now_utc()):
         return None, ""
+    # A basket that has given back most of its best level is not a trend to add to,
+    # however far the price still sits above the last entry. Without this the
+    # spacing rule actively bought the pullback.
+    drawdown = _basket_drawdown(
+        list(request.positions), _request_candles(request), request.bid, request.ask, atr
+    )
+    if drawdown and _config_flag(config, "basket_drawdown_block_add", True):
+        min_peak = _config_number(config, "basket_peak_min_atr", DEFAULT_BASKET_PEAK_MIN_ATR)
+        ratio = _config_number(config, "basket_give_back_ratio", DEFAULT_BASKET_GIVE_BACK_RATIO)
+        if drawdown["peak"] >= min_peak and drawdown["give_back"] >= ratio:
+            return None, (
+                f"浮盈已从最高点回吐{drawdown['give_back'] * 100:.0f}%"
+                f"（最高{drawdown['peak']:.1f} ATR、现剩{drawdown['current']:.1f} ATR），本次不加仓"
+            )
     sides = {item.side for item in request.positions}
     if len(sides) != 1:
         return None, ""

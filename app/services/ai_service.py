@@ -1885,6 +1885,12 @@ def _turtle_position_review_prompt() -> str:
         "opposing_divergence names a divergence against the position - price made a new extreme while momentum did "
         "not. It leads every other input in this payload, so when it is present lean towards close_now true, and do "
         "not approve an add-on. "
+        # A basket can sit above its last entry and still be past its best. Handing
+        # over both distances lets the reviewer tell a pause from a round trip.
+        "basket_peak_atr, basket_now_atr and basket_give_back_pct describe the basket against its weighted average "
+        "entry: how far it ever ran, how far it still is, and the share of the best level it has given back. A large "
+        "give_back_pct with a small basket_now_atr means the move has already been undone - prefer close_now true and "
+        "do not approve an add-on. Do not read the absolute size on its own. "
         "allow_add: may the server execute the add-on candidate if one is present? Approve by default: the add-on "
         "only has to be acceptable, not ideal. "
         "Use risk_level high only for a specific, nameable danger. "
