@@ -3538,6 +3538,21 @@ _CACHE_VOLATILE_KEYS = frozenset({
 # Five significant digits is a tenth of a point on gold, which is the order of the
 # difference between two brokers quoting the same bar.
 CACHE_PRICE_PRECISION = 5
+# A broker appends the account type to the instrument: XAUUSD.c on a cent account
+# quotes the same gold as XAUUSD. Merging them is safe even when the names mean
+# different contracts, because the candles have to match as well - two symbols only
+# share a key when they are quoting the same market.
+_CACHE_SYMBOL_SEPARATORS = (".", "_", "-", "#")
+
+
+def _cache_symbol(value: Any) -> str:
+    """The instrument name without the broker's account-type suffix."""
+    text = str(value or "").strip().upper()
+    for separator in _CACHE_SYMBOL_SEPARATORS:
+        head, found, tail = text.rpartition(separator)
+        if found and head and 0 < len(tail) <= 3:
+            return head
+    return text
 
 
 def _cache_fingerprint(payload: Any) -> Any:
@@ -3557,7 +3572,11 @@ def _cache_fingerprint(payload: Any) -> Any:
     if isinstance(payload, dict):
         compact: dict[str, Any] = {}
         for key, value in payload.items():
-            if str(key).strip().lower() in _CACHE_VOLATILE_KEYS:
+            lowered = str(key).strip().lower()
+            if lowered in _CACHE_VOLATILE_KEYS:
+                continue
+            if lowered == "symbol":
+                compact[key] = _cache_symbol(value)
                 continue
             compact[key] = _cache_fingerprint(value)
         return compact

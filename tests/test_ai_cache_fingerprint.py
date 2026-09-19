@@ -27,6 +27,26 @@ def _request(bid: float, ask: float, closes: list[float], login: str = "111") ->
     }
 
 
+def test_a_cent_account_symbol_matches_the_plain_one() -> None:
+    """XAUUSD.c quotes the same gold as XAUUSD, so the verdict is the same."""
+    closes = [4374.6, 4375.1]
+    plain = _request(4374.63, 4374.85, closes)
+    cent = {**_request(4374.63, 4374.85, closes), "symbol": "XAUUSD.c"}
+    suffixed = {**_request(4374.63, 4374.85, closes), "symbol": "XAUUSDs"}
+
+    assert _cache_fingerprint(plain) == _cache_fingerprint(cent)
+    # A bare trailing letter is part of the name: EURUSD ends in one too, so it is
+    # never stripped.
+    assert _cache_fingerprint(plain) != _cache_fingerprint(suffixed)
+
+
+def test_two_different_instruments_do_not_merge() -> None:
+    first = {**_request(4374.6, 4374.8, [4374.6]), "symbol": "NAS100"}
+    second = {**_request(4374.6, 4374.8, [4374.6]), "symbol": "US500"}
+
+    assert _cache_fingerprint(first) != _cache_fingerprint(second)
+
+
 def test_two_accounts_on_the_same_market_produce_the_same_key() -> None:
     closes = [4374.6, 4375.1, 4374.9]
     first = _request(4374.63, 4374.85, closes, login="111")
