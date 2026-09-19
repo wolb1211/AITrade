@@ -721,8 +721,13 @@ def create_admin_ai_router(
         }
 
     @router.post("/stats/overview")
-    def stats_overview() -> dict[str, object]:
-        return ok(store.admin_ai_strategy_overview())
+    def stats_overview(payload: dict[str, object] | None = None) -> dict[str, object]:
+        payload = payload or {}
+        filters = {
+            key: str(payload.get(key) or "").strip()
+            for key in ("user_id", "username", "strategy_code", "deployment_key")
+        }
+        return ok(store.admin_ai_strategy_overview(filters))
 
     @router.post("/user/list")
     def user_list(payload: dict[str, object] | None = None) -> dict[str, object]:

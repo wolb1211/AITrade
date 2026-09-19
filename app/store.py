@@ -2246,7 +2246,8 @@ class SqliteStore:
             ),
         }
 
-    def admin_ai_strategy_overview(self) -> dict[str, Any]:
+    def admin_ai_strategy_overview(self, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        filters = filters or {}
         billing_settings = self.get_ai_billing_settings()
         credit_limit = Decimal(str(billing_settings["credit_limit"]))
         warning_threshold = Decimal(str(billing_settings["low_balance_threshold"]))
@@ -2318,14 +2319,27 @@ class SqliteStore:
                 GROUP BY deployment_id
                 """
             ).fetchall()
+            # The admin filters by user, so the display name travels with the row.
+            user_rows = connection.execute(
+                "SELECT id, email, nickname FROM users"
+            ).fetchall()
+            user_names = {
+                str(row["id"]): str(row["nickname"] or row["email"] or "") for row in user_rows
+            }
 
         by_deployment: dict[str, dict[str, Any]] = {}
         for deployment in deployments:
             by_deployment[deployment["id"]] = {
                 "id": deployment["id"],
                 "user_id": deployment["user_id"],
+                "username": user_names.get(str(deployment["user_id"]), ""),
                 "name": deployment["strategy_name"],
                 "strategy_code": deployment["strategy_code"],
+                # The plain key is not stored, only its hash, so the displayable one
+                # comes from the deployment config.
+                "deployment_key": str((deployment.get("config") or {}).get("deployment_key") or ""),
+                "symbol": deployment.get("symbol") or "",
+                "timeframe": deployment.get("timeframe") or "",
                 "status": deployment["status"],
                 "analysis_count": 0,
                 "signal_count": 0,
@@ -2335,6 +2349,22 @@ class SqliteStore:
                 "total_tokens": 0,
                 "pnl": 0.0,
                 "updated_at": deployment["updated_at"],
+            }
+
+        # Filtering here, before the per-deployment loops below, is what makes the
+        # totals follow the filter: those loops already skip ids they do not know.
+        wanted_user = str(filters.get("user_id") or "").strip()
+        wanted_name = str(filters.get("username") or "").strip().lower()
+        wanted_code = str(filters.get("strategy_code") or "").strip().lower()
+        wanted_key = str(filters.get("deployment_key") or "").strip().lower()
+        if wanted_user or wanted_name or wanted_code or wanted_key:
+            by_deployment = {
+                deployment_id: item
+                for deployment_id, item in by_deployment.items()
+                if (not wanted_user or wanted_user in str(item["user_id"]))
+                and (not wanted_name or wanted_name in str(item["username"]).lower())
+                and (not wanted_code or wanted_code in str(item["strategy_code"]).lower())
+                and (not wanted_key or wanted_key in str(item["deployment_key"]).lower())
             }
 
         total_analysis = 0
