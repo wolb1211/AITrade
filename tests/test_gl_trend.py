@@ -410,7 +410,7 @@ def test_conflicting_entry_signals_stand_aside(monkeypatch) -> None:
     monkeypatch.setattr(
         turtle_agent,
         "_swing_pullback_signal",
-        lambda candles, atr, config: ("buy", "synthetic swing buy"),
+        lambda candles, atr, config, engulf_tolerance=0.0: ("buy", "synthetic swing buy"),
     )
     # Closing below the 20-bar channel low makes the channel system say "sell".
     request = _open_request(last_close=99.0)
@@ -496,7 +496,7 @@ def test_matching_entry_signals_still_open(monkeypatch) -> None:
     monkeypatch.setattr(
         turtle_agent,
         "_swing_pullback_signal",
-        lambda candles, atr, config: ("buy", "synthetic swing buy"),
+        lambda candles, atr, config, engulf_tolerance=0.0: ("buy", "synthetic swing buy"),
     )
     request = _open_request(last_close=112.5, last_high=113.0, last_low=104.0)
 
@@ -1223,6 +1223,32 @@ def test_the_breakout_wording_follows_the_direction() -> None:
     assert "下破" in decision.reason
     assert "区间低点" in decision.reason
     assert "上破" not in decision.reason
+
+
+def test_an_engulfing_may_miss_the_previous_body_by_a_tick() -> None:
+    """A bar still moving at its close makes the next one open a tick above it.
+
+    Requiring an exact cover threw those engulfings away, and in a live market this
+    is the common shape rather than the exception.
+    """
+    from app.strategies import turtle_agent
+
+    candles = _flat_bars(6)
+    candles.append(_confirm_bar(101.0, 101.2, 99.8, 100.0, 6))    # bearish, closes 100.0
+    candles.append(_confirm_bar(100.01, 101.5, 99.9, 101.3, 7))   # opens one tick above it
+
+    # The exact rule rejects it; a tick of tolerance accepts it, which is the point.
+    assert turtle_agent._confirmation_text(candles, 5, "buy", 1) == ""
+    assert "吞没" in turtle_agent._confirmation_text(candles, 5, "buy", 1, 0.02)
+
+
+def test_the_engulf_tolerance_comes_from_the_symbol_point() -> None:
+    """Ticks, not a fraction of the ATR: that would be dozens of ticks on gold."""
+    from app.strategies import turtle_agent
+
+    assert turtle_agent._engulf_tolerance({"point": 0.01}, {}) == pytest.approx(0.02)
+    assert turtle_agent._engulf_tolerance({"point": 0.01}, {"engulf_tolerance_points": 0}) == 0.0
+    assert turtle_agent._engulf_tolerance({}, {}) == 0.0
 
 
 def test_the_default_protection_thresholds_are_the_tightened_ones() -> None:

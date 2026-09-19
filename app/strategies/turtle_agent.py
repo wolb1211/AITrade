@@ -44,6 +44,12 @@ SWING_CONFIRM_MIN_SIGNALS = 1
 SWING_EMA_FAST = 5              # confirmation EMA cross, fast period
 SWING_EMA_SLOW = 10             # confirmation EMA cross, slow period
 PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
+# How many ticks an engulfing body edge may miss the previous body by. A bar still
+# moving at its close makes the next bar open a tick above that close, which is the
+# common case in a live market; demanding an exact cover filtered real engulfings
+# out. Measured in ticks rather than ATR, because a fraction of an ATR is dozens of
+# ticks on gold. 0 restores the exact rule.
+DEFAULT_ENGULF_TOLERANCE_POINTS = 2.0
 
 # Protection ladder: break-even first, then a trailing stop.
 DEFAULT_BREAK_EVEN_ATR = 0.5         # favourable move that triggers break-even
@@ -122,7 +128,9 @@ class TurtleTrendStrategy:
         # Both entry systems run on every bar.  The channel breakout is the
         # original turtle rule; the swing system covers the range-bound stretches
         # where a pure channel breakout tends to fire at the end of a move.
-        swing_direction, swing_analysis = _swing_pullback_signal(candles, atr, config)
+        swing_direction, swing_analysis = _swing_pullback_signal(
+            candles, atr, config, _engulf_tolerance(request.symbol_info, config)
+        )
         window = candles[-period - 1:-1]
         close = candles[-1].close
         upper = max(item.high for item in window)
@@ -632,7 +640,22 @@ def _atr(candles, period: int) -> float:
     return max(sum(ranges) / max(len(ranges), 1), 1e-9)
 
 
-def _swing_pullback_signal(candles, atr: float, config: dict[str, Any]) -> tuple[str, str]:
+def _engulf_tolerance(symbol_info: Any, config: dict[str, Any]) -> float:
+    """How far an engulfing body edge may miss the previous body, in price."""
+    points = _config_number(config, "engulf_tolerance_points", DEFAULT_ENGULF_TOLERANCE_POINTS)
+    if points <= 0:
+        return 0.0
+    info = symbol_info if isinstance(symbol_info, dict) else {}
+    try:
+        point = float(info.get("point") or 0)
+    except (TypeError, ValueError):
+        point = 0.0
+    return point * points if point > 0 else 0.0
+
+
+def _swing_pullback_signal(
+    candles, atr: float, config: dict[str, Any], engulf_tolerance: float = 0.0
+) -> tuple[str, str]:
     """Confirm a new small swing after a completed pullback.
 
     Only confirmed pivots are used (two bars on either side by default), so
@@ -658,7 +681,9 @@ def _swing_pullback_signal(candles, atr: float, config: dict[str, Any]) -> tuple
     if bullish_structure and last_low[0] > last_high[0]:
         pullback_size = last_high[2] - last_low[2]
         crossed = close > last_high[2] and _crossed_recently(candles, last_high[2], "buy", confirmation_window)
-        confirmation = _bullish_confirmation(candles, confirmation_window, confirm_min_signals)
+        confirmation = _bullish_confirmation(
+            candles, confirmation_window, confirm_min_signals, engulf_tolerance
+        )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "buy", (
                 f"低点与高点同步抬高（{previous_low[2]:g}→{last_low[2]:g}，{previous_high[2]:g}→{last_high[2]:g}）；"
@@ -669,7 +694,9 @@ def _swing_pullback_signal(candles, atr: float, config: dict[str, Any]) -> tuple
     if bearish_structure and last_high[0] > last_low[0]:
         pullback_size = last_high[2] - last_low[2]
         crossed = close < last_low[2] and _crossed_recently(candles, last_low[2], "sell", confirmation_window)
-        confirmation = _bearish_confirmation(candles, confirmation_window, confirm_min_signals)
+        confirmation = _bearish_confirmation(
+            candles, confirmation_window, confirm_min_signals, engulf_tolerance
+        )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "sell", (
                 f"高点与低点同步走低（{previous_high[2]:g}→{last_high[2]:g}，{previous_low[2]:g}→{last_low[2]:g}）；"
@@ -750,12 +777,19 @@ def _ema_series(values: list[float], period: int) -> list[float]:
     return result
 
 
-def _confirmation_signals(candles, window: int, direction: str) -> list[tuple[int, str]]:
+def _confirmation_signals(
+    candles, window: int, direction: str, engulf_tolerance: float = 0.0
+) -> list[tuple[int, str]]:
     """Every confirmation hit in the window, oldest first, as (bar index, kind).
 
     Each condition is reported separately so the caller can require more than one
     of them, and can require the newest bar to carry one - which is what makes the
     entry punctual instead of firing several bars after the move started.
+
+    ``engulf_tolerance`` forgives a body edge that misses the previous body by a
+    tick. A bar that is still moving at its close makes the next bar open a tick
+    above that close, which is the common case in a live market, and demanding an
+    exact cover threw those engulfings away.
     """
     start = max(1, len(candles) - max(1, window))
     hits: list[tuple[int, str]] = []
@@ -766,11 +800,13 @@ def _confirmation_signals(candles, window: int, direction: str) -> list[tuple[in
             continue
         previous, current = candles[index - 1], candles[index]
         if bullish and previous.close < previous.open and current.close > current.open \
-                and current.open <= previous.close and current.close >= previous.open:
+                and current.open <= previous.close + engulf_tolerance \
+                and current.close >= previous.open - engulf_tolerance:
             hits.append((index, "看涨吞没"))
             continue
         if not bullish and previous.close > previous.open and current.close < current.open \
-                and current.open >= previous.close and current.close <= previous.open:
+                and current.open >= previous.close - engulf_tolerance \
+                and current.close <= previous.open + engulf_tolerance:
             hits.append((index, "看跌吞没"))
             continue
         body = abs(current.close - current.open)
@@ -785,7 +821,9 @@ def _confirmation_signals(candles, window: int, direction: str) -> list[tuple[in
     return hits
 
 
-def _confirmation_text(candles, window: int, direction: str, min_signals: int) -> str:
+def _confirmation_text(
+    candles, window: int, direction: str, min_signals: int, engulf_tolerance: float = 0.0
+) -> str:
     """The confirmation wording, or an empty string when the bar does not qualify.
 
     Two requirements, both from the source design: at least ``min_signals``
@@ -793,7 +831,7 @@ def _confirmation_text(candles, window: int, direction: str, min_signals: int) -
     second is what stops a condition from five bars ago still counting as a fresh
     entry - the trigger has to be happening now.
     """
-    hits = _confirmation_signals(candles, window, direction)
+    hits = _confirmation_signals(candles, window, direction, engulf_tolerance)
     if not hits:
         return ""
     kinds = list(dict.fromkeys(text for _, text in hits))
@@ -805,12 +843,12 @@ def _confirmation_text(candles, window: int, direction: str, min_signals: int) -
     return "、".join(kinds)
 
 
-def _bullish_confirmation(candles, window: int, min_signals: int = 2) -> str:
-    return _confirmation_text(candles, window, "buy", min_signals)
+def _bullish_confirmation(candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0) -> str:
+    return _confirmation_text(candles, window, "buy", min_signals, engulf_tolerance)
 
 
-def _bearish_confirmation(candles, window: int, min_signals: int = 2) -> str:
-    return _confirmation_text(candles, window, "sell", min_signals)
+def _bearish_confirmation(candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0) -> str:
+    return _confirmation_text(candles, window, "sell", min_signals, engulf_tolerance)
 
 
 def _bullish_confirmation_event(candles, window: int) -> tuple[int, str] | None:
