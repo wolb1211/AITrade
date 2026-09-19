@@ -1225,30 +1225,42 @@ def test_the_breakout_wording_follows_the_direction() -> None:
     assert "上破" not in decision.reason
 
 
-def test_an_engulfing_may_miss_the_previous_body_by_a_tick() -> None:
-    """A bar still moving at its close makes the next one open a tick above it.
+def test_an_engulfing_may_miss_the_previous_body_by_a_few_ticks() -> None:
+    """The gap is whatever the market left: one tick, or three.
 
-    Requiring an exact cover threw those engulfings away, and in a live market this
-    is the common shape rather than the exception.
+    Live case: one bar closed 4374.60 and the next opened 4374.63. The first
+    version of this allowance was two ticks and still rejected it.
     """
     from app.strategies import turtle_agent
 
     candles = _flat_bars(6)
-    candles.append(_confirm_bar(101.0, 101.2, 99.8, 100.0, 6))    # bearish, closes 100.0
-    candles.append(_confirm_bar(100.01, 101.5, 99.9, 101.3, 7))   # opens one tick above it
+    candles.append(_confirm_bar(4375.10, 4375.20, 4374.00, 4374.60, 6))
+    candles.append(_confirm_bar(4374.63, 4375.90, 4374.40, 4375.60, 7))
 
-    # The exact rule rejects it; a tick of tolerance accepts it, which is the point.
     assert turtle_agent._confirmation_text(candles, 5, "buy", 1) == ""
-    assert "吞没" in turtle_agent._confirmation_text(candles, 5, "buy", 1, 0.02)
+    assert "吞没" in turtle_agent._confirmation_text(candles, 5, "buy", 1, 0.05)
 
 
-def test_the_engulf_tolerance_comes_from_the_symbol_point() -> None:
-    """Ticks, not a fraction of the ATR: that would be dozens of ticks on gold."""
+def test_the_engulf_tolerance_takes_the_larger_of_ticks_and_atr() -> None:
+    """Ticks alone are too tight on a coarse symbol; the ATR share stretches it."""
     from app.strategies import turtle_agent
 
-    assert turtle_agent._engulf_tolerance({"point": 0.01}, {}) == pytest.approx(0.02)
-    assert turtle_agent._engulf_tolerance({"point": 0.01}, {"engulf_tolerance_points": 0}) == 0.0
-    assert turtle_agent._engulf_tolerance({}, {}) == 0.0
+    # 5 ticks of a 0.01-point symbol = 0.05.
+    assert turtle_agent._engulf_tolerance({"point": 0.01}, {}) == pytest.approx(0.05)
+    # A 0.01 share of ATR 20 = 0.20, which is larger and therefore used.
+    assert turtle_agent._engulf_tolerance({"point": 0.01}, {}, 20.0) == pytest.approx(0.20)
+    # Either side can be switched off.
+    assert turtle_agent._engulf_tolerance(
+        {"point": 0.01}, {"engulf_tolerance_points": 0}, 20.0
+    ) == pytest.approx(0.20)
+    assert turtle_agent._engulf_tolerance(
+        {"point": 0.01}, {"engulf_tolerance_atr": 0}
+    ) == pytest.approx(0.05)
+    # Both off restores the exact rule.
+    assert turtle_agent._engulf_tolerance(
+        {"point": 0.01}, {"engulf_tolerance_points": 0, "engulf_tolerance_atr": 0}, 20.0
+    ) == 0.0
+    assert turtle_agent._engulf_tolerance({}, {"engulf_tolerance_atr": 0}) == 0.0
 
 
 def test_the_default_protection_thresholds_are_the_tightened_ones() -> None:

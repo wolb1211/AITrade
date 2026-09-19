@@ -44,12 +44,14 @@ SWING_CONFIRM_MIN_SIGNALS = 1
 SWING_EMA_FAST = 5              # confirmation EMA cross, fast period
 SWING_EMA_SLOW = 10             # confirmation EMA cross, slow period
 PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
-# How many ticks an engulfing body edge may miss the previous body by. A bar still
-# moving at its close makes the next bar open a tick above that close, which is the
-# common case in a live market; demanding an exact cover filtered real engulfings
-# out. Measured in ticks rather than ATR, because a fraction of an ATR is dozens of
-# ticks on gold. 0 restores the exact rule.
-DEFAULT_ENGULF_TOLERANCE_POINTS = 2.0
+# How far an engulfing body edge may miss the previous body by. A bar still moving
+# at its close makes the next bar open a tick or three above that close, which is
+# the common case in a live market; demanding an exact cover filtered real
+# engulfings out. The allowance is the larger of a tick count and a small share of
+# the ATR, so it also stretches on a symbol whose ticks are coarse. 0 on either
+# switches that part off; both 0 restores the exact rule.
+DEFAULT_ENGULF_TOLERANCE_POINTS = 5.0
+DEFAULT_ENGULF_TOLERANCE_ATR = 0.01
 
 # Protection ladder: break-even first, then a trailing stop.
 DEFAULT_BREAK_EVEN_ATR = 0.5         # favourable move that triggers break-even
@@ -129,7 +131,7 @@ class TurtleTrendStrategy:
         # original turtle rule; the swing system covers the range-bound stretches
         # where a pure channel breakout tends to fire at the end of a move.
         swing_direction, swing_analysis = _swing_pullback_signal(
-            candles, atr, config, _engulf_tolerance(request.symbol_info, config)
+            candles, atr, config, _engulf_tolerance(request.symbol_info, config, atr)
         )
         window = candles[-period - 1:-1]
         close = candles[-1].close
@@ -640,17 +642,18 @@ def _atr(candles, period: int) -> float:
     return max(sum(ranges) / max(len(ranges), 1), 1e-9)
 
 
-def _engulf_tolerance(symbol_info: Any, config: dict[str, Any]) -> float:
+def _engulf_tolerance(symbol_info: Any, config: dict[str, Any], atr: float = 0.0) -> float:
     """How far an engulfing body edge may miss the previous body, in price."""
-    points = _config_number(config, "engulf_tolerance_points", DEFAULT_ENGULF_TOLERANCE_POINTS)
-    if points <= 0:
-        return 0.0
     info = symbol_info if isinstance(symbol_info, dict) else {}
     try:
         point = float(info.get("point") or 0)
     except (TypeError, ValueError):
         point = 0.0
-    return point * points if point > 0 else 0.0
+    points = _config_number(config, "engulf_tolerance_points", DEFAULT_ENGULF_TOLERANCE_POINTS)
+    share = _config_number(config, "engulf_tolerance_atr", DEFAULT_ENGULF_TOLERANCE_ATR)
+    from_ticks = point * points if point > 0 and points > 0 else 0.0
+    from_atr = atr * share if atr > 0 and share > 0 else 0.0
+    return max(from_ticks, from_atr)
 
 
 def _swing_pullback_signal(
