@@ -48,6 +48,8 @@ def test_the_tag_rule_leaves_real_instrument_names_alone() -> None:
     assert _cache_symbol("NAS100") == "NAS100"
     assert _cache_symbol("XAUUSDm") == "XAUUSD"
     assert _cache_symbol("XAUUSDs") == "XAUUSD"
+    assert _cache_symbol("XAUUSDmc") == "XAUUSD"
+    # Too long to be a tag, so the tail is kept.
     assert _cache_symbol("US30cash") == "US30CASH"
 
 

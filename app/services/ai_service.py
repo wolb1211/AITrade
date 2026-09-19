@@ -3560,8 +3560,12 @@ def _cache_symbol(value: Any) -> str:
         if found and head and 0 < len(tail) <= 3:
             text = head
             break
-    if len(text) >= 3 and text[-1].islower() and text[:-1].isupper():
-        text = text[:-1]
+    # XAUUSDmc is written without a separator. Only a short run of lower-case
+    # letters after an upper-case name is a tag; US30cash keeps its tail because
+    # "cash" is too long to be one, and EURUSD has no lower case to strip.
+    tail = len(text) - len(text.rstrip("abcdefghijklmnopqrstuvwxyz"))
+    if 0 < tail <= 3 and text[: len(text) - tail].isupper():
+        text = text[: len(text) - tail]
     return text.upper()
 
 
