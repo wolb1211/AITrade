@@ -437,6 +437,14 @@ class TurtleTrendStrategy:
             }
         else:
             signal["add_candidate"] = None
+        # A divergence against the side already held. It leads, so it is worth more
+        # to this decision than to the entry: it says momentum has stopped agreeing
+        # with the move before any candle shows it, which argues for banking the
+        # profit and against adding.
+        held_direction = "buy" if request.positions[0].side == "BUY" else "sell"
+        signal["opposing_divergence"] = _opposing_divergence(
+            candles, held_direction, config=deployment.get("config") or {}
+        )
 
         result = self.ai_client.turtle_position_review(
             deployment=deployment,
@@ -516,8 +524,10 @@ class TurtleTrendStrategy:
         atr: float,
     ) -> tuple[bool, str, Any]:
         """Risk gate for a new entry: AI may warn, never reshape the order."""
+        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
+        direction = "buy" if candidate.action == "BUY" else "sell"
         signal = {
-            "direction": "buy" if candidate.action == "BUY" else "sell",
+            "direction": direction,
             "entry": candidate.entry,
             "protective_stop": candidate.sl,
             "stop_atr": STOP_ATR,
@@ -526,8 +536,11 @@ class TurtleTrendStrategy:
             "entry_analysis": candidate.metadata.get("entry_analysis"),
             "swing_direction": candidate.metadata.get("swing_direction"),
             "donchian_direction": candidate.metadata.get("donchian_direction"),
+            # A divergence against this direction, which is a leading warning.
+            "opposing_divergence": _opposing_divergence(
+                getattr(request, "candles", []) or [], direction, config=config
+            ),
         }
-        config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
         # What a provider outage means for the entry. The gate is the risk check,
         # so the default leaves the entry unapproved; a deployment that would
         # rather keep trading on its own rules can set ai_gate_fail_open.
@@ -903,6 +916,18 @@ def _retest_hit(
                 f"回踩{level:g}不破后站住" if bullish else f"反抽{level:g}不破后压住"
             )
     return None
+
+
+def _opposing_divergence(candles, direction: str, *, config: dict[str, Any]) -> str:
+    """The divergence pointing the other way: a leading warning against this trade.
+
+    A bullish divergence supports a long; a bearish one that appears while the book
+    is long is the warning, and it arrives before any candle pattern shows a turn.
+    Handed to the AI as evidence for adds and exits rather than gating them here.
+    """
+    other = "sell" if direction == "buy" else "buy"
+    hit = _divergence_hit(candles, other, config=config)
+    return hit[1] if hit is not None else ""
 
 
 def _divergence_hit(candles, direction: str, *, config: dict[str, Any]) -> tuple[int, str] | None:

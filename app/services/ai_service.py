@@ -1879,6 +1879,12 @@ def _turtle_position_review_prompt() -> str:
         "Do not decline because the protective stop is in force. That stop is the last resort; giving back profit "
         "that was already earned is a worse outcome than closing a little early. "
         "Decline only when the structure is intact and the move still looks like it is going somewhere. "
+        # The strategy's only leading input. It is worth the most here: after an
+        # extended run it is the earliest evidence that the move has stopped being
+        # paid for, which argues for banking profit and against adding.
+        "opposing_divergence names a divergence against the position - price made a new extreme while momentum did "
+        "not. It leads every other input in this payload, so when it is present lean towards close_now true, and do "
+        "not approve an add-on. "
         "allow_add: may the server execute the add-on candidate if one is present? Approve by default: the add-on "
         "only has to be acceptable, not ideal. "
         "Use risk_level high only for a specific, nameable danger. "
@@ -1939,6 +1945,11 @@ def _turtle_open_risk_system_prompt() -> str:
         "is a strong signal and the usual structural checks are enough, while a single condition is weak and should pass "
         "only when the structure is unusually clean and the room to the target is clearly sufficient. A trigger that has "
         "already gone stale never qualifies. "
+        # The divergence is the only leading input the strategy can offer: it warns
+        # of a turn before any candle shows one, so it should move the answer.
+        "opposing_divergence names a divergence against the direction you are judging - price made a new extreme while "
+        "momentum did not. It leads every other input here, so when it is present treat the trade as late in its move: "
+        "demand more from the structure and lean towards refusing. "
         # The gate lets an entry through when the model answers "not high", so a
         # verdict that warns in prose while reporting a low level silently opens
         # the trade. Require the two halves of the answer to agree.

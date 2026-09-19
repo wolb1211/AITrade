@@ -1336,6 +1336,42 @@ def _divergence_closes() -> list[float]:
     return closes
 
 
+def _top_divergence_closes() -> list[float]:
+    """The mirror of the bottom case: a steep rise, then a gentler one to a top."""
+    closes = [100.0] * 30
+    closes += [100 + index * 1.0 for index in range(1, 9)]
+    closes += [107, 106, 105, 104]
+    closes += [104.2 + index * 0.2 for index in range(25)]
+    closes += [108, 107, 106]
+    return closes
+
+
+def test_the_opposing_divergence_warns_against_the_side_held() -> None:
+    """For a long, the warning is the bearish one - the mirror of the supporting."""
+    from app.strategies import turtle_agent
+
+    warning = turtle_agent._opposing_divergence(
+        _closes_to_candles(_top_divergence_closes()), "buy", config={}
+    )
+
+    assert "顶背离" in warning
+    # And the same series supports a short rather than warning it.
+    assert turtle_agent._opposing_divergence(
+        _closes_to_candles(_top_divergence_closes()), "sell", config={}
+    ) == ""
+
+
+def test_both_ai_prompts_weigh_the_opposing_divergence() -> None:
+    """The strategy can only offer evidence; the prompt has to say what it means."""
+    from app.services.ai_service import (
+        _turtle_open_risk_system_prompt,
+        _turtle_position_review_prompt,
+    )
+
+    assert "opposing_divergence" in _turtle_open_risk_system_prompt()
+    assert "opposing_divergence" in _turtle_position_review_prompt()
+
+
 def test_rsi_reads_a_one_way_market() -> None:
     from app.strategies import turtle_agent
 
