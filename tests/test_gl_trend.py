@@ -1235,6 +1235,92 @@ def _star_candles() -> list[Candle]:
     return bars
 
 
+def _closes_to_candles(closes: list[float]) -> list[Candle]:
+    """One candle per close, each with a small wick of its own.
+
+    The wick matters: with open equal to the previous close the bounce bar repeats
+    the low of the bar before it, and a pivot needs to be strictly the lowest, so
+    the series would contain no pivots at all.
+    """
+    return [
+        Candle(
+            timestamp=1_700_000_000 + index * 900, open=close, high=close + 0.1,
+            low=close - 0.1, close=close, volume=1.0,
+        )
+        for index, close in enumerate(closes)
+    ]
+
+
+def _divergence_closes() -> list[float]:
+    """A steep drop, a bounce, then a gentle slide to a lower low.
+
+    The second leg loses less per bar than the first, so momentum is firmer while
+    the price is lower - which is what a bottom divergence is. The flat lead-in
+    exists because RSI needs its period before the first reading means anything.
+    """
+    closes = [100.0] * 30
+    closes += [100 - index * 1.0 for index in range(1, 9)]
+    closes += [93, 94, 95, 96]
+    closes += [95.8 - index * 0.2 for index in range(25)]
+    closes += [92, 93, 94]
+    return closes
+
+
+def test_rsi_reads_a_one_way_market() -> None:
+    from app.strategies import turtle_agent
+
+    rising = turtle_agent._rsi_series([100 + index for index in range(30)], 14)
+    falling = turtle_agent._rsi_series([100 - index for index in range(30)], 14)
+    flat = turtle_agent._rsi_series([100.0] * 30, 14)
+
+    assert rising[-1] > 95
+    assert falling[-1] < 5
+    assert flat[-1] == pytest.approx(50.0)
+
+
+def test_a_lower_low_with_firmer_momentum_is_a_bottom_divergence() -> None:
+    """Price makes the new low; momentum does not. That is the leading warning."""
+    from app.strategies import turtle_agent
+
+    candles = _closes_to_candles(_divergence_closes())
+
+    hit = turtle_agent._divergence_hit(candles, "buy", config={})
+
+    assert hit is not None
+    assert "底背离" in hit[1]
+
+
+def test_a_clean_trend_reports_no_divergence() -> None:
+    from app.strategies import turtle_agent
+
+    candles = _closes_to_candles([100.0] * 30 + [100 - index for index in range(20)])
+
+    assert turtle_agent._divergence_hit(candles, "buy", config={}) is None
+
+
+def test_a_divergence_is_a_warning_and_never_the_trigger() -> None:
+    """It is reported at the pivot, so it cannot satisfy the newest-bar rule."""
+    from app.strategies import turtle_agent
+
+    candles = _closes_to_candles(_divergence_closes())
+
+    hits = turtle_agent._confirmation_signals(candles, 5, "buy", 0.0, 0.0, None, {})
+    divergence = [item for item in hits if "背离" in item[1]]
+
+    assert divergence
+    assert not any(index == len(candles) - 1 for index, _ in divergence)
+
+
+def test_the_divergence_condition_can_be_switched_off() -> None:
+    from app.strategies import turtle_agent
+
+    candles = _closes_to_candles(_divergence_closes())
+
+    assert turtle_agent._divergence_hit(
+        candles, "buy", config={"divergence_enabled": False}
+    ) is None
+
+
 def test_a_morning_star_is_a_confirmation() -> None:
     """A trend into a star at the low, then a reversal bar: three bars as a group.
 

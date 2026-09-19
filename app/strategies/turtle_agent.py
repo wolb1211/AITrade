@@ -52,6 +52,10 @@ DEFAULT_PIN_BAR_MIN_ATR = 0.1
 DEFAULT_STAR_INNER_BODY_SHARE = 0.6
 DEFAULT_STAR_RECOVER_SHARE = 0.5
 DEFAULT_STAR_TREND_BARS = 3
+# Divergence is the only leading condition: price makes a new extreme while RSI
+# does not, which warns of a turn before any candle pattern shows it.
+DEFAULT_DIVERGENCE_PERIOD = 14
+DEFAULT_DIVERGENCE_MIN_GAP = 3
 # How far an engulfing body edge may miss the previous body by. A bar still moving
 # at its close makes the next bar open a tick or three above that close, which is
 # the common case in a live market; demanding an exact cover filtered real
@@ -706,7 +710,7 @@ def _swing_pullback_signal(
         crossed = close > last_high[2] and _crossed_recently(candles, last_high[2], "buy", confirmation_window)
         confirmation = _bullish_confirmation(
             candles, confirmation_window, confirm_min_signals, engulf_tolerance,
-            pin_min_wick, star_settings,
+            pin_min_wick, star_settings, config,
         )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "buy", (
@@ -720,7 +724,7 @@ def _swing_pullback_signal(
         crossed = close < last_low[2] and _crossed_recently(candles, last_low[2], "sell", confirmation_window)
         confirmation = _bearish_confirmation(
             candles, confirmation_window, confirm_min_signals, engulf_tolerance,
-            pin_min_wick, star_settings,
+            pin_min_wick, star_settings, config,
         )
         if pullback_size >= min_pullback * atr and crossed and confirmation:
             return "sell", (
@@ -802,6 +806,78 @@ def _ema_series(values: list[float], period: int) -> list[float]:
     return result
 
 
+def _rsi_series(values: list[float], period: int) -> list[float]:
+    """Wilder's RSI, one value per input, front-padded with neutral readings."""
+    if period <= 0 or len(values) < 2:
+        return [50.0] * len(values)
+    gains: list[float] = [0.0]
+    losses: list[float] = [0.0]
+    for index in range(1, len(values)):
+        change = values[index] - values[index - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    result = [50.0] * len(values)
+    avg_gain = sum(gains[1:period + 1]) / period if len(values) > period else 0.0
+    avg_loss = sum(losses[1:period + 1]) / period if len(values) > period else 0.0
+    for index in range(period, len(values)):
+        if index > period:
+            avg_gain = (avg_gain * (period - 1) + gains[index]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[index]) / period
+        if avg_loss <= 0:
+            result[index] = 100.0 if avg_gain > 0 else 50.0
+        else:
+            result[index] = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+    return result
+
+
+def _divergence_hit(candles, direction: str, *, config: dict[str, Any]) -> tuple[int, str] | None:
+    """A leading warning: price makes a new extreme, momentum does not.
+
+    Compared between two confirmed pivots, which the swing logic already locates,
+    so no new structure machinery is needed. The hit is reported at the pivot's own
+    index rather than the newest bar on purpose: it is a warning, not a trigger, so
+    it must not satisfy the rule that the newest bar carries a condition - the
+    entry still needs a candle pattern happening now.
+    """
+    if not _config_flag(config, "divergence_enabled", True):
+        return None
+    period = int(_config_number(config, "divergence_period", DEFAULT_DIVERGENCE_PERIOD))
+    gap = int(_config_number(config, "divergence_min_gap_bars", DEFAULT_DIVERGENCE_MIN_GAP))
+    span = _positive_int(config.get("swing_pivot_span"), SWING_PIVOT_SPAN)
+    if period <= 1 or len(candles) < period + 4:
+        return None
+    closes = [float(item.close) for item in candles]
+    rsi = _rsi_series(closes, period)
+    points = _confirmed_pivots(candles, span)
+    highs = [item for item in points if item[1] == "high"]
+    lows = [item for item in points if item[1] == "low"]
+
+    if direction == "sell":
+        if len(highs) < 2:
+            return None
+        older, newer = highs[-2], highs[-1]
+        if newer[0] - older[0] < gap:
+            return None
+        if float(newer[2]) <= float(older[2]) or rsi[newer[0]] >= rsi[older[0]]:
+            return None
+        return newer[0], "顶背离（价格创新高、动能未创新高）"
+    if len(lows) < 2:
+        return None
+    older, newer = lows[-2], lows[-1]
+    if newer[0] - older[0] < gap:
+        return None
+    if float(newer[2]) >= float(older[2]) or rsi[newer[0]] <= rsi[older[0]]:
+        return None
+    return newer[0], "底背离（价格创新低、动能未创新低）"
+
+
+def _config_flag(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key)
+    if value is None:
+        return default
+    return value not in (False, 0, "0", "false", "off", "no")
+
+
 def _star_signal(candles, direction: str, *, settings: dict[str, Any]) -> bool:
     """Whether the newest three bars form a morning or evening star.
 
@@ -861,6 +937,7 @@ def _confirmation_signals(
     engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0,
     settings: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> list[tuple[int, str]]:
     """Every confirmation hit in the window, oldest first, as (bar index, kind).
 
@@ -905,12 +982,17 @@ def _confirmation_signals(
                 hits.append((index, "看跌长上影（Pin Bar）"))
     if settings is not None and _star_signal(candles, direction, settings=settings):
         hits.append((len(candles) - 1, "启明星" if bullish else "黄昏星"))
+    if config is not None:
+        divergence = _divergence_hit(candles, direction, config=config)
+        if divergence is not None:
+            hits.append(divergence)
     return hits
 
 
 def _confirmation_text(
     candles, window: int, direction: str, min_signals: int, engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> str:
     """The confirmation wording, or an empty string when the bar does not qualify.
 
@@ -920,7 +1002,7 @@ def _confirmation_text(
     entry - the trigger has to be happening now.
     """
     hits = _confirmation_signals(
-        candles, window, direction, engulf_tolerance, pin_min_wick, star_settings
+        candles, window, direction, engulf_tolerance, pin_min_wick, star_settings, config
     )
     if not hits:
         return ""
@@ -936,18 +1018,20 @@ def _confirmation_text(
 def _bullish_confirmation(
     candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> str:
     return _confirmation_text(
-        candles, window, "buy", min_signals, engulf_tolerance, pin_min_wick, star_settings
+        candles, window, "buy", min_signals, engulf_tolerance, pin_min_wick, star_settings, config
     )
 
 
 def _bearish_confirmation(
     candles, window: int, min_signals: int = 2, engulf_tolerance: float = 0.0,
     pin_min_wick: float = 0.0, star_settings: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> str:
     return _confirmation_text(
-        candles, window, "sell", min_signals, engulf_tolerance, pin_min_wick, star_settings
+        candles, window, "sell", min_signals, engulf_tolerance, pin_min_wick, star_settings, config
     )
 
 
