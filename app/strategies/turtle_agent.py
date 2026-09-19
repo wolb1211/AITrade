@@ -51,7 +51,7 @@ PIN_BAR_WICK_RATIO = 2.0        # pin-bar wick must be this many times the body
 # the ATR, so it also stretches on a symbol whose ticks are coarse. 0 on either
 # switches that part off; both 0 restores the exact rule.
 DEFAULT_ENGULF_TOLERANCE_POINTS = 5.0
-DEFAULT_ENGULF_TOLERANCE_ATR = 0.01
+DEFAULT_ENGULF_TOLERANCE_ATR = 0.03
 
 # Protection ladder: break-even first, then a trailing stop.
 DEFAULT_BREAK_EVEN_ATR = 0.5         # favourable move that triggers break-even

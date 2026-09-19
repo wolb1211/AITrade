@@ -1247,12 +1247,12 @@ def test_the_engulf_tolerance_takes_the_larger_of_ticks_and_atr() -> None:
 
     # 5 ticks of a 0.01-point symbol = 0.05.
     assert turtle_agent._engulf_tolerance({"point": 0.01}, {}) == pytest.approx(0.05)
-    # A 0.01 share of ATR 20 = 0.20, which is larger and therefore used.
-    assert turtle_agent._engulf_tolerance({"point": 0.01}, {}, 20.0) == pytest.approx(0.20)
+    # A 0.03 share of ATR 20 = 0.60, which is larger and therefore used.
+    assert turtle_agent._engulf_tolerance({"point": 0.01}, {}, 20.0) == pytest.approx(0.60)
     # Either side can be switched off.
     assert turtle_agent._engulf_tolerance(
         {"point": 0.01}, {"engulf_tolerance_points": 0}, 20.0
-    ) == pytest.approx(0.20)
+    ) == pytest.approx(0.60)
     assert turtle_agent._engulf_tolerance(
         {"point": 0.01}, {"engulf_tolerance_atr": 0}
     ) == pytest.approx(0.05)
