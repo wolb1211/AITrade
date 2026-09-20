@@ -203,7 +203,15 @@ class TurtleTrendStrategy:
             if retest is not None:
                 entry_analysis = f"{entry_analysis}；{retest[1]}"
         else:
-            return _hold_open(request, "当前无合适入场点：等突破关键位、或回调到位后再进场")
+            # Both structures came up empty. The breakout side needs no explaining -
+            # the price has simply not left the range - so the useful part is why the
+            # pullback structure did not complete, and that is said in plain words
+            # rather than by repeating the internal wording.
+            message = "当前无合适入场点：等突破关键位、或回调到位后再进场"
+            detail = _plain_pullback_reason(swing_analysis)
+            if detail:
+                message = f"{message}（{detail}）"
+            return _hold_open(request, message)
         entry = request.ask if direction == "buy" else request.bid
         # The US data/open window and a spike bar both mean the move has just
         # happened; those entries wait for a pullback at the level that was
@@ -1792,6 +1800,22 @@ def _basket_drawdown(
         current = (weighted - now) / atr
     give_back = (peak - current) / peak if peak > 0 else 0.0
     return {"peak": peak, "current": current, "give_back": max(give_back, 0.0)}
+
+
+# The pullback structure explains itself in internal wording; the panel gets the
+# same fact in the customer's language.
+_PLAIN_PULLBACK_REASONS = (
+    ("有效波段高低点不足", "波段数据还不足，暂不判断回调"),
+    ("回调结构与确认条件尚未同时满足", "回调幅度不够，或确认信号还没出现"),
+)
+
+
+def _plain_pullback_reason(analysis: str) -> str:
+    text = str(analysis or "")
+    for marker, plain in _PLAIN_PULLBACK_REASONS:
+        if marker in text:
+            return plain
+    return ""
 
 
 def _maybe_add(

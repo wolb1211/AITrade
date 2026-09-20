@@ -1605,6 +1605,20 @@ def test_the_engulf_tolerance_takes_the_larger_of_ticks_and_atr() -> None:
     assert turtle_agent._engulf_tolerance({}, {"engulf_tolerance_atr": 0}) == 0.0
 
 
+def test_the_waiting_message_says_why_in_plain_words() -> None:
+    """The panel gets the reason, not the internal wording."""
+    from app.strategies import turtle_agent
+
+    assert turtle_agent._plain_pullback_reason("回调结构与确认条件尚未同时满足") == (
+        "回调幅度不够，或确认信号还没出现"
+    )
+    assert turtle_agent._plain_pullback_reason("有效波段高低点不足，暂不判断回调结构") == (
+        "波段数据还不足，暂不判断回调"
+    )
+    # Anything unrecognised adds nothing rather than leaking the raw text.
+    assert turtle_agent._plain_pullback_reason("回调趋势确认：低点与高点同步抬高") == ""
+
+
 def test_the_default_protection_thresholds_are_the_tightened_ones() -> None:
     """The operator's settings: break even at 0.5, trail from 1.0 at 0.5 behind.
 
