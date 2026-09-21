@@ -1660,17 +1660,19 @@ def test_the_waiting_message_says_why_in_plain_words() -> None:
     assert turtle_agent._plain_pullback_reason("回调趋势确认：低点与高点同步抬高") == ""
 
 
-def test_the_default_protection_thresholds_are_the_tightened_ones() -> None:
-    """The operator's settings: break even at 0.5, trail from 1.0 at 0.5 behind.
+def test_the_default_protection_thresholds_are_the_current_ones() -> None:
+    """The operator's settings: break even at 0.8, trail from 1.3 at 0.8 behind.
 
-    Every test that needs the older thresholds pins them through _legacy, so this
-    is the one place that says what a deployment gets without any configuration.
+    A tighter 0.5 / 1.0 / 0.5 set was in place for a while and left too little room:
+    break-even fired on ordinary pullbacks. Every test that needs the older
+    thresholds pins them through _legacy, so this is the one place that says what a
+    deployment gets without any configuration.
     """
     from app.strategies import turtle_agent
 
-    assert turtle_agent.DEFAULT_BREAK_EVEN_ATR == 0.5
-    assert turtle_agent.DEFAULT_TRAILING_START_ATR == 1.0
-    assert turtle_agent.DEFAULT_TRAILING_DISTANCE_ATR == 0.5
+    assert turtle_agent.DEFAULT_BREAK_EVEN_ATR == 0.8
+    assert turtle_agent.DEFAULT_TRAILING_START_ATR == 1.3
+    assert turtle_agent.DEFAULT_TRAILING_DISTANCE_ATR == 0.8
     assert turtle_agent.DEFAULT_TRAILING_MIN_STEP_ATR == 0.2
 
 
