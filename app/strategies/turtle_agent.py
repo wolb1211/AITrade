@@ -214,8 +214,9 @@ class TurtleTrendStrategy:
             return _hold_open(request, message)
         entry = request.ask if direction == "buy" else request.bid
         # The US data/open window and a spike bar both mean the move has just
-        # happened; those entries wait for a pullback at the level that was
-        # broken instead of buying the top of it.
+        # happened. Those entries used to be parked as a limit order at the level
+        # that was broken; the operator wants no resting orders on this strategy, so
+        # the bar is simply skipped and the next signal is waited for instead.
         waits, anchor, wait_reason = _pending_entry_conditions(
             candles=candles, direction=direction, upper=upper, lower=lower,
             donchian_fired=bool(donchian_direction), atr=atr, config=config,
@@ -223,13 +224,10 @@ class TurtleTrendStrategy:
         order_type = "market"
         wait_note = ""
         if waits and anchor > 0:
-            # A limit only works when it sits behind the market, which is the case
-            # these conditions describe; otherwise the market entry stands.
             behind_market = anchor < request.bid if direction == "buy" else anchor > request.ask
-            if behind_market:
-                order_type = "limit"
-                entry = anchor
-                wait_note = f"（{wait_reason}，改为限价挂单等待回调）"
+            if behind_market and not _config_flag(config, "pending_entry_enabled", False):
+                detail = wait_reason or "行情刚走完一段"
+                return _hold_open(request, f"本根不入场：{detail}，等下一次信号再进（不使用挂单）")
         sl = entry - STOP_ATR * atr if direction == "buy" else entry + STOP_ATR * atr
         # A stop the broker will refuse is worse than a wider usable one, so the
         # entry stop respects the minimum distance too.

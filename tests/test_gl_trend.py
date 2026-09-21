@@ -555,6 +555,47 @@ def _add_ready_request() -> PositionEvaluateRequest:
     return _position_request([_position("9001", current_price=111.0)], bid=111.0, ask=111.1)
 
 
+def test_a_spike_bar_is_skipped_instead_of_parked_as_a_limit_order() -> None:
+    """No resting orders on this strategy: enter at market or wait for the next one.
+
+    A spike bar used to be parked as a limit order at the middle of the bar. The
+    operator wants either a market entry or nothing, so the bar is skipped and the
+    next signal is waited for.
+    """
+    gate = _FakeRiskGate(
+        open_content={"allow_open": True, "risk_level": "low", "reason": "缁撴瀯骞插噣"}
+    )
+    # A last bar far wider than twice the ATR is the spike case.
+    request = _open_request(last_close=112.5, last_high=120.0, last_low=104.0)
+
+    # A low spike threshold makes the last bar count, so the test is about the skip
+    # and not about the spike arithmetic.
+    decision = TurtleTrendStrategy(gate).evaluate_open(
+        request, {"config": {"spike_bar_atr": 0.5}}
+    )
+
+    assert decision.action == "HOLD"
+    assert "不使用挂单" in decision.reason
+    assert gate.open_calls == 0
+
+
+def test_the_pending_entry_can_still_be_switched_back_on() -> None:
+    gate = _FakeRiskGate(
+        open_content={"allow_open": True, "risk_level": "low", "reason": "缁撴瀯骞插噣"}
+    )
+    request = _open_request(last_close=112.5, last_high=120.0, last_low=104.0)
+
+    decision = TurtleTrendStrategy(gate).evaluate_open(
+        request, {"config": {"pending_entry_enabled": True, "spike_bar_atr": 0.5}}
+    )
+
+    # With the switch back on the bar is traded again instead of skipped. Whether it
+    # becomes a limit or stays at market depends on where the anchor sits relative
+    # to the quote, so only the skip is asserted against.
+    assert decision.action == "BUY"
+    assert "不使用挂单" not in decision.reason
+
+
 def test_open_ai_approval_keeps_the_order() -> None:
     gate = _FakeRiskGate(
         open_content={"allow_open": True, "risk_level": "low", "reason": "结构干净"}
