@@ -1044,7 +1044,7 @@ class AiDecisionClient:
         model that answers "no" is a verdict and must never be re-asked elsewhere,
         or the risk gate could be talked past by simply switching model.
         """
-        def call(chosen: str) -> AiCallResult | None:
+        def call(chosen: dict[str, Any]) -> AiCallResult | None:
             kwargs: dict[str, Any] = {
                 "deployment": deployment,
                 "endpoint": endpoint,
@@ -1062,16 +1062,21 @@ class AiDecisionClient:
         try:
             return call(model)
         except Exception as exc:  # noqa: BLE001 - any provider failure is a reason to retry
-            backup = self._fallback_model(deployment, endpoint, model)
-            if not backup:
+            primary = str(model.get("model") or model.get("name") or "")
+            backup_name = self._fallback_model(deployment, endpoint, primary)
+            if not backup_name:
                 raise
+            # The retry needs a model record, not just a name: the call reads the
+            # provider, key and base url off it. The backup is taken as a sibling of
+            # the model in use, which is where qwen-plus lives.
+            backup = {**model, "model": backup_name, "name": backup_name}
             logger.warning(
-                "AI model %s failed (%s); retrying on %s", model, type(exc).__name__, backup
+                "AI model %s failed (%s); retrying on %s", primary, type(exc).__name__, backup_name
             )
             result = call(backup)
             if result is not None and isinstance(result.content, dict):
                 note = (
-                    f"模型 {model} 出错，本次已改用 {backup} 完成判断，请尽快查原因或更换模型。"
+                    f"模型 {primary} 出错，本次已改用 {backup_name} 完成判断，请尽快查原因或更换模型。"
                 )
                 existing = str(result.content.get("analysis") or "")
                 result.content["analysis"] = f"{note}{existing}"

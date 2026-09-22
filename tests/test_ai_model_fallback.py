@@ -24,19 +24,36 @@ class _Client(AiDecisionClient):
         self.calls: list[str] = []
 
     def _chat_json_uncached(self, **kwargs: Any) -> Any:
-        model = str(kwargs.get("model") or "")
-        self.calls.append(model)
-        outcome = self.outcomes.get(model)
+        model = kwargs.get("model")
+        # The real call indexes into the record, so a bare name here is a bug the
+        # fallback used to have: it retried with a string and never reached the
+        # provider.
+        assert isinstance(model, dict), f"model must be a record, got {type(model).__name__}"
+        name = str(model.get("model") or model.get("name") or "")
+        self.calls.append(name)
+        outcome = self.outcomes.get(name)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+def _model(name: str = "gemini-3.8-flash", is_custom: bool = False) -> dict[str, Any]:
+    return {
+        "is_custom": is_custom,
+        "provider_id": "p",
+        "provider_base_url": "https://example.test/v1",
+        "provider_api_key": "k",
+        "model": name,
+        "name": name,
+        "strict_json": True,
+    }
 
 
 def _result(analysis: str = "") -> AiCallResult:
     return AiCallResult(content={"reason": "观望", "analysis": analysis}, usage=None)
 
 
-def _call(client: _Client, model: str, config: dict[str, Any] | None = None) -> Any:
+def _call(client: _Client, model: dict[str, Any], config: dict[str, Any] | None = None) -> Any:
     return client._chat_with_model_fallback(
         deployment={"config": config or {}},
         endpoint="open",
@@ -52,7 +69,7 @@ def test_a_rate_limited_model_is_retried_on_the_backup() -> None:
         "qwen-plus": _result("原有分析"),
     })
 
-    result = _call(client, "gemini-3.8-flash")
+    result = _call(client, _model())
 
     assert client.calls == ["gemini-3.8-flash", "qwen-plus"]
     assert result is not None
@@ -66,20 +83,20 @@ def test_a_rate_limited_model_is_retried_on_the_backup() -> None:
 def test_a_timeout_is_retried_too() -> None:
     client = _Client({"a-model": TimeoutError("slow"), "qwen-plus": _result()})
 
-    assert _call(client, "a-model") is not None
+    assert _call(client, _model("a-model")) is not None
     assert client.calls == ["a-model", "qwen-plus"]
 
 
 def test_the_backup_model_can_be_chosen_or_switched_off() -> None:
     client = _Client({"a-model": RuntimeError("boom"), "gpt-5.5": _result()})
 
-    assert _call(client, "a-model", {"fallback_model": "gpt-5.5"}) is not None
+    assert _call(client, _model("a-model"), {"fallback_model": "gpt-5.5"}) is not None
     assert client.calls == ["a-model", "gpt-5.5"]
 
     # An empty setting disables the fallback and the failure propagates.
     failing = _Client({"a-model": RuntimeError("boom"), "qwen-plus": _result()})
     with pytest.raises(RuntimeError):
-        _call(failing, "a-model", {"fallback_model": ""})
+        _call(failing, _model("a-model"), {"fallback_model": ""})
     assert failing.calls == ["a-model"]
 
 
@@ -87,7 +104,7 @@ def test_the_model_in_use_is_never_retried_against_itself() -> None:
     client = _Client({"qwen-plus": RuntimeError("boom")})
 
     with pytest.raises(RuntimeError):
-        _call(client, "qwen-plus")
+        _call(client, _model("qwen-plus"))
 
     assert client.calls == ["qwen-plus"]
 
@@ -97,7 +114,7 @@ def test_a_verdict_is_never_re_asked_elsewhere() -> None:
     refusal = _result("不符合条件")
     client = _Client({"a-model": refusal, "qwen-plus": _result("换我说")})
 
-    result = _call(client, "a-model")
+    result = _call(client, _model("a-model"))
 
     assert client.calls == ["a-model"]
     assert result is refusal
