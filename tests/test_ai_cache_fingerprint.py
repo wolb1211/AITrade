@@ -60,13 +60,25 @@ def test_two_different_instruments_do_not_merge() -> None:
     assert _cache_fingerprint(first) != _cache_fingerprint(second)
 
 
-def test_two_accounts_on_the_same_market_produce_the_same_key() -> None:
+def test_two_accounts_quoting_the_same_market_produce_the_same_key() -> None:
     closes = [4374.6, 4375.1, 4374.9]
     first = _request(4374.63, 4374.85, closes, login="111")
-    # Another broker, another account, three points away.
-    second = _request(4374.66, 4374.88, [4374.62, 4375.12, 4374.92], login="999")
+    second = _request(4374.63, 4374.85, closes, login="999")
 
     assert _cache_fingerprint(first) == _cache_fingerprint(second)
+
+
+def test_a_moved_price_is_a_different_question() -> None:
+    """A spike poll a second later must not reuse the answer from before it.
+
+    The candles only carry closed bars, so the live quote is the only thing that
+    says the market has moved; dropping it made a running move look identical.
+    """
+    closes = [4374.6, 4375.1, 4374.9]
+    before = _request(4374.63, 4374.85, closes)
+    after = _request(4379.10, 4379.32, closes)
+
+    assert _cache_fingerprint(before) != _cache_fingerprint(after)
 
 
 def test_a_different_market_is_a_different_key() -> None:

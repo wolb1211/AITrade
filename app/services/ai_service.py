@@ -1439,7 +1439,7 @@ class AiDecisionClient:
             api_key_hash = sha256(str(model.get("provider_api_key") or "").encode("utf-8")).hexdigest()
             scope = f"custom:{deployment.get('user_id', '')}:{api_key_hash}"
         material = {
-            "cache_version": 2,
+            "cache_version": 3,
             "scope": scope,
             "endpoint": endpoint,
             "provider_id": str(model.get("provider_id") or ""),
@@ -3524,17 +3524,21 @@ def _empty_content_error(parsed: Any, raw_response: str) -> str:
 # should be. Dropping them is what lets two deployments on the same symbol and
 # timeframe share one answer.
 _CACHE_VOLATILE_KEYS = frozenset({
-    # Per account: same book, different numbers.
+    # Per account bookkeeping: same book, different numbers.
     "ticket", "position_ticket", "login", "account_login", "server", "mt_login", "mt_server",
     "volume", "lot", "lots", "units", "profit", "net_profit", "commission", "swap",
     "balance", "equity", "margin", "free_margin", "comment", "open_time", "close_time",
-    # Quotes arrive with the candles, and the broker's contract figures do not
-    # change the shape of the market.
-    "bid", "ask", "spread", "point", "tick_size", "tick_value", "value_per_point",
-    "value_per_price", "contract_size", "stops_level", "open_price", "current_price",
+    # Broker contract figures that do not change the shape of the market.
+    "point", "tick_size", "tick_value", "value_per_point",
+    "value_per_price", "contract_size", "stops_level",
     # Snapshot timestamps: two feeds describe the same bars a second apart.
     "time", "timestamp", "bar_time", "created_at", "updated_at",
 })
+# bid, ask, open_price and current_price are deliberately NOT dropped. The candles
+# only carry closed bars in practice, so without the live quote a request during a
+# fast move looked identical to the one a second earlier and reused that verdict.
+# They are rounded instead, which is enough: a spike moves further than the rounding
+# grid between two polls, and a quiet market deserves the same answer anyway.
 # Five significant digits is a tenth of a point on gold, which is the order of the
 # difference between two brokers quoting the same bar.
 CACHE_PRICE_PRECISION = 5
