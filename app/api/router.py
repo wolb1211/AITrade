@@ -1257,6 +1257,28 @@ def create_auth_router(
         token = bearer_token(authorization)
         return execute(lambda: auth_service.me(token))
 
+    @router.get("/api-keys")
+    def user_api_keys(authorization: str = Header(default="")) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.api_keys(token))
+
+    @router.post("/api-keys")
+    def user_api_key_create(
+        payload: dict[str, object] | None = None,
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        body = payload or {}
+        return execute(lambda: auth_service.create_api_key(token, str(body.get("name") or "")))
+
+    @router.post("/api-keys/revoke")
+    def user_api_key_revoke(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        token = bearer_token(authorization)
+        return execute(lambda: auth_service.revoke_api_key(token, str(payload.get("id") or "")))
+
     @router.get("/portal")
     def user_portal(authorization: str = Header(default="")) -> dict[str, object]:
         token = bearer_token(authorization)

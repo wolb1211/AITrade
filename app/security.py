@@ -10,6 +10,29 @@ def hash_deployment_key(raw_key: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+# Keys for the public AI interface. They carry a different prefix from a strategy
+# key on purpose: a leaked strategy key must not be usable against the public API,
+# and revoking one must not touch the other.
+API_KEY_PREFIX = "ak_"
+API_KEY_BYTES = 16
+
+
+def generate_api_key() -> str:
+    return f"{API_KEY_PREFIX}{secrets.token_hex(API_KEY_BYTES)}"
+
+
+def hash_api_key(raw_key: str) -> str:
+    return hash_deployment_key(raw_key)
+
+
+def api_key_prefix(raw_key: str) -> str:
+    """The part of a key that is safe to show again after it is created."""
+    text = raw_key.strip()
+    if len(text) <= 12:
+        return text
+    return f"{text[:10]}…{text[-4:]}"
+
+
 PASSWORD_ITERATIONS = 600_000
 
 

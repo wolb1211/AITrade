@@ -126,6 +126,22 @@ class UserAuthService:
             raise AuthError("invalid_session", 401)
         return user
 
+    def api_keys(self, token: str) -> dict[str, Any]:
+        """The keys this user has for the public AI interface, never the secrets."""
+        user = self.me(token)
+        return {"list": self.store.list_user_api_keys(user["id"])}
+
+    def create_api_key(self, token: str, name: str = "") -> dict[str, Any]:
+        """Mint a key. The plain value is returned here and never again."""
+        user = self.me(token)
+        return self.store.create_user_api_key(user["id"], name=name)
+
+    def revoke_api_key(self, token: str, key_id: str) -> dict[str, Any]:
+        user = self.me(token)
+        if not self.store.revoke_user_api_key(user["id"], key_id):
+            raise AuthError("api_key_not_found", 404)
+        return {"ok": True}
+
     def portal(self, token: str) -> dict[str, Any]:
         user = self.me(token)
         return self.store.get_user_portal_data(int(user["id"]))

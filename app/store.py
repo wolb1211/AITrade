@@ -12,9 +12,17 @@ from uuid import uuid4
 import pymysql
 from pymysql.err import IntegrityError as MySqlIntegrityError
 
-from app.security import hash_deployment_key
+from app.security import (
+    api_key_prefix,
+    generate_api_key,
+    hash_api_key,
+    hash_deployment_key,
+)
 
 LOCAL_TIMEZONE = timezone(timedelta(hours=8))
+# Requests per minute allowed on a key for the public AI interface. Enough for a
+# person, low enough that a leaked key cannot burn a balance in minutes.
+DEFAULT_API_KEY_RPM = 60
 
 DatabaseIntegrityError = (sqlite3.IntegrityError, MySqlIntegrityError)
 
@@ -677,6 +685,23 @@ class SqliteStore:
 
                 CREATE INDEX IF NOT EXISTS idx_ai_response_cache_expires
                     ON ai_response_cache(expires_at);
+
+                CREATE TABLE IF NOT EXISTS user_api_keys (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    key_hash TEXT NOT NULL UNIQUE,
+                    key_prefix TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    rpm_limit INTEGER NOT NULL DEFAULT 60,
+                    request_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL DEFAULT '',
+                    revoked_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_api_keys_user
+                    ON user_api_keys(user_id);
 
                 CREATE TABLE IF NOT EXISTS official_ai_strategies (
                     id TEXT PRIMARY KEY,
@@ -1467,6 +1492,84 @@ class SqliteStore:
                     now,
                     now,
                 ),
+            )
+
+    def create_user_api_key(self, user_id: int | str, *, name: str = "") -> dict[str, Any]:
+        """Mint a key for the public AI interface.
+
+        Only the hash is stored, so the plain key is visible exactly once, at
+        creation, and a database dump cannot be used to call the API.
+        """
+        raw_key = generate_api_key()
+        key_id = f"ak_{uuid4().hex}"
+        now = utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_api_keys
+                    (id, user_id, name, key_hash, key_prefix, status, rpm_limit,
+                     request_count, created_at, last_used_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, 'active', ?, 0, ?, '', '')
+                """,
+                (
+                    key_id,
+                    str(user_id),
+                    str(name or "").strip()[:64],
+                    hash_api_key(raw_key),
+                    api_key_prefix(raw_key),
+                    DEFAULT_API_KEY_RPM,
+                    now,
+                ),
+            )
+        return {"id": key_id, "key": raw_key, "key_prefix": api_key_prefix(raw_key), "created_at": now}
+
+    def list_user_api_keys(self, user_id: int | str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, name, key_prefix, status, rpm_limit, request_count,
+                       created_at, last_used_at, revoked_at
+                FROM user_api_keys
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                """,
+                (str(user_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_user_api_key(self, user_id: int | str, key_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE user_api_keys
+                SET status = 'revoked', revoked_at = ?
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (utc_now_iso(), str(key_id), str(user_id)),
+            )
+            return cursor.rowcount > 0
+
+    def find_user_api_key(self, raw_key: str) -> dict[str, Any] | None:
+        """The key record for a presented key, or None when it is unknown."""
+        raw = str(raw_key or "").strip()
+        if not raw:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM user_api_keys WHERE key_hash = ?",
+                (hash_api_key(raw),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_user_api_key(self, key_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE user_api_keys
+                SET last_used_at = ?, request_count = request_count + 1
+                WHERE id = ?
+                """,
+                (utc_now_iso(), str(key_id)),
             )
 
     def find_deployment_by_key(self, raw_key: str) -> dict[str, Any] | None:
