@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.public_api import create_public_api_router
 from app.api.router import (
     create_admin_ai_router,
     create_auth_router,
@@ -186,6 +187,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         require_admin_auth=resolved.environment == "production" or bool(resolved.admin_jwt_secret),
     ))
     application.include_router(create_auth_router(auth_service, ai_client=ai_client))
+    # The public AI interface lives outside /api/v1: callers use it with a user API
+    # key and an OpenAI-compatible client.
+    application.include_router(create_public_api_router(store))
     application.state.settings = resolved
     application.state.store = store
     return application
