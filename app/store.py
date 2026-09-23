@@ -6876,6 +6876,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_auth_tables()
         self._ensure_mysql_wallet_tables()
         self._ensure_mysql_ai_cache_table()
+        self._ensure_mysql_user_api_keys_table()
         self._ensure_mysql_ea_download_table()
         self._ensure_mysql_guide_article_table()
         self._ensure_mysql_order_summary_table()
@@ -6888,6 +6889,7 @@ class MySQLStore(SqliteStore):
             "ai_balance_ledger",
             "ai_usage_monthly_summaries",
             "ai_response_cache",
+            "user_api_keys",
             "deployments",
             "decisions",
             "heartbeats",
@@ -7249,6 +7251,29 @@ class MySQLStore(SqliteStore):
                 ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
                 """,
                 ("order_detail_retention_days", "365", "订单明细保存天数", now),
+            )
+
+    def _ensure_mysql_user_api_keys_table(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_api_keys (
+                    id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL,
+                    name VARCHAR(64) NOT NULL DEFAULT '',
+                    key_hash CHAR(64) NOT NULL,
+                    key_prefix VARCHAR(32) NOT NULL DEFAULT '',
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    rpm_limit INT NOT NULL DEFAULT 60,
+                    request_count BIGINT NOT NULL DEFAULT 0,
+                    created_at VARCHAR(40) NOT NULL,
+                    last_used_at VARCHAR(40) NOT NULL DEFAULT '',
+                    revoked_at VARCHAR(40) NOT NULL DEFAULT '',
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_user_api_keys_hash (key_hash),
+                    KEY idx_user_api_keys_user (user_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
             )
 
     def _ensure_mysql_ai_cache_table(self) -> None:
