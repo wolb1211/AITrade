@@ -1538,16 +1538,31 @@ class SqliteStore:
         return [dict(row) for row in rows]
 
     def revoke_user_api_key(self, user_id: int | str, key_id: str) -> bool:
+        """Revoke one key, reporting whether an active one was there to revoke.
+
+        The row is read first rather than trusting the cursor's affected-row count,
+        which the MySQL wrapper does not carry - the update used to raise instead of
+        revoking.
+        """
         with self._connect() as connection:
-            cursor = connection.execute(
+            row = connection.execute(
+                """
+                SELECT id FROM user_api_keys
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (str(key_id), str(user_id)),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
                 """
                 UPDATE user_api_keys
                 SET status = 'revoked', revoked_at = ?
-                WHERE id = ? AND user_id = ? AND status = 'active'
+                WHERE id = ?
                 """,
-                (utc_now_iso(), str(key_id), str(user_id)),
+                (utc_now_iso(), str(key_id)),
             )
-            return cursor.rowcount > 0
+            return True
 
     def find_user_api_key(self, raw_key: str) -> dict[str, Any] | None:
         """The key record for a presented key, or None when it is unknown."""
