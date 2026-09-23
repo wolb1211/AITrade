@@ -4300,6 +4300,33 @@ class SqliteStore:
             ],
         }
 
+    def get_public_ai_endpoint(self, selector: str) -> dict[str, Any] | None:
+        """The callable endpoint behind a model name, for the public interface.
+
+        Unlike the options list this one carries the provider key and base url, so
+        it is only ever used server side. A caller sends the model name it read from
+        /v1/models; the record id is accepted too.
+        """
+        wanted = str(selector or "").strip()
+        if not wanted:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM ai_endpoints
+                WHERE owner_type = 'gl'
+                  AND enabled = 1
+                  AND api_key <> ''
+                  AND selectable_by_user = 1
+                  AND (model = ? OR id = ?)
+                ORDER BY is_default DESC, sort ASC, updated_at DESC
+                LIMIT 1
+                """,
+                (wanted, wanted),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_ai_user_quotas(self, *, page: int, size: int, keyword: str = "") -> dict[str, Any]:
         where = ""
         params: list[Any] = []
