@@ -20,7 +20,7 @@ treated as the latest closed one, matching every other engine in the service.
 from __future__ import annotations
 
 from math import floor, log10
-from typing import Any, Iterable
+from typing import Any
 
 from app.models import Candle
 
@@ -29,18 +29,27 @@ TREND_BEAR = "bear"
 TREND_RANGE = "range"
 TREND_UNKNOWN = "unknown"
 
-# Ordered short -> mid -> long: the EA reads the answer under these three names,
-# and the admin decides which timeframe each one is.
+# Ordered short -> mid -> long: the EA reads the answer under these three names.
 REGIME_LABELS: tuple[str, ...] = ("short", "mid", "long")
 
+# The data contract of this endpoint is deliberately hardcoded rather than
+# configured in the admin console. The endpoint exists for one strategy, so the
+# shape is fixed: three timeframes, one answer slot each. Changing these means
+# changing this line and the EA together, which is the honest cost of a private
+# contract - a console field would only let the two drift apart silently.
+#
 # M15 because the EA polls on a fifteen minute timer; H4 and D1 because the
-# strategy is a hedge basket that lives for hours to days and only the higher
-# timeframes say whether it is fighting a one-way market. Editable in the admin
-# console, and the EA is told the list by the init response, so changing it here
-# needs no change on the EA side.
-DEFAULT_REGIME_PERIODS: tuple[str, ...] = ("M15", "H4", "D1")
+# strategy is a hedge basket that lives for hours to days, and only the higher
+# timeframes say whether it is fighting a one-way market.
+REGIME_PERIODS: tuple[str, ...] = ("M15", "H4", "D1")
 
-# The CLIENTS that may appear as a secondary timeframe key.
+# Bars used per timeframe, and how long one answer stays valid. 100 bars covers a
+# 30 period average with context and is what the EA is asked to upload. The five
+# minute window mainly lets several EAs on the same symbol share one paid call.
+REGIME_KLINE_COUNT = 100
+REGIME_CACHE_SECONDS = 300
+
+# The only timeframe keys that may appear as a secondary timeframe.
 ALLOWED_REGIME_TIMEFRAMES = frozenset({"M1", "M5", "M15", "M30", "H1", "H4", "D1"})
 
 _RULE_TREND_TEXT = {
@@ -49,42 +58,6 @@ _RULE_TREND_TEXT = {
     TREND_RANGE: "规则判定为震荡",
     TREND_UNKNOWN: "规则无法判定",
 }
-
-
-def normalize_regime_periods(value: Any) -> list[str]:
-    """The configured periods, in order, with unusable entries dropped.
-
-    The list is read from the official strategy's config, which an admin edits,
-    so it is validated here rather than trusted: an unknown key would silently
-    become a period the EA never uploads bars for.
-    """
-    if isinstance(value, str):
-        raw_items: Iterable[Any] = [item for item in value.replace(",", " ").split()]
-    elif isinstance(value, (list, tuple)):
-        raw_items = value
-    else:
-        raw_items = ()
-    periods: list[str] = []
-    for item in raw_items:
-        timeframe = str(item or "").strip().upper()
-        if timeframe in ALLOWED_REGIME_TIMEFRAMES and timeframe not in periods:
-            periods.append(timeframe)
-    return periods or list(DEFAULT_REGIME_PERIODS)
-
-
-def normalize_regime_cache_seconds(value: Any, *, default: int = 300) -> int:
-    """Cache lifetime for one regime answer, in seconds.
-
-    Clamped to the range the response cache itself accepts (10s - 1h). The
-    default is five minutes because the EA polls every fifteen: the cache mainly
-    lets several EAs on the same symbol share one paid call, and a stale read is
-    acceptable for a reference opinion.
-    """
-    try:
-        seconds = int(float(value))
-    except (TypeError, ValueError):
-        return default
-    return max(10, min(3600, seconds))
 
 
 def _round_significant(value: float | None, digits: int = 4) -> float | None:

@@ -56,10 +56,11 @@ from app.services.ai_service import AiDecisionClient
 from app.services.custom_indicators import public_indicator_catalog
 from app.services.custom_workflow import workflow_catalog, workflow_json_schema, workflow_validation_result
 from app.services.regime_service import (
+    REGIME_CACHE_SECONDS,
+    REGIME_KLINE_COUNT,
     REGIME_LABELS,
+    REGIME_PERIODS,
     TREND_UNKNOWN,
-    normalize_regime_cache_seconds,
-    normalize_regime_periods,
     normalize_trend_text,
     rule_detail,
     timeframe_features,
@@ -567,8 +568,8 @@ def create_mt5_router(
                 # trend read is told exactly which periods to upload.
                 secondary_timeframes=(
                     [
-                        Mt5SecondaryTimeframe(timeframe=timeframe, kline_count=_regime_bar_limit(ea_config.get("regime_kline_count")))
-                        for timeframe in normalize_regime_periods(ea_config.get("regime_periods"))
+                        Mt5SecondaryTimeframe(timeframe=timeframe, kline_count=REGIME_KLINE_COUNT)
+                        for timeframe in REGIME_PERIODS
                     ]
                     if deployment["strategy_code"] in _REGIME_STRATEGY_CODES
                     else []
@@ -750,13 +751,9 @@ def create_mt5_router(
             event_type="regime",
         )
 
-        official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
-        strategy_config = official_strategy["default_config"] if official_strategy else {}
-        if not isinstance(strategy_config, dict):
-            strategy_config = {}
-        periods = normalize_regime_periods(strategy_config.get("regime_periods"))
-        cache_seconds = normalize_regime_cache_seconds(strategy_config.get("regime_cache_seconds"))
-        bar_limit = _regime_bar_limit(strategy_config.get("regime_kline_count"))
+        periods = list(REGIME_PERIODS)
+        cache_seconds = REGIME_CACHE_SECONDS
+        bar_limit = REGIME_KLINE_COUNT
 
         timeframe_candles = _secondary_candles(request.market.secondary_bars)
         # The EA is expected to send the short period in the ordinary bars list,
@@ -1813,15 +1810,6 @@ def _regime_request_id(request: Mt5RegimeRequest) -> str:
     )
     source_id = request.request_id or "auto"
     return f"{source_id[:48]}_{sha256(raw.encode('utf-8')).hexdigest()[:16]}"
-
-
-def _regime_bar_limit(value: object) -> int:
-    """How many bars of each period are used, as configured on the strategy."""
-    try:
-        limit = int(float(value))
-    except (TypeError, ValueError):
-        return 100
-    return max(30, min(1000, limit))
 
 
 def _mt5_regime_error_response(

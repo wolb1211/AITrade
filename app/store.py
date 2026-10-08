@@ -49,25 +49,21 @@ ARBITRAGE_EA_CONFIG_DEFAULTS: dict[str, Any] = {
     "maPeriod": 10,  # ma 周期
 }
 
-# Server side extras stored on the same row: they drive the regime endpoint and
-# are ignored by the EA. Three periods because the answer has exactly three slots
-# - short, mid, long - and the EA is told this list by the init response.
-ARBITRAGE_REGIME_CONFIG_DEFAULTS: dict[str, Any] = {
-    "regime_periods": ["M15", "H4", "D1"],
-    "regime_kline_count": 100,
-    "regime_cache_seconds": 300,
-}
+# Config keys that used to configure the regime endpoint and are now hardcoded in
+# app/services/regime_service.py. They are dropped from stored rows so the init
+# response keeps describing only settings that actually do something.
+OBSOLETE_STRATEGY_CONFIG_KEYS: tuple[str, ...] = (
+    "regime_periods",
+    "regime_kline_count",
+    "regime_cache_seconds",
+)
 
 
 def arbitrage_ea_config_defaults() -> dict[str, Any]:
-    """Fresh copy of the GL_ARBITRAGE_V1 seed config (EA + server side)."""
+    """Fresh copy of the GL_ARBITRAGE_V1 seed config."""
     return {
         "position_sizing_mode": "fixed",
         **ARBITRAGE_EA_CONFIG_DEFAULTS,
-        **ARBITRAGE_REGIME_CONFIG_DEFAULTS,
-        # A fresh list so a caller mutating the result cannot corrupt the module
-        # level default.
-        "regime_periods": list(ARBITRAGE_REGIME_CONFIG_DEFAULTS["regime_periods"]),
     }
 
 
@@ -82,14 +78,8 @@ def backfill_arbitrage_config(config: Any) -> dict[str, Any]:
     merged = dict(config) if isinstance(config, dict) else {}
     for key, value in arbitrage_ea_config_defaults().items():
         merged.setdefault(key, value)
-    # regime_periods is the exception to "only fill gaps": the response has one
-    # slot per entry (short, mid, long), so a list written before the third slot
-    # existed describes a read the server cannot produce. Anything that is not
-    # three usable timeframes is restored to the default; a list an admin edited
-    # into three valid periods is left exactly as it is.
-    periods = merged.get("regime_periods")
-    if not isinstance(periods, list) or len(periods) != 3:
-        merged["regime_periods"] = list(ARBITRAGE_REGIME_CONFIG_DEFAULTS["regime_periods"])
+    for key in OBSOLETE_STRATEGY_CONFIG_KEYS:
+        merged.pop(key, None)
     return merged
 
 

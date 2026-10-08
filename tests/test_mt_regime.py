@@ -16,8 +16,8 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.services.regime_service import (
-    normalize_regime_cache_seconds,
-    normalize_regime_periods,
+    REGIME_KLINE_COUNT,
+    REGIME_PERIODS,
     normalize_trend_text,
     timeframe_features,
 )
@@ -149,13 +149,13 @@ def test_trend_words_are_folded_from_both_languages() -> None:
     assert normalize_trend_text("???") == "unknown"
 
 
-def test_period_config_is_validated_and_falls_back_to_the_defaults() -> None:
-    assert normalize_regime_periods(["m15", "H4", "D1"]) == ["M15", "H4", "D1"]
-    assert normalize_regime_periods(["H4", "H4", "W1"]) == ["H4"]
-    assert normalize_regime_periods(None) == ["M15", "H4", "D1"]
-    assert normalize_regime_cache_seconds(0) == 10
-    assert normalize_regime_cache_seconds("600") == 600
-    assert normalize_regime_cache_seconds(None) == 300
+def test_the_data_contract_is_fixed_in_code_not_configured() -> None:
+    # The endpoint serves one strategy, so its shape is a constant: three
+    # periods, one answer slot each, a fixed bar count. Nothing an admin edits
+    # can make the EA upload a list the server cannot answer.
+    assert REGIME_PERIODS == ("M15", "H4", "D1")
+    assert len(REGIME_PERIODS) == 3
+    assert REGIME_KLINE_COUNT == 100
 
 
 def _candle(bar: dict):
