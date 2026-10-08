@@ -391,6 +391,35 @@ def create_api_router(
     return router
 
 
+# Keys whose name suggests a credential. The EA needs the strategy settings, not
+# the user's AI key, so anything matching these is left out of the init response.
+_INIT_CONFIG_HIDDEN_MARKERS = ("key", "secret", "password", "token", "authorization")
+
+
+def _mt5_init_config(config: dict[str, object]) -> dict[str, object]:
+    """The deployment settings an EA may see, with the lot normalised.
+
+    The lot is stored under fixed_volume (and lot) by the deployment form while the
+    strategy default calls it fixed_lot; an EA should not have to know all three, so
+    fixed_lot is always present with the effective value.
+    """
+    if not isinstance(config, dict):
+        return {}
+    settings = {
+        str(name): value
+        for name, value in config.items()
+        if not any(marker in str(name).lower() for marker in _INIT_CONFIG_HIDDEN_MARKERS)
+    }
+    for alias in ("fixed_lot", "fixed_volume", "lot"):
+        if config.get(alias) not in (None, ""):
+            try:
+                settings["fixed_lot"] = float(config[alias])
+            except (TypeError, ValueError):
+                pass
+            break
+    return settings
+
+
 def create_mt5_router(
     store: SqliteStore,
     decision_service: DecisionService,
@@ -492,6 +521,7 @@ def create_mt5_router(
                 # unnecessary secondary bars.
                 secondary_timeframes=[],
             ),
+            config=_mt5_init_config(config),
         )
 
     @router.post("/open-decision", response_model=Mt5OpenDecisionResponse)

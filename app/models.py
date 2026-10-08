@@ -203,6 +203,10 @@ class Mt5StrategyInitResponse(StrictModel):
     min_ea_version: float = 1.0
     ea_upgrade_required: bool = False
     strategy: Mt5StrategyInfo
+    # The deployment's own settings, so an EA does not have to hard-code them: the
+    # same keys the strategy uses, with the lot normalised to fixed_lot. Anything
+    # that looks like a credential is left out.
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class Mt5Bar(StrictModel):
