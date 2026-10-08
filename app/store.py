@@ -26,6 +26,63 @@ DEFAULT_API_KEY_RPM = 60
 
 DatabaseIntegrityError = (sqlite3.IntegrityError, MySqlIntegrityError)
 
+# Settings the GL_ARBITRAGE_V1 EA reads from the init response. Only the first
+# lot is a user choice (the client writes it into the deployment config); every
+# other value is managed once in the admin console and then reaches every
+# deployed EA on its next init, which is why they live on the official strategy
+# row rather than on each deployment.
+#
+# The JSON keys keep the EA's own input names on purpose: the EA maps them 1:1
+# without a translation table, so a renamed key would silently fall back to the
+# EA's hardcoded default.
+ARBITRAGE_EA_CONFIG_DEFAULTS: dict[str, Any] = {
+    "fixed_lot": 0.01,  # 初始下单手数（用户可在客户端修改）
+    "addMax": 30,  # 单向最多单数
+    "addNum": 1,  # 加仓系数：初始手数 × (1 + 当前单数 × 系数)
+    "carryStart": 10,  # 盈带亏起始单数，0 = 不带单
+    "carryWin": 500.0,  # 盈带亏留利润（每单）
+    "maxLoss": 0,  # 单向止损金额
+    "step": 0.0004,  # 加仓间隔
+    "stopWin": 0.0006,  # 止盈触发值
+    "stopMove": 0.0003,  # 移动止损值
+    "maStart": 0,  # ma 判断启动数量
+    "maPeriod": 10,  # ma 周期
+}
+
+# Server side extras stored on the same row: they drive the regime endpoint and
+# are ignored by the EA.
+ARBITRAGE_REGIME_CONFIG_DEFAULTS: dict[str, Any] = {
+    "regime_periods": ["H4", "D1"],
+    "regime_kline_count": 100,
+    "regime_cache_seconds": 900,
+}
+
+
+def arbitrage_ea_config_defaults() -> dict[str, Any]:
+    """Fresh copy of the GL_ARBITRAGE_V1 seed config (EA + server side)."""
+    return {
+        "position_sizing_mode": "fixed",
+        **ARBITRAGE_EA_CONFIG_DEFAULTS,
+        **ARBITRAGE_REGIME_CONFIG_DEFAULTS,
+        # A fresh list so a caller mutating the result cannot corrupt the module
+        # level default.
+        "regime_periods": list(ARBITRAGE_REGIME_CONFIG_DEFAULTS["regime_periods"]),
+    }
+
+
+def backfill_arbitrage_config(config: Any) -> dict[str, Any]:
+    """Add any missing arbitrage default to a stored config.
+
+    Only missing keys are filled, so a value an admin already tuned is never
+    overwritten. The seed uses INSERT IGNORE, which leaves existing rows alone,
+    so this is what brings a strategy row created before a new setting existed
+    up to date.
+    """
+    merged = dict(config) if isinstance(config, dict) else {}
+    for key, value in arbitrage_ea_config_defaults().items():
+        merged.setdefault(key, value)
+    return merged
+
 
 class DbRow(dict[str, Any]):
     def __init__(self, columns: list[str], values: tuple[Any, ...]) -> None:
@@ -792,6 +849,36 @@ class SqliteStore:
         self._backfill_ai_cache_stats()
         self._backfill_order_time_summaries()
         self._ensure_existing_users()
+        self._ensure_official_strategy_config_defaults()
+
+    def _ensure_official_strategy_config_defaults(self) -> None:
+        """Fill in newly added official strategy settings on existing rows.
+
+        The seed statements only insert, so a strategy row that already exists
+        keeps its old config. Adding a setting would otherwise never reach an
+        environment that already has the row, which is exactly the case for the
+        live server. Only missing keys are written, so admin tuned values stay.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, default_config_json FROM official_ai_strategies WHERE code = ?",
+                ("GL_ARBITRAGE_V1",),
+            ).fetchone()
+            if not row:
+                return
+            try:
+                current = json.loads(row["default_config_json"] or "{}")
+            except (TypeError, ValueError):
+                current = {}
+            if not isinstance(current, dict):
+                current = {}
+            merged = backfill_arbitrage_config(current)
+            if merged == current:
+                return
+            connection.execute(
+                "UPDATE official_ai_strategies SET default_config_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(merged, ensure_ascii=False), utc_now_iso(), row["id"]),
+            )
 
     def _migrate_sqlite_user_id(self, connection: sqlite3.Connection) -> None:
         table = connection.execute(
@@ -1470,7 +1557,7 @@ class SqliteStore:
                 "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
                 "由 EA 本地执行：行情转向时平掉盈利腿，保留亏损腿并按规则减仓（减带亏）。",
                 "kline", 200, "kline", 200, "bar", 1,
-                json.dumps({"regime_periods": ["H4", "D1"], "regime_kline_count": 100, "regime_cache_seconds": 900}, ensure_ascii=False),
+                json.dumps(arbitrage_ea_config_defaults(), ensure_ascii=False),
                 1, 30, now, now,
             ),
         )
@@ -6960,6 +7047,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_ai_usage_columns()
         self._ensure_mysql_official_strategy_columns()
         self._ensure_mysql_gl_trend_strategy_seed()
+        self._ensure_official_strategy_config_defaults()
         self._ensure_mysql_ai_template_endpoint_seed()
         self._ensure_existing_users()
         self._backfill_ai_usage_monthly_summaries()
@@ -7450,7 +7538,7 @@ class MySQLStore(SqliteStore):
                     "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
                     "由 EA 本地执行：行情转向时平掉盈利腿，保留亏损腿并按规则减仓（减带亏）。",
                     "kline", 200, "kline", 200, "bar", 1,
-                    json.dumps({"regime_periods": ["H4", "D1"], "regime_kline_count": 100, "regime_cache_seconds": 900}, ensure_ascii=False),
+                    json.dumps(arbitrage_ea_config_defaults(), ensure_ascii=False),
                     1, 30, now, now,
                 ),
             )

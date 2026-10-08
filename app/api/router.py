@@ -395,13 +395,26 @@ def create_api_router(
 # the user's AI key, so anything matching these is left out of the init response.
 _INIT_CONFIG_HIDDEN_MARKERS = ("key", "secret", "password", "token", "authorization")
 
+# Strategy codes whose EA takes all of its trading parameters from the init
+# response. For these the official strategy row acts as the shared config every
+# deployed EA reads, so one admin edit reaches all of them. Codes outside this
+# set are unaffected, which keeps older EAs on their existing payload.
+_EA_SERVER_CONFIG_CODES = frozenset({"GL_ARBITRAGE_V1"})
 
-def _mt5_init_config(config: dict[str, object]) -> dict[str, object]:
+
+def _mt5_init_config(
+    config: dict[str, object],
+    *,
+    lot_source: dict[str, object] | None = None,
+) -> dict[str, object]:
     """The deployment settings an EA may see, with the lot normalised.
 
     The lot is stored under fixed_volume (and lot) by the deployment form while the
     strategy default calls it fixed_lot; an EA should not have to know all three, so
     fixed_lot is always present with the effective value.
+
+    lot_source, when given, is consulted first for the lot: it is the deployment's
+    own config, which must win over a strategy default that merely fills a gap.
     """
     if not isinstance(config, dict):
         return {}
@@ -410,13 +423,16 @@ def _mt5_init_config(config: dict[str, object]) -> dict[str, object]:
         for name, value in config.items()
         if not any(marker in str(name).lower() for marker in _INIT_CONFIG_HIDDEN_MARKERS)
     }
-    for alias in ("fixed_lot", "fixed_volume", "lot"):
-        if config.get(alias) not in (None, ""):
-            try:
-                settings["fixed_lot"] = float(config[alias])
-            except (TypeError, ValueError):
-                pass
-            break
+    for source in (lot_source, config):
+        if not isinstance(source, dict):
+            continue
+        for alias in ("fixed_lot", "fixed_volume", "lot"):
+            if source.get(alias) not in (None, ""):
+                try:
+                    settings["fixed_lot"] = float(source[alias])
+                except (TypeError, ValueError):
+                    pass
+                return settings
     return settings
 
 
@@ -495,6 +511,15 @@ def create_mt5_router(
         strategy_summary = config.get("ea_description") or config.get("summary", "")
         if official_strategy is not None:
             strategy_summary = official_strategy["summary"]
+        # Strategies whose EA reads every trading parameter from the server get
+        # the official row's admin managed defaults as a base; the deployment
+        # config still wins, so a user's own lot is not overwritten. Strategies
+        # that are not listed keep the historical behaviour of sending the
+        # deployment config only, so their EAs see exactly what they saw before.
+        ea_config = config
+        if deployment["strategy_code"] in _EA_SERVER_CONFIG_CODES:
+            defaults = official_strategy["default_config"] if official_strategy else {}
+            ea_config = {**(defaults if isinstance(defaults, dict) else {}), **config}
         return Mt5StrategyInitResponse(
             status="ok",
             protocol_version=1.0,
@@ -510,19 +535,19 @@ def create_mt5_router(
                     if access_error is not None
                     else deployment["status"]
                 ),
-                open_data_type=config.get("open_data_type", "kline"),
-                open_kline_count=int(config.get("open_kline_count", 200)),
-                position_data_type=config.get("position_data_type", "kline"),
-                position_kline_count=int(config.get("position_kline_count", 200)),
-                call_mode=config.get("call_mode", "bar"),
-                call_val=float(config.get("call_val", 1)),
+                open_data_type=ea_config.get("open_data_type", "kline"),
+                open_kline_count=int(ea_config.get("open_kline_count", 200)),
+                position_data_type=ea_config.get("position_data_type", "kline"),
+                position_kline_count=int(ea_config.get("position_kline_count", 200)),
+                call_mode=ea_config.get("call_mode", "bar"),
+                call_val=float(ea_config.get("call_val", 1)),
                 # Higher-timeframe data is not currently used by the official
                 # GL Trend strategy. Keep the response field empty for old EAs
                 # that still read it, while stopping new clients from sending
                 # unnecessary secondary bars.
                 secondary_timeframes=[],
             ),
-            config=_mt5_init_config(config),
+            config=_mt5_init_config(ea_config, lot_source=config),
         )
 
     @router.post("/open-decision", response_model=Mt5OpenDecisionResponse)
