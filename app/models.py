@@ -173,6 +173,10 @@ RiskBaseMode = Literal["fixed_loss", "balance_percent"]
 
 class Mt5StrategyInfo(StrictModel):
     id: str
+    # The strategy code (GL_TREND_V1, GL_ARBITRAGE_V1, ...). id identifies the
+    # deployment and name is displayed copy, so neither is something an EA can
+    # reliably branch on; the code is.
+    code: str = ""
     name: str
     summary: str = ""
     status: str

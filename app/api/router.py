@@ -502,6 +502,7 @@ def create_mt5_router(
             ea_upgrade_required=False,
             strategy=Mt5StrategyInfo(
                 id=deployment["id"],
+                code=deployment["strategy_code"],
                 name=strategy_name,
                 summary=strategy_summary,
                 status=(
