@@ -1454,6 +1454,26 @@ class SqliteStore:
                 1, 20, now, now,
             ),
         )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO official_ai_strategies (
+                id, code, name, badge, version, status, summary,
+                open_logic, position_logic, open_data_type, open_kline_count,
+                position_data_type, position_kline_count, call_mode, call_value,
+                default_config_json, enabled, sort, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ofs_gl_arbitrage_v1", "GL_ARBITRAGE_V1", "GL对冲套利策略", "GainLab", "1.0", "active",
+                "单商品对冲套利：双向持仓跟随价格方向，行情转向时平掉盈利腿、保留亏损腿并逐步减仓。"
+                "开平仓由 EA 本地执行，服务端只提供授权与多周期趋势分析。",
+                "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
+                "由 EA 本地执行：行情转向时平掉盈利腿，保留亏损腿并按规则减仓（减带亏）。",
+                "kline", 200, "kline", 200, "bar", 1,
+                json.dumps({"regime_periods": ["H4", "D1"], "regime_kline_count": 100, "regime_cache_seconds": 900}, ensure_ascii=False),
+                1, 30, now, now,
+            ),
+        )
 
     def ensure_demo_deployment(self, raw_key: str) -> None:
         key_hash = hash_deployment_key(raw_key)
@@ -7412,6 +7432,26 @@ class MySQLStore(SqliteStore):
                     "kline", 30, "kline", 30, "bar", 1,
                     json.dumps({"position_sizing_mode": "fixed", "fixed_lot": 0.01, "risk_mode": "fixed_stop_amount", "max_stop_amount": 100, "risk_percent": 1, "max_positions": 4, "allow_add_position": True}, ensure_ascii=False),
                     1, 20, now, now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT IGNORE INTO official_ai_strategies (
+                    id, code, name, badge, version, status, summary,
+                    open_logic, position_logic, open_data_type, open_kline_count,
+                    position_data_type, position_kline_count, call_mode, call_value,
+                    default_config_json, enabled, sort, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    "ofs_gl_arbitrage_v1", "GL_ARBITRAGE_V1", "GL对冲套利策略", "GainLab", "1.0", "active",
+                    "单商品对冲套利：双向持仓跟随价格方向，行情转向时平掉盈利腿、保留亏损腿并逐步减仓。"
+                    "开平仓由 EA 本地执行，服务端只提供授权与多周期趋势分析。",
+                    "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
+                    "由 EA 本地执行：行情转向时平掉盈利腿，保留亏损腿并按规则减仓（减带亏）。",
+                    "kline", 200, "kline", 200, "bar", 1,
+                    json.dumps({"regime_periods": ["H4", "D1"], "regime_kline_count": 100, "regime_cache_seconds": 900}, ensure_ascii=False),
+                    1, 30, now, now,
                 ),
             )
 
