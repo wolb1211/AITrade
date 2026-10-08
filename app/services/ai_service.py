@@ -51,6 +51,10 @@ _VISION_TEST_IMAGE_DATA_URL = (
 class AiCallResult:
     content: dict[str, Any]
     usage: UsageSummary
+    # True when the answer came from the response cache instead of the provider.
+    # Callers that show the result to a user want to say so; the usage row already
+    # records the distinction (provider_called/response_source).
+    cached: bool = False
 
 
 def _cached_input_tokens(usage_payload: dict[str, Any], prompt_tokens: int) -> int:
@@ -1025,6 +1029,46 @@ class AiDecisionClient:
             response_schema=_TURTLE_OPEN_RISK_SCHEMA,
         )
 
+    def market_regime(
+        self,
+        *,
+        deployment: dict[str, Any],
+        symbol: str,
+        periods: dict[str, dict[str, Any]],
+        bid: float = 0.0,
+        ask: float = 0.0,
+        spread: float = 0.0,
+        cache_ttl_seconds: int = 300,
+    ) -> AiCallResult | None:
+        """Ask the model to read the trend of each supplied timeframe.
+
+        The arbitrage EA executes locally, so this is the whole server side of its
+        market opinion: three timeframes, one direction word and one explanation
+        each. It is explicitly a reference - the EA never waits on it to manage a
+        position - which is why the answer is cached longer than a decision and
+        why an unusable answer makes the caller fall back to the server's own bar
+        read instead of failing the request.
+        """
+        return self._chat_json(
+            deployment=deployment,
+            endpoint="regime",
+            system_prompt=_regime_system_prompt(),
+            user_payload={
+                "task": "market_regime",
+                "strategy_name": deployment.get("strategy_name", "GL对冲套利策略"),
+                "symbol": symbol,
+                "bid": bid,
+                "ask": ask,
+                "spread": spread,
+                "periods": periods,
+                "required_json_schema": {
+                    label: {"trend": "bull|bear|range", "detail": "中文 40-120 字"}
+                    for label in periods
+                },
+            },
+            cache_ttl_seconds=cache_ttl_seconds,
+        )
+
     def _chat_with_model_fallback(
         self,
         *,
@@ -1108,6 +1152,7 @@ class AiDecisionClient:
         user_payload: dict[str, Any],
         user_image_url: str = "",
         response_schema: str = "",
+        cache_ttl_seconds: int | None = None,
     ) -> AiCallResult | None:
         model = self._select_model(deployment, endpoint)
         if model is None:
@@ -1177,8 +1222,17 @@ class AiDecisionClient:
                 user_payload=user_payload,
                 model=model,
                 user_image_url=user_image_url,
+                response_schema=response_schema,
                 cache_key=cache_key,
-                cache_ttl_seconds=int(cache_settings.get("ttl_seconds") or 120),
+                # A caller may know better than the global setting how long its
+                # answer stays valid: a regime read on H4/D1 barely moves, so it
+                # is worth keeping far longer than a decision that must react to
+                # the next bar.
+                cache_ttl_seconds=int(
+                    cache_ttl_seconds
+                    if cache_ttl_seconds is not None
+                    else (cache_settings.get("ttl_seconds") or 120)
+                ),
             )
 
     def _chat_json_uncached(
@@ -1509,7 +1563,7 @@ class AiDecisionClient:
             response_source="cache",
             cache_id=str(cached.get("id") or ""),
         )
-        return AiCallResult(content=dict(cached.get("content") or {}), usage=usage)
+        return AiCallResult(content=dict(cached.get("content") or {}), usage=usage, cached=True)
 
     def _save_cache_result(
         self,
@@ -1548,8 +1602,10 @@ class AiDecisionClient:
     def _select_model(self, deployment: dict[str, Any], endpoint: str) -> dict[str, Any] | None:
         config = deployment.get("config") if isinstance(deployment.get("config"), dict) else {}
         # pa_diag is stage 1 of the open flow: it must use the same model the
-        # user configured for opening, not the position model.
-        prefix = "open" if endpoint in {"open", "workflow_open", "pa_diag"} else "position"
+        # user configured for opening, not the position model. regime is the
+        # arbitrage EA's market read: it is an entry-side opinion, so it follows
+        # the open model too.
+        prefix = "open" if endpoint in {"open", "workflow_open", "pa_diag", "regime"} else "position"
         if str(config.get(f"{prefix}_ai_mode") or "official") == "custom":
             base_url = str(config.get(f"{prefix}_ai_base_url") or config.get(f"{prefix}_ai_provider") or "").strip()
             model_name = str(config.get(f"{prefix}_ai_model") or "").strip()
@@ -3436,6 +3492,27 @@ def _json_api_system_prompt(
             "Never copy placeholder text such as cycle, reason, or .... "
             f"Task: {task_prompt}"
         )
+    if endpoint == "regime":
+        return (
+            "Strict JSON API mode. Output exactly one compact JSON object and nothing else. "
+            "Start with { and end with }. No markdown, code fences, prefix, suffix or prose outside JSON. "
+            'Required JSON shape: {"short":{"trend":"bull|bear|range","detail":"Chinese"},'
+            '"mid":{"trend":"bull|bear|range","detail":"Chinese"},'
+            '"long":{"trend":"bull|bear|range","detail":"Chinese"}}. '
+            "Each key is one timeframe, given in the payload under periods.short / periods.mid / periods.long: "
+            "short is the fastest, long is the slowest. "
+            "trend must be exactly one of bull (rising), bear (falling) or range (no direction). "
+            "detail is Chinese, 40-120 characters, and must say what the supplied moving averages, ATR and channel "
+            "position actually show on that timeframe, and whether an existing move is still healthy or stalling. "
+            "Base every sentence on the supplied numbers; never invent a price, an indicator value or a timeframe "
+            "that was not supplied. When a period has no bars or reports timeframe_ready false, answer range for it "
+            "and say in detail that the data was missing. "
+            "When the three timeframes disagree, say so in detail rather than forcing one direction onto all three. "
+            "Never output order instructions, entry or exit prices, lot sizes or trade plans: this is a market read "
+            "for a strategy that trades on its own. "
+            f"{_PLAIN_CHINESE_RULE}"
+            f"Task: {task_prompt}"
+        )
     schema = (
         '{"should_open":false,"direction":null,"confidence":0,'
         '"lot":0,"sl":null,"tp":null,"sl_distance_price":0,"tp_distance_price":0,'
@@ -3622,6 +3699,21 @@ def _cache_fingerprint(payload: Any) -> Any:
     return payload
 
 
+def _regime_system_prompt() -> str:
+    """The task half of the regime prompt; the format half lives in
+    _json_api_system_prompt so the output contract is stated in exactly one
+    place per endpoint."""
+    return (
+        "读一段行情：下面给出同一品种在几个不同周期上的客观指标（均线、ATR、最近区间位置、"
+        "快慢均线差与慢均线斜率，均以 ATR 为单位，另有最近若干根收盘价）。"
+        "请分别判断每个周期的趋势并给出简短中文说明。"
+        "判断要基于给出的数字：均线差扩大且慢均线斜率同向，说明趋势在延续；"
+        "均线差很小或斜率走平，即使价格刚创新高也应判为震荡；"
+        "价格在区间边缘但均线纠缠，说明是区间边界而不是突破。"
+        "各周期结论可以不一致。不要给出任何下单建议。"
+    )
+
+
 def _max_tokens_for_endpoint(endpoint: str) -> int:
     # A ceiling costs nothing on its own: the model still stops when it is
     # finished, so raising it only decides whether an answer that needs room gets
@@ -3632,9 +3724,10 @@ def _max_tokens_for_endpoint(endpoint: str) -> int:
     # accepted by the configured providers.
     if endpoint.startswith("workflow_"):
         return 6000
-    if endpoint in {"open", "position", "pa_diag"}:
+    if endpoint in {"open", "position", "pa_diag", "regime"}:
         # The decision endpoints must never truncate: a half-written JSON object
-        # costs the call and produces nothing usable.
+        # costs the call and produces nothing usable. regime carries three
+        # explanations, so it needs the same room.
         return 6000
     return 1024
 
@@ -3668,6 +3761,9 @@ def _compact_workflow_indicators(indicators: dict[str, Any], *, limit: int) -> d
 _REQUIRED_VERDICT_KEYS: dict[str, tuple[str, ...]] = {
     "open": ("should_open", "allow_open"),
     "position": ("action", "close_now", "allow_add"),
+    # Any period key is enough to read an answer from; the missing ones are
+    # filled in by the server's own bar read.
+    "regime": ("short", "mid", "long"),
 }
 
 
@@ -4055,6 +4151,17 @@ def _fallback_decision(endpoint: str, reason: str) -> dict[str, Any]:
             "direction": None,
             "gates": {},
             "reasoning": reason,
+        }
+    if endpoint == "regime":
+        # A trend read is not an order: the EA has already decided how it trades,
+        # and the only thing wanted here is a direction per timeframe. Saying so
+        # in the object keeps an over-eager model from writing a trade plan. The
+        # unknown words make the caller fall back to its own bar read.
+        return {
+            "short": {"trend": "unknown", "detail": reason},
+            "mid": {"trend": "unknown", "detail": reason},
+            "long": {"trend": "unknown", "detail": reason},
+            "reason": reason,
         }
     if endpoint == "open":
         return {

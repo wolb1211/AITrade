@@ -326,6 +326,59 @@ class Mt5PositionDecisionResponse(StrictModel):
     actions: list[Mt5PositionAction] = Field(default_factory=list, max_length=100)
 
 
+class Mt5RegimeMarket(StrictModel):
+    """The market data a trend read needs.
+
+    Unlike the decision snapshots this is deliberately forgiving: the EA asks for
+    a regime on a timer, and a missing quote must not turn a bar analysis into a
+    validation error. Only the bars matter here.
+    """
+
+    bid: float = Field(default=0, ge=0)
+    ask: float = Field(default=0, ge=0)
+    spread: float = Field(default=0, ge=0)
+    bars: list[Mt5Bar] = Field(default_factory=list, max_length=1000)
+    # Keyed by timeframe, e.g. {"M15": [...], "H4": [...], "D1": [...]}. Which
+    # periods matter is decided by the strategy config and handed to the EA by
+    # the init response.
+    secondary_bars: dict[str, list[Mt5Bar]] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class Mt5RegimeRequest(StrictModel):
+    deployment_key: str = Field(min_length=8, max_length=256)
+    request_id: str | None = Field(default=None, min_length=8, max_length=128)
+    account: AccountIdentity = Field(default_factory=lambda: AccountIdentity(login="unknown"))
+    symbol: str = Field(min_length=1, max_length=32)
+    timeframe: str = Field(default="", max_length=16)
+    market: Mt5RegimeMarket = Field(default_factory=Mt5RegimeMarket)
+
+
+class Mt5RegimePeriod(StrictModel):
+    """One timeframe's verdict: the word the EA compares, plus the reasoning."""
+
+    timeframe: str = ""
+    # bull | bear | range | unknown
+    trend: str = "unknown"
+    detail: str = ""
+
+
+class Mt5RegimeResponse(StrictModel):
+    status: Literal["ok"]
+    symbol: str
+    # short / mid / long, in the order the strategy config lists the periods.
+    short: Mt5RegimePeriod
+    mid: Mt5RegimePeriod
+    long: Mt5RegimePeriod
+    # When the cached answer expires. The EA may ask again sooner, but nothing is
+    # recomputed before this, so a poll loop costs one call per window.
+    valid_until: str = ""
+    cached: bool = False
+    decision_id: str
+    request_id: str
+    description: str = ""
+
+
 class Mt5HistoryOrder(StrictModel):
     model_config = ConfigDict(extra="ignore")
 

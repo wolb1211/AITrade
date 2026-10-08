@@ -50,11 +50,12 @@ ARBITRAGE_EA_CONFIG_DEFAULTS: dict[str, Any] = {
 }
 
 # Server side extras stored on the same row: they drive the regime endpoint and
-# are ignored by the EA.
+# are ignored by the EA. Three periods because the answer has exactly three slots
+# - short, mid, long - and the EA is told this list by the init response.
 ARBITRAGE_REGIME_CONFIG_DEFAULTS: dict[str, Any] = {
-    "regime_periods": ["H4", "D1"],
+    "regime_periods": ["M15", "H4", "D1"],
     "regime_kline_count": 100,
-    "regime_cache_seconds": 900,
+    "regime_cache_seconds": 300,
 }
 
 
@@ -81,6 +82,14 @@ def backfill_arbitrage_config(config: Any) -> dict[str, Any]:
     merged = dict(config) if isinstance(config, dict) else {}
     for key, value in arbitrage_ea_config_defaults().items():
         merged.setdefault(key, value)
+    # regime_periods is the exception to "only fill gaps": the response has one
+    # slot per entry (short, mid, long), so a list written before the third slot
+    # existed describes a read the server cannot produce. Anything that is not
+    # three usable timeframes is restored to the default; a list an admin edited
+    # into three valid periods is left exactly as it is.
+    periods = merged.get("regime_periods")
+    if not isinstance(periods, list) or len(periods) != 3:
+        merged["regime_periods"] = list(ARBITRAGE_REGIME_CONFIG_DEFAULTS["regime_periods"])
     return merged
 
 

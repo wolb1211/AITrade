@@ -178,7 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     application.include_router(create_api_router(store, service))
-    application.include_router(create_mt5_router(store, service))
+    application.include_router(create_mt5_router(store, service, ai_client))
     application.include_router(create_mt5_executions_router(store, service))
     application.include_router(create_admin_ai_router(
         store,

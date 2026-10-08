@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 import hmac
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -32,6 +32,10 @@ from app.models import (
     Mt5PositionAction,
     Mt5PositionDecisionRequest,
     Mt5PositionDecisionResponse,
+    Mt5RegimePeriod,
+    Mt5RegimeRequest,
+    Mt5RegimeResponse,
+    Mt5SecondaryTimeframe,
     Mt5StrategyInfo,
     Mt5StrategyInitRequest,
     Mt5StrategyInitResponse,
@@ -51,6 +55,15 @@ from app.services.auth_service import AuthError, UserAuthService
 from app.services.ai_service import AiDecisionClient
 from app.services.custom_indicators import public_indicator_catalog
 from app.services.custom_workflow import workflow_catalog, workflow_json_schema, workflow_validation_result
+from app.services.regime_service import (
+    REGIME_LABELS,
+    TREND_UNKNOWN,
+    normalize_regime_cache_seconds,
+    normalize_regime_periods,
+    normalize_trend_text,
+    rule_detail,
+    timeframe_features,
+)
 from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
 from app.store import SqliteStore
 from app.strategies import turtle_agent
@@ -401,6 +414,11 @@ _INIT_CONFIG_HIDDEN_MARKERS = ("key", "secret", "password", "token", "authorizat
 # set are unaffected, which keeps older EAs on their existing payload.
 _EA_SERVER_CONFIG_CODES = frozenset({"GL_ARBITRAGE_V1"})
 
+# Strategies whose EA asks for a trend read. Only these are told which timeframes
+# to upload; every other strategy keeps the historical empty list, so no existing
+# EA starts sending bars it has no reason to send.
+_REGIME_STRATEGY_CODES = frozenset({"GL_ARBITRAGE_V1"})
+
 
 def _mt5_init_config(
     config: dict[str, object],
@@ -439,6 +457,7 @@ def _mt5_init_config(
 def create_mt5_router(
     store: SqliteStore,
     decision_service: DecisionService,
+    ai_client: AiDecisionClient | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/mt5/strategy", default_response_class=AsciiJSONResponse)
 
@@ -544,8 +563,16 @@ def create_mt5_router(
                 # Higher-timeframe data is not currently used by the official
                 # GL Trend strategy. Keep the response field empty for old EAs
                 # that still read it, while stopping new clients from sending
-                # unnecessary secondary bars.
-                secondary_timeframes=[],
+                # unnecessary secondary bars. A strategy that does ask for a
+                # trend read is told exactly which periods to upload.
+                secondary_timeframes=(
+                    [
+                        Mt5SecondaryTimeframe(timeframe=timeframe, kline_count=_regime_bar_limit(ea_config.get("regime_kline_count")))
+                        for timeframe in normalize_regime_periods(ea_config.get("regime_periods"))
+                    ]
+                    if deployment["strategy_code"] in _REGIME_STRATEGY_CODES
+                    else []
+                ),
             ),
             config=_mt5_init_config(ea_config, lot_source=config),
         )
@@ -697,6 +724,141 @@ def create_mt5_router(
             positions=request.positions,
             metadata=request.market.metadata,
             cancel_actions=cancel_actions,
+        )
+
+    @router.post("/regime", response_model=Mt5RegimeResponse)
+    def regime(request: Mt5RegimeRequest) -> Mt5RegimeResponse:
+        """Long / mid / short trend read for the arbitrage EA.
+
+        The EA executes every order itself, so this endpoint answers one question
+        and changes nothing: what are the higher timeframes doing. It is an
+        opinion the EA consults, never a gate it must pass, so an unusable AI
+        answer degrades to the server's own bar read instead of failing.
+        """
+        request_id = _regime_request_id(request)
+        deployment = store.find_deployment_by_key(request.deployment_key)
+        access_error = "invalid_deployment_key" if deployment is None else decision_service.deployment_access_error(deployment)
+        if access_error is None:
+            deployment, access_error = _mt5_validate_deployment_account(
+                store, deployment, request.deployment_key, request.account,
+            )
+        if access_error is not None:
+            return _mt5_regime_error_response(request, request_id, access_error)
+        store.record_deployment_activity(
+            deployment["id"],
+            strategy_code=deployment["strategy_code"],
+            event_type="regime",
+        )
+
+        official_strategy = store.get_official_ai_strategy(deployment["strategy_code"])
+        strategy_config = official_strategy["default_config"] if official_strategy else {}
+        if not isinstance(strategy_config, dict):
+            strategy_config = {}
+        periods = normalize_regime_periods(strategy_config.get("regime_periods"))
+        cache_seconds = normalize_regime_cache_seconds(strategy_config.get("regime_cache_seconds"))
+        bar_limit = _regime_bar_limit(strategy_config.get("regime_kline_count"))
+
+        timeframe_candles = _secondary_candles(request.market.secondary_bars)
+        # The EA is expected to send the short period in the ordinary bars list,
+        # because that is the chart it is attached to. Accepting it there means a
+        # caller that never learned about secondary_bars still gets a full read.
+        chart_timeframe = str(request.timeframe or "").strip().upper()
+        if chart_timeframe and chart_timeframe not in timeframe_candles and request.market.bars:
+            timeframe_candles[chart_timeframe] = _candles(request.market.bars)
+
+        labels = REGIME_LABELS
+        features_by_label: dict[str, dict[str, Any]] = {}
+        timeframes_by_label: dict[str, str] = {}
+        missing: list[str] = []
+        for index, label in enumerate(labels):
+            timeframe = periods[index] if index < len(periods) else ""
+            candles = timeframe_candles.get(timeframe, []) if timeframe else []
+            if len(candles) > bar_limit:
+                candles = candles[-bar_limit:]
+            timeframes_by_label[label] = timeframe
+            features_by_label[label] = timeframe_features(candles) if timeframe else {}
+            if not timeframe:
+                missing.append(label)
+            elif not features_by_label[label].get("timeframe_ready"):
+                # Not enough bars to say anything honest: the AI is told the same
+                # thing through timeframe_ready, and the rule read reports it.
+                missing.append(timeframe)
+
+        ai_payload_periods: dict[str, dict[str, Any]] = {}
+        for label in labels:
+            timeframe = timeframes_by_label[label]
+            if not timeframe:
+                continue
+            ai_payload_periods[label] = {
+                "timeframe": timeframe,
+                "features": features_by_label[label],
+            }
+
+        ai_content: dict[str, Any] = {}
+        cached = False
+        if ai_client is not None and ai_payload_periods:
+            try:
+                result = ai_client.market_regime(
+                    deployment=deployment,
+                    symbol=request.symbol,
+                    periods=ai_payload_periods,
+                    bid=request.market.bid,
+                    ask=request.market.ask,
+                    spread=request.market.spread,
+                    cache_ttl_seconds=cache_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 - a market read must never fail the EA
+                logger.warning("regime AI call failed: %s: %s", type(exc).__name__, exc)
+                result = None
+            if result is not None and isinstance(result.content, dict):
+                ai_content = result.content
+                cached = bool(getattr(result, "cached", False))
+
+        results: dict[str, Mt5RegimePeriod] = {}
+        ai_usable = False
+        for label in labels:
+            timeframe = timeframes_by_label[label]
+            features = features_by_label[label]
+            ai_period = ai_content.get(label)
+            ai_period = ai_period if isinstance(ai_period, dict) else {}
+            trend = normalize_trend_text(ai_period.get("trend"))
+            detail = str(ai_period.get("detail") or "").strip()
+            if trend == TREND_UNKNOWN:
+                # The AI said nothing usable for this timeframe: fall back to the
+                # deterministic read rather than reporting an empty trend. The
+                # detail is discarded too - the service writes its own apology
+                # into that field when a call fails, and showing "AI调用失败" as
+                # the market explanation reads like a market call.
+                trend = str(features.get("rule_trend") or TREND_UNKNOWN)
+                detail = ""
+            else:
+                ai_usable = True
+            if not detail:
+                detail = rule_detail(features)
+            results[label] = Mt5RegimePeriod(timeframe=timeframe, trend=trend, detail=detail)
+
+        description = "已按策略配置的周期给出长中短趋势，仅供参考。"
+        if missing:
+            description = (
+                f"以下周期缺少K线数据：{'、'.join(missing)}；"
+                "请在 market.secondary_bars 里补上，否则该周期只能判为震荡。"
+            )
+        if not ai_usable:
+            description = f"{description} 本次未取得AI分析，结果来自服务端规则计算。"
+        valid_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=cache_seconds)
+        ).isoformat()
+        return Mt5RegimeResponse(
+            status="ok",
+            symbol=request.symbol.upper(),
+            short=results["short"],
+            mid=results["mid"],
+            long=results["long"],
+            valid_until=valid_until,
+            cached=cached,
+            decision_id=f"regime_{request_id[:48]}",
+            request_id=request_id,
+            description=description,
         )
 
     return router
@@ -1635,6 +1797,59 @@ def _request_id(
         ],
     )
     return f"{source_id[:48]}_{sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _regime_request_id(request: Mt5RegimeRequest) -> str:
+    """Stable id for one regime read, so a repeated poll reuses one usage row."""
+    raw = "|".join(
+        [
+            "regime",
+            request.deployment_key,
+            request.request_id or "auto",
+            request.account.login,
+            request.symbol.upper(),
+            request.timeframe.upper(),
+        ]
+    )
+    source_id = request.request_id or "auto"
+    return f"{source_id[:48]}_{sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _regime_bar_limit(value: object) -> int:
+    """How many bars of each period are used, as configured on the strategy."""
+    try:
+        limit = int(float(value))
+    except (TypeError, ValueError):
+        return 100
+    return max(30, min(1000, limit))
+
+
+def _mt5_regime_error_response(
+    request: Mt5RegimeRequest,
+    request_id: str,
+    error_code: str,
+) -> Mt5RegimeResponse:
+    """Answer a rejected call with an unusable read instead of an HTTP error.
+
+    The EA polls this endpoint on a timer. A 4xx would make it retry and log a
+    protocol failure for something the panel can simply show - an expired VIP, a
+    stopped key - so the refusal travels as a description beside an empty trend,
+    exactly like the decision endpoints do.
+    """
+    description = _mt5_business_error_description(error_code)
+    unknown = Mt5RegimePeriod(trend=TREND_UNKNOWN, detail=description)
+    return Mt5RegimeResponse(
+        status="ok",
+        symbol=request.symbol.upper(),
+        short=unknown.model_copy(deep=True),
+        mid=unknown.model_copy(deep=True),
+        long=unknown.model_copy(deep=True),
+        valid_until="",
+        cached=False,
+        decision_id=f"regime_{request_id[:48]}",
+        request_id=request_id,
+        description=description,
+    )
 
 
 def _bar_timestamp(bar: Mt5Bar, fallback: int) -> int:
