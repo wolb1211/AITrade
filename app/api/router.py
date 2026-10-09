@@ -855,7 +855,7 @@ def create_mt5_router(
                 detail = rule_detail(features)
             results[label] = Mt5RegimePeriod(timeframe=timeframe, trend=trend, detail=detail)
 
-        description = "已按策略配置的周期给出长中短趋势，仅供参考。"
+        description = f"已按 {' / '.join(periods)} 给出短中长趋势判断，仅供参考。"
         if missing:
             description = (
                 f"以下周期缺少K线数据：{'、'.join(missing)}；"
