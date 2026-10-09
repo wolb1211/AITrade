@@ -193,7 +193,11 @@ def test_regime_answers_from_rules_when_no_ai_is_configured(tmp_path: Path) -> N
         assert body["short"]["detail"]
 
 
-def test_regime_returns_the_ai_read_when_it_is_usable(tmp_path: Path) -> None:
+def test_the_request_is_answered_without_waiting_for_the_ai(tmp_path: Path) -> None:
+    # This is the whole point of the design. An AI read takes tens of seconds and
+    # the MT5 WebRequest carrying the request gives up long before that, so the
+    # first call is answered from the server's own bar read while the AI read is
+    # computed behind it, and the next call picks that up.
     app = _app(tmp_path, "regime-ai.db")
     calls: list[dict] = []
 
@@ -214,21 +218,26 @@ def test_regime_returns_the_ai_read_when_it_is_usable(tmp_path: Path) -> None:
         original = ai_service.AiDecisionClient._post_chat_completion
         ai_service.AiDecisionClient._post_chat_completion = lambda self, **kwargs: fake_provider(**kwargs)
         try:
-            response = client.post("/mt5/strategy/regime", json=_payload(
-                "gl_regime_ai", {"M15": _bars(UP), "H4": _bars(FLAT), "D1": _bars(UP)},
-            ))
+            payload = _payload("gl_regime_ai", {"M15": _bars(UP), "H4": _bars(FLAT), "D1": _bars(UP)})
+            first = client.post("/mt5/strategy/regime", json=payload).json()
+            second = client.post("/mt5/strategy/regime", json=payload).json()
         finally:
             ai_service.AiDecisionClient._post_chat_completion = original
 
-        body = response.json()
-        assert response.status_code == 200, response.text
+        # First answer: the server's own read, produced while the AI was still out.
+        assert first["cached"] is False
+        assert "未取得AI分析" in first["description"]
+        assert first["short"]["trend"] == "bull"
         assert len(calls) == 1
+
+        # Second answer: the AI read, served instantly from the stored snapshot.
+        assert second["cached"] is True
+        assert second["evaluated_at"]
         # The Chinese word is folded onto the value the EA compares.
-        assert body["short"]["trend"] == "bull"
-        assert body["short"]["detail"] == "短周期均线向上。"
-        assert body["mid"]["trend"] == "range"
-        assert body["long"]["trend"] == "bull"
-        assert body["cached"] is False
+        assert second["short"]["trend"] == "bull"
+        assert second["short"]["detail"] == "短周期均线向上。"
+        assert second["mid"]["trend"] == "range"
+        assert second["long"]["trend"] == "bull"
 
 
 def test_regime_keeps_the_rule_read_when_the_ai_answer_is_unusable(tmp_path: Path) -> None:
@@ -246,18 +255,17 @@ def test_regime_keeps_the_rule_read_when_the_ai_answer_is_unusable(tmp_path: Pat
             "short": {"trend": "???", "detail": ""},
         })
         try:
-            response = client.post("/mt5/strategy/regime", json=_payload(
-                "gl_regime_bad_ai", {"M15": _bars(UP), "H4": _bars(UP), "D1": _bars(UP)},
-            ))
+            payload = _payload("gl_regime_bad_ai", {"M15": _bars(UP), "H4": _bars(UP), "D1": _bars(UP)})
+            client.post("/mt5/strategy/regime", json=payload)
+            body = client.post("/mt5/strategy/regime", json=payload).json()
         finally:
             ai_service.AiDecisionClient._post_chat_completion = original
 
-        body = response.json()
-        assert response.status_code == 200, response.text
         assert body["short"]["trend"] == "bull"
         assert body["mid"]["trend"] == "bull"
         assert body["long"]["trend"] == "bull"
         assert body["short"]["detail"] != ""
+        assert "未取得AI分析" in body["description"]
 
 
 def test_regime_survives_a_provider_failure(tmp_path: Path) -> None:
@@ -275,14 +283,14 @@ def test_regime_survives_a_provider_failure(tmp_path: Path) -> None:
         original = ai_service.AiDecisionClient._post_chat_completion
         ai_service.AiDecisionClient._post_chat_completion = explode
         try:
-            response = client.post("/mt5/strategy/regime", json=_payload(
-                "gl_regime_ai_down", {"M15": _bars(UP), "H4": _bars(FLAT), "D1": _bars(DOWN)},
-            ))
+            payload = _payload("gl_regime_ai_down", {"M15": _bars(UP), "H4": _bars(FLAT), "D1": _bars(DOWN)})
+            response = client.post("/mt5/strategy/regime", json=payload)
+            body = client.post("/mt5/strategy/regime", json=payload).json()
         finally:
             ai_service.AiDecisionClient._post_chat_completion = original
 
+        # The client still gets a usable answer both times.
         assert response.status_code == 200, response.text
-        body = response.json()
         assert body["short"]["trend"] == "bull"
         assert body["long"]["trend"] == "bear"
         assert "未取得AI分析" in body["description"]
@@ -312,14 +320,17 @@ def test_regime_reuses_one_answer_inside_the_cache_window(tmp_path: Path) -> Non
             payload = _payload("gl_regime_cache", {"M15": _bars(UP), "H4": _bars(UP), "D1": _bars(UP)})
             first = client.post("/mt5/strategy/regime", json=payload).json()
             second = client.post("/mt5/strategy/regime", json=payload).json()
+            third = client.post("/mt5/strategy/regime", json=payload).json()
         finally:
             ai_service.AiDecisionClient._post_chat_completion = original
 
         assert first["cached"] is False
         assert second["cached"] is True
-        # One paid call, two answered polls.
+        assert third["cached"] is True
+        # One paid call answers every poll inside the window.
         assert len(calls) == 1
         assert second["short"]["trend"] == "bull"
+        assert third["evaluated_at"] == second["evaluated_at"]
 
 
 def test_regime_reports_the_periods_the_ea_did_not_upload(tmp_path: Path) -> None:

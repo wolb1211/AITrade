@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
 from app.models import (
@@ -60,6 +60,8 @@ from app.services.regime_service import (
     REGIME_KLINE_COUNT,
     REGIME_LABELS,
     REGIME_PERIODS,
+    REGIME_REFRESH_SECONDS,
+    REGIME_SNAPSHOT_TTL_SECONDS,
     TREND_UNKNOWN,
     normalize_trend_text,
     rule_detail,
@@ -749,13 +751,17 @@ def create_mt5_router(
         )
 
     @router.post("/regime", response_model=Mt5RegimeResponse)
-    def regime(request: Mt5RegimeRequest) -> Mt5RegimeResponse:
+    def regime(request: Mt5RegimeRequest, background: BackgroundTasks) -> Mt5RegimeResponse:
         """Long / mid / short trend read for the arbitrage EA.
 
         The EA executes every order itself, so this endpoint answers one question
-        and changes nothing: what are the higher timeframes doing. It is an
-        opinion the EA consults, never a gate it must pass, so an unusable AI
-        answer degrades to the server's own bar read instead of failing.
+        and changes nothing: what are the higher timeframes doing.
+
+        It never waits for the AI. A model call takes tens of seconds, and the MT5
+        WebRequest that carries it gives up long before that, so the request is
+        answered from the last completed read - or from the server's own bar read
+        when there is none yet - and a fresh AI read is computed in the background
+        for the next poll. `evaluated_at` says how old the answer is.
         """
         request_id = _regime_request_id(request)
         deployment = store.find_deployment_by_key(request.deployment_key)
@@ -773,8 +779,8 @@ def create_mt5_router(
         )
 
         periods = list(REGIME_PERIODS)
-        cache_seconds = REGIME_CACHE_SECONDS
         bar_limit = REGIME_KLINE_COUNT
+        labels = REGIME_LABELS
 
         timeframe_candles = _secondary_candles(request.market.secondary_bars)
         # The EA is expected to send the short period in the ordinary bars list,
@@ -784,7 +790,6 @@ def create_mt5_router(
         if chart_timeframe and chart_timeframe not in timeframe_candles and request.market.bars:
             timeframe_candles[chart_timeframe] = _candles(request.market.bars)
 
-        labels = REGIME_LABELS
         features_by_label: dict[str, dict[str, Any]] = {}
         timeframes_by_label: dict[str, str] = {}
         missing: list[str] = []
@@ -802,81 +807,62 @@ def create_mt5_router(
                 # thing through timeframe_ready, and the rule read reports it.
                 missing.append(timeframe)
 
-        ai_payload_periods: dict[str, dict[str, Any]] = {}
-        for label in labels:
-            timeframe = timeframes_by_label[label]
-            if not timeframe:
-                continue
-            ai_payload_periods[label] = {
-                "timeframe": timeframe,
-                "features": features_by_label[label],
-            }
+        ai_payload_periods = {
+            label: {"timeframe": timeframes_by_label[label], "features": features_by_label[label]}
+            for label in labels
+            if timeframes_by_label[label]
+        }
 
-        ai_content: dict[str, Any] = {}
-        cached = False
-        if ai_client is not None and ai_payload_periods:
-            try:
-                result = ai_client.market_regime(
-                    deployment=deployment,
-                    symbol=request.symbol,
-                    periods=ai_payload_periods,
-                    bid=request.market.bid,
-                    ask=request.market.ask,
-                    spread=request.market.spread,
-                    cache_ttl_seconds=cache_seconds,
-                )
-            except Exception as exc:  # noqa: BLE001 - a market read must never fail the EA
-                logger.warning("regime AI call failed: %s: %s", type(exc).__name__, exc)
-                result = None
-            if result is not None and isinstance(result.content, dict):
-                ai_content = result.content
-                cached = bool(getattr(result, "cached", False))
-
-        results: dict[str, Mt5RegimePeriod] = {}
-        ai_usable = False
-        for label in labels:
-            timeframe = timeframes_by_label[label]
-            features = features_by_label[label]
-            ai_period = ai_content.get(label)
-            ai_period = ai_period if isinstance(ai_period, dict) else {}
-            trend = normalize_trend_text(ai_period.get("trend"))
-            detail = str(ai_period.get("detail") or "").strip()
-            if trend == TREND_UNKNOWN:
-                # The AI said nothing usable for this timeframe: fall back to the
-                # deterministic read rather than reporting an empty trend. The
-                # detail is discarded too - the service writes its own apology
-                # into that field when a call fails, and showing "AI调用失败" as
-                # the market explanation reads like a market call.
-                trend = str(features.get("rule_trend") or TREND_UNKNOWN)
-                detail = ""
-            else:
-                ai_usable = True
-            if not detail:
-                detail = rule_detail(features)
-            results[label] = Mt5RegimePeriod(timeframe=timeframe, trend=trend, detail=detail)
-
-        description = f"已按 {' / '.join(periods)} 给出短中长趋势判断，仅供参考。"
-        if missing:
-            description = (
-                f"以下周期缺少K线数据：{'、'.join(missing)}；"
-                "请在 market.secondary_bars 里补上，否则该周期只能判为震荡。"
+        snapshot_key = _regime_snapshot_key(deployment["strategy_code"], request.symbol)
+        stored = _stored_regime_read(store, snapshot_key) if ai_client is not None else {}
+        stored_at = str(stored.get("evaluated_at") or "")
+        if ai_client is not None and ai_payload_periods and not _regime_read_is_fresh(stored_at):
+            background.add_task(
+                _refresh_regime_read,
+                store=store,
+                ai_client=ai_client,
+                deployment=deployment,
+                symbol=request.symbol,
+                ai_periods=ai_payload_periods,
+                bid=request.market.bid,
+                ask=request.market.ask,
+                spread=request.market.spread,
+                snapshot_key=snapshot_key,
+                missing=missing,
+                use_ai=True,
             )
-        if not ai_usable:
-            description = f"{description} 本次未取得AI分析，结果来自服务端规则计算。"
+
+        if stored:
+            read = stored
+            cached = True
+        else:
+            # Nothing computed yet: answer now from the bars the EA just sent and
+            # let the background task fill in the AI opinion for the next poll.
+            read = _regime_read(
+                features_by_label=features_by_label,
+                timeframes_by_label=timeframes_by_label,
+                periods=periods,
+                missing=missing,
+                ai_content={},
+                evaluated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            cached = False
+
         valid_until = (
-            datetime.now(timezone.utc) + timedelta(seconds=cache_seconds)
+            datetime.now(timezone.utc) + timedelta(seconds=REGIME_CACHE_SECONDS)
         ).isoformat()
         return Mt5RegimeResponse(
             status="ok",
             symbol=request.symbol.upper(),
-            short=results["short"],
-            mid=results["mid"],
-            long=results["long"],
+            short=Mt5RegimePeriod(**read["short"]),
+            mid=Mt5RegimePeriod(**read["mid"]),
+            long=Mt5RegimePeriod(**read["long"]),
             valid_until=valid_until,
             cached=cached,
+            evaluated_at=read.get("evaluated_at", ""),
             decision_id=f"regime_{request_id[:48]}",
             request_id=request_id,
-            description=description,
+            description=read.get("description", ""),
         )
 
     return router
@@ -1831,6 +1817,164 @@ def _regime_request_id(request: Mt5RegimeRequest) -> str:
     )
     source_id = request.request_id or "auto"
     return f"{source_id[:48]}_{sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _regime_snapshot_key(strategy_code: str, symbol: str) -> str:
+    """Where the last completed trend read for one instrument is kept.
+
+    Deliberately not keyed by deployment: several EAs of the same strategy on the
+    same symbol are asking the same question, and one paid read can answer all of
+    them. It is also not keyed by the uploaded bars, because the point of the key
+    is to survive the bars changing - that is what makes an instant answer
+    possible while a new read is computed behind it.
+    """
+    return f"regime-snapshot:{str(strategy_code or '').strip().upper()}:{str(symbol or '').strip().upper()}"
+
+
+def _stored_regime_read(store: SqliteStore, snapshot_key: str) -> dict[str, Any]:
+    cached = store.get_ai_response_cache(snapshot_key)
+    content = cached.get("content") if isinstance(cached, dict) else None
+    if not isinstance(content, dict) or not content.get("short"):
+        return {}
+    return {
+        label: dict(content.get(label) or {}) if isinstance(content.get(label), dict) else {}
+        for label in REGIME_LABELS
+    } | {
+        "evaluated_at": str(content.get("evaluated_at") or ""),
+        "description": str(content.get("description") or ""),
+    }
+
+
+def _regime_read_is_fresh(evaluated_at: str) -> bool:
+    """Whether a stored read is young enough to serve without recomputing."""
+    if not evaluated_at:
+        return False
+    try:
+        evaluated = datetime.fromisoformat(evaluated_at)
+    except (TypeError, ValueError):
+        return False
+    if evaluated.tzinfo is None:
+        evaluated = evaluated.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - evaluated).total_seconds() < REGIME_REFRESH_SECONDS
+
+
+def _regime_read(
+    *,
+    features_by_label: dict[str, dict[str, Any]],
+    timeframes_by_label: dict[str, str],
+    periods: list[str],
+    missing: list[str],
+    ai_content: dict[str, Any],
+    evaluated_at: str,
+) -> dict[str, Any]:
+    """Turn the AI answer and the server's own bar read into one complete result.
+
+    Each timeframe is decided independently: a usable AI verdict wins, and a
+    missing or unreadable one falls back to the deterministic read. The service
+    writes its own apology into detail when a call fails, so an unusable verdict
+    discards that text too - showing "AI调用失败" as the market explanation reads
+    like a market call.
+    """
+    read: dict[str, Any] = {}
+    ai_usable = False
+    for label in REGIME_LABELS:
+        timeframe = timeframes_by_label.get(label, "")
+        features = features_by_label.get(label, {})
+        ai_period = ai_content.get(label)
+        ai_period = ai_period if isinstance(ai_period, dict) else {}
+        trend = normalize_trend_text(ai_period.get("trend"))
+        detail = str(ai_period.get("detail") or "").strip()
+        if trend == TREND_UNKNOWN:
+            trend = str(features.get("rule_trend") or TREND_UNKNOWN)
+            detail = ""
+        else:
+            ai_usable = True
+        if not detail:
+            detail = rule_detail(features)
+        read[label] = {"timeframe": timeframe, "trend": trend, "detail": detail}
+
+    description = f"已按 {' / '.join(periods)} 给出短中长趋势判断，仅供参考。"
+    if missing:
+        description = (
+            f"以下周期缺少K线数据：{'、'.join(missing)}；"
+            "请在 market.secondary_bars 里补上，否则该周期只能判为震荡。"
+        )
+    if not ai_usable:
+        description = f"{description} 本次未取得AI分析，结果来自服务端规则计算。"
+    read["description"] = description
+    read["evaluated_at"] = evaluated_at
+    return read
+
+
+def _refresh_regime_read(
+    *,
+    store: SqliteStore,
+    ai_client: AiDecisionClient,
+    deployment: dict[str, Any],
+    symbol: str,
+    ai_periods: dict[str, dict[str, Any]],
+    bid: float,
+    ask: float,
+    spread: float,
+    snapshot_key: str,
+    missing: list[str],
+    use_ai: bool,
+) -> None:
+    """Compute a trend read off the request path and store it for the next poll.
+
+    Runs after the response has been sent. A failure is logged and nothing else:
+    the EA already has its answer, and the request that triggered this one was
+    answered from the previous read.
+    """
+    ai_content: dict[str, Any] = {}
+    if use_ai:
+        try:
+            result = ai_client.market_regime(
+                deployment=deployment,
+                symbol=symbol,
+                periods=ai_periods,
+                bid=bid,
+                ask=ask,
+                spread=spread,
+                cache_ttl_seconds=REGIME_CACHE_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - a market read must never break the next call
+            logger.warning("regime AI call failed: %s: %s", type(exc).__name__, exc)
+            result = None
+        if result is not None and isinstance(result.content, dict):
+            ai_content = result.content
+
+    features_by_label = {
+        label: dict(period.get("features") or {}) for label, period in ai_periods.items()
+    }
+    timeframes_by_label = {
+        label: str(period.get("timeframe") or "") for label, period in ai_periods.items()
+    }
+    read = _regime_read(
+        features_by_label=features_by_label,
+        timeframes_by_label=timeframes_by_label,
+        periods=list(REGIME_PERIODS),
+        missing=list(missing),
+        ai_content=ai_content,
+        evaluated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    try:
+        store.save_ai_response_cache(
+            {
+                "cache_key": snapshot_key,
+                "endpoint": "regime",
+                "provider_id": "",
+                "model_id": "",
+                "content": read,
+                "response_preview": str(read.get("description") or "")[:200],
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            },
+            ttl_seconds=REGIME_SNAPSHOT_TTL_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - a cache write must never surface
+        logger.warning("regime snapshot not stored: %s: %s", type(exc).__name__, exc)
 
 
 def _mt5_regime_error_response(

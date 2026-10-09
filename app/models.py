@@ -377,10 +377,16 @@ class Mt5RegimeResponse(StrictModel):
     short: Mt5RegimePeriod
     mid: Mt5RegimePeriod
     long: Mt5RegimePeriod
-    # When the cached answer expires. The EA may ask again sooner, but nothing is
-    # recomputed before this, so a poll loop costs one call per window.
+    # When the served answer stops being considered current and a new one starts
+    # being computed for the next poll.
     valid_until: str = ""
+    # True when the answer was served from the last completed read instead of
+    # being computed for this request. That is the normal case: the endpoint never
+    # waits for the AI, because the MT5 WebRequest carrying it gives up long
+    # before a model call returns.
     cached: bool = False
+    # When this read was computed. Populated even for a rule-only read.
+    evaluated_at: str = ""
     decision_id: str
     request_id: str
     description: str = ""

@@ -43,11 +43,18 @@ REGIME_LABELS: tuple[str, ...] = ("short", "mid", "long")
 # timeframes say whether it is fighting a one-way market.
 REGIME_PERIODS: tuple[str, ...] = ("M15", "H4", "D1")
 
-# Bars used per timeframe, and how long one answer stays valid. 100 bars covers a
-# 30 period average with context and is what the EA is asked to upload. The five
-# minute window mainly lets several EAs on the same symbol share one paid call.
+# Bars used per timeframe. 100 covers a 30 period average with context and is what
+# the EA is asked to upload.
 REGIME_KLINE_COUNT = 100
+
+# How long a stored read is served before a new one is computed, and how long the
+# last read is kept at all. The window is a cost control, not a latency one: an AI
+# call takes tens of seconds and the MT5 WebRequest carrying it gives up long
+# before that, so the request is always answered from the last completed read and
+# the next poll picks up the new one.
 REGIME_CACHE_SECONDS = 300
+REGIME_REFRESH_SECONDS = 300
+REGIME_SNAPSHOT_TTL_SECONDS = 3600
 
 # The only timeframe keys that may appear as a secondary timeframe.
 ALLOWED_REGIME_TIMEFRAMES = frozenset({"M1", "M5", "M15", "M30", "H1", "H4", "D1"})
