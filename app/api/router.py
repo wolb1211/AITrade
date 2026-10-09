@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
 from app.models import (
@@ -751,18 +751,25 @@ def create_mt5_router(
         )
 
     @router.post("/regime", response_model=Mt5RegimeResponse)
-    def regime(request: Mt5RegimeRequest, background: BackgroundTasks) -> Mt5RegimeResponse:
+    def regime(
+        request: Mt5RegimeRequest,
+        background: BackgroundTasks,
+        response: Response,
+    ) -> Mt5RegimeResponse:
         """Long / mid / short trend read for the arbitrage EA.
 
         The EA executes every order itself, so this endpoint answers one question
         and changes nothing: what are the higher timeframes doing.
 
-        It never waits for the AI. A model call takes tens of seconds, and the MT5
-        WebRequest that carries it gives up long before that, so the request is
-        answered from the last completed read - or from the server's own bar read
-        when there is none yet - and a fresh AI read is computed in the background
-        for the next poll. `evaluated_at` says how old the answer is.
+        It never waits for the AI. A model call takes seconds to tens of seconds,
+        and the MT5 WebRequest that carries it gives up long before that, so the
+        request is answered from the last completed read - or from the server's own
+        bar read when there is none yet - and a fresh AI read is computed in the
+        background for the next poll. `evaluated_at` says how old the answer is,
+        and the x-regime-ms response header reports the server side duration so a
+        client log can tell a slow server from a local timeout.
         """
+        started = time.perf_counter()
         request_id = _regime_request_id(request)
         deployment = store.find_deployment_by_key(request.deployment_key)
         access_error = "invalid_deployment_key" if deployment is None else decision_service.deployment_access_error(deployment)
@@ -851,6 +858,20 @@ def create_mt5_router(
         valid_until = (
             datetime.now(timezone.utc) + timedelta(seconds=REGIME_CACHE_SECONDS)
         ).isoformat()
+        elapsed_ms = max(1, round((time.perf_counter() - started) * 1000))
+        # Reported in a header as well as the log: an MT5 client can print the
+        # headers it received, which separates "the server was slow" from "the
+        # terminal gave up before the response came back".
+        response.headers["x-regime-ms"] = str(elapsed_ms)
+        logger.info(
+            "regime %s %s bars=%s cached=%s elapsed=%dms evaluated_at=%s",
+            deployment["strategy_code"],
+            request.symbol.upper(),
+            {name: len(candles) for name, candles in timeframe_candles.items()},
+            cached,
+            elapsed_ms,
+            read.get("evaluated_at", ""),
+        )
         return Mt5RegimeResponse(
             status="ok",
             symbol=request.symbol.upper(),
