@@ -329,23 +329,30 @@ class Mt5PositionDecisionResponse(StrictModel):
 class Mt5RegimeMarket(StrictModel):
     """The market data a trend read needs.
 
-    Unlike the decision snapshots this is deliberately forgiving: the EA asks for
-    a regime on a timer, and a missing quote must not turn a bar analysis into a
-    validation error. Only the bars matter here.
+    Extra keys are ignored rather than rejected. The EA builds one market snapshot
+    and reuses it, so a payload written for open-decision arrives here carrying
+    data_type, balance, equity and the screenshot fields. None of it is read, and
+    refusing it would only force the EA to keep two request shapes in step.
     """
+
+    model_config = ConfigDict(extra="ignore")
 
     bid: float = Field(default=0, ge=0)
     ask: float = Field(default=0, ge=0)
     spread: float = Field(default=0, ge=0)
     bars: list[Mt5Bar] = Field(default_factory=list, max_length=1000)
     # Keyed by timeframe, e.g. {"M15": [...], "H4": [...], "D1": [...]}. Which
-    # periods matter is decided by the strategy config and handed to the EA by
-    # the init response.
+    # periods matter is fixed by the server and handed to the EA by the init
+    # response.
     secondary_bars: dict[str, list[Mt5Bar]] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Mt5RegimeRequest(StrictModel):
+    """Same tolerance as the market block: the EA may post its whole open payload."""
+
+    model_config = ConfigDict(extra="ignore")
+
     deployment_key: str = Field(min_length=8, max_length=256)
     request_id: str | None = Field(default=None, min_length=8, max_length=128)
     account: AccountIdentity = Field(default_factory=lambda: AccountIdentity(login="unknown"))

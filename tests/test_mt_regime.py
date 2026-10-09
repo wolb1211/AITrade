@@ -339,6 +339,34 @@ def test_regime_reports_the_periods_the_ea_did_not_upload(tmp_path: Path) -> Non
         assert body["mid"]["detail"]
 
 
+def test_regime_accepts_the_payload_the_ea_already_sends_open(tmp_path: Path) -> None:
+    # The EA builds one request body and posts it to both endpoints. Fields the
+    # trend read does not use (data_type, balance, equity, the screenshot slots)
+    # must be ignored, not rejected: a 422 here would make the EA keep two shapes
+    # in step for no reason.
+    app = _app(tmp_path, "regime-open-shape.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        _deploy(store, "gl_regime_open_shape", _vip_user(store))
+
+        payload = _payload(
+            "gl_regime_open_shape", {"M15": _bars(UP), "H4": _bars(UP), "D1": _bars(DOWN)},
+        )
+        payload.update({"data_type": "kline", "balance": 1000.0, "equity": 1000.0})
+        payload["market"].update({
+            "screenshot": None,
+            "screenshot_id": None,
+            "metadata": {"contract_size": 100, "point": 0.01},
+        })
+
+        response = client.post("/mt5/strategy/regime", json=payload)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["short"]["trend"] == "bull"
+        assert body["long"]["trend"] == "bear"
+
+
 def test_regime_refuses_an_unknown_key_without_an_http_error(tmp_path: Path) -> None:
     app = _app(tmp_path, "regime-bad-key.db")
     with TestClient(app) as client:
