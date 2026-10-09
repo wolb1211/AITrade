@@ -66,7 +66,7 @@ from app.services.regime_service import (
     timeframe_features,
 )
 from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
-from app.store import SqliteStore
+from app.store import ARBITRAGE_EA_CONFIG_DEFAULTS, SqliteStore
 from app.strategies import turtle_agent
 from app.strategies.pending_orders import cancel_stale_pending_orders
 
@@ -409,11 +409,22 @@ def create_api_router(
 # the user's AI key, so anything matching these is left out of the init response.
 _INIT_CONFIG_HIDDEN_MARKERS = ("key", "secret", "password", "token", "authorization")
 
-# Strategy codes whose EA takes all of its trading parameters from the init
-# response. For these the official strategy row acts as the shared config every
-# deployed EA reads, so one admin edit reaches all of them. Codes outside this
-# set are unaffected, which keeps older EAs on their existing payload.
-_EA_SERVER_CONFIG_CODES = frozenset({"GL_ARBITRAGE_V1"})
+# Strategies whose EA reads its trading parameters from the init response, with
+# the exact key list that EA reads.
+#
+# For these the official strategy row acts as the shared config every deployed EA
+# sees, so one admin edit reaches all of them. The value is a whitelist rather
+# than a filter: the deployment row also stores the client form (data types, kline
+# counts, call mode) and the AI endpoint picks, none of which the EA can use. This
+# is a contract, and a contract that ships twenty keys the EA ignores only invites
+# it to read one the server later renames.
+#
+# Codes outside this mapping keep the historical payload, which is what lets older
+# EAs see exactly what they saw before.
+_EA_SERVER_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
+    "GL_ARBITRAGE_V1": tuple(ARBITRAGE_EA_CONFIG_DEFAULTS),
+}
+_EA_SERVER_CONFIG_CODES = frozenset(_EA_SERVER_CONFIG_KEYS)
 
 # Strategies whose EA asks for a trend read. Only these are told which timeframes
 # to upload; every other strategy keeps the historical empty list, so no existing
@@ -425,6 +436,7 @@ def _mt5_init_config(
     config: dict[str, object],
     *,
     lot_source: dict[str, object] | None = None,
+    keep_keys: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """The deployment settings an EA may see, with the lot normalised.
 
@@ -434,14 +446,21 @@ def _mt5_init_config(
 
     lot_source, when given, is consulted first for the lot: it is the deployment's
     own config, which must win over a strategy default that merely fills a gap.
+
+    keep_keys, when given, is the exact key list to send. Strategies that declare
+    one get a small, documented payload instead of everything the deployment row
+    happens to hold.
     """
     if not isinstance(config, dict):
         return {}
-    settings = {
-        str(name): value
-        for name, value in config.items()
-        if not any(marker in str(name).lower() for marker in _INIT_CONFIG_HIDDEN_MARKERS)
-    }
+    if keep_keys:
+        settings = {str(name): config[str(name)] for name in keep_keys if name in config}
+    else:
+        settings = {
+            str(name): value
+            for name, value in config.items()
+            if not any(marker in str(name).lower() for marker in _INIT_CONFIG_HIDDEN_MARKERS)
+        }
     for source in (lot_source, config):
         if not isinstance(source, dict):
             continue
@@ -537,7 +556,9 @@ def create_mt5_router(
         # that are not listed keep the historical behaviour of sending the
         # deployment config only, so their EAs see exactly what they saw before.
         ea_config = config
+        ea_config_keys: tuple[str, ...] = ()
         if deployment["strategy_code"] in _EA_SERVER_CONFIG_CODES:
+            ea_config_keys = _EA_SERVER_CONFIG_KEYS[deployment["strategy_code"]]
             defaults = official_strategy["default_config"] if official_strategy else {}
             ea_config = {**(defaults if isinstance(defaults, dict) else {}), **config}
         return Mt5StrategyInitResponse(
@@ -575,7 +596,7 @@ def create_mt5_router(
                     else []
                 ),
             ),
-            config=_mt5_init_config(ea_config, lot_source=config),
+            config=_mt5_init_config(ea_config, lot_source=config, keep_keys=ea_config_keys),
         )
 
     @router.post("/open-decision", response_model=Mt5OpenDecisionResponse)

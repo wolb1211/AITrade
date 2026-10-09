@@ -113,6 +113,75 @@ def test_one_admin_edit_reaches_every_deployed_ea(tmp_path: Path) -> None:
         assert second["fixed_lot"] == 0.03
 
 
+def test_init_sends_only_the_keys_the_arbitrage_ea_reads(tmp_path: Path) -> None:
+    # The deployment row also stores the client form and the AI endpoint picks.
+    # Shipping those to the EA would make a server-side rename look like an EA
+    # setting, so the payload is a whitelist.
+    app = _app(tmp_path, "arb-whitelist.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        _deploy(store, "gl_arb_whitelist", "GL_ARBITRAGE_V1", {
+            "fixed_lot": 0.01,
+            "open_data_type": "kline",
+            "open_kline_count": 200,
+            "position_kline_count": 200,
+            "call_mode": "bar",
+            "call_val": 1,
+            "open_ai_mode": "official",
+            "open_ai_endpoint_id": "aie_somewhere",
+            "open_ai_model": "qwen-turbo",
+            "open_ai_base_url": "",
+            "position_ai_model": "qwen-plus",
+            "position_size_mode": "fixed",
+            "fixed_volume": 0.01,
+            "lot": 0.01,
+            "risk_base_mode": "fixed_loss",
+            "risk_amount": 100.0,
+            "max_positions": 1,
+            "allow_add": False,
+            "ai_user_configured": True,
+            "strategy_type": "official",
+        })
+
+        config = _init(client, "gl_arb_whitelist")["config"]
+
+        assert set(config) == set(EA_KEYS)
+        # The client's own lot key still wins over the admin default.
+        assert config["fixed_lot"] == 0.01
+        for unwanted in (
+            "open_ai_model", "open_ai_endpoint_id", "open_data_type", "open_kline_count",
+            "position_data_type", "position_kline_count", "call_mode", "call_val",
+            "position_ai_model", "position_size_mode", "fixed_volume", "lot",
+            "risk_base_mode", "risk_amount", "risk_percent", "max_positions",
+            "allow_add", "ai_user_configured", "strategy_type", "position_sizing_mode",
+        ):
+            assert unwanted not in config, unwanted
+
+
+def test_other_strategies_keep_their_full_config_payload(tmp_path: Path) -> None:
+    # The whitelist is per strategy: an older EA must still receive every key it
+    # reads today, or it would silently fall back to its hardcoded defaults.
+    app = _app(tmp_path, "arb-other-full.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        _deploy(store, "gl_trend_full", "GL_TREND_V1", {
+            "fixed_lot": 0.01,
+            "open_data_type": "kline",
+            "open_kline_count": 200,
+            "call_mode": "bar",
+            "max_positions": 4,
+            "allow_add": True,
+        })
+
+        config = _init(client, "gl_trend_full")["config"]
+
+        assert config["open_data_type"] == "kline"
+        assert config["open_kline_count"] == 200
+        assert config["call_mode"] == "bar"
+        assert config["max_positions"] == 4
+        assert config["allow_add"] is True
+
+
 def test_other_strategies_do_not_receive_arbitrage_settings(tmp_path: Path) -> None:
     app = _app(tmp_path, "arb-other.db")
     with TestClient(app) as client:
