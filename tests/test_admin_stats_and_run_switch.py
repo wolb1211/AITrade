@@ -118,6 +118,42 @@ def test_overview_counts_signals_and_orders(tmp_path: Path) -> None:
         assert overview["strategies"][0]["run_enabled"] is True
 
 
+def test_the_action_backfill_lifts_history_out_of_the_payload(tmp_path: Path) -> None:
+    # Decisions written before the column existed carry an empty action, so they
+    # would count as neither signal nor order. The one-time backfill reads the word
+    # out of the stored payload.
+    app = _app(tmp_path, "stats-backfill.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        deployment = _deploy(store, "gl_stats_backfill", _vip_user(store))
+        store.save_decision(
+            deployment["id"], "open", "req-old-0001",
+            {"decision_id": "dec_old_0001", "action": "BUY"},
+        )
+        with store._connect() as connection:
+            connection.execute("UPDATE decisions SET action = '' WHERE request_id = ?", ("req-old-0001",))
+
+        assert store.admin_ai_strategy_overview({})["summary"]["signal_count"] == 0
+
+        # A fresh database marks the backfill done during initialize(), because
+        # there is nothing to convert. Clearing the marker is what the first start
+        # after this ships looks like on a database that already had history.
+        with store._connect() as connection:
+            connection.execute(
+                "DELETE FROM system_settings WHERE setting_key = ?",
+                ("decisions_action_backfilled",),
+            )
+        store._backfill_decision_actions()
+
+        overview = store.admin_ai_strategy_overview({})
+        assert overview["summary"]["signal_count"] == 1
+        assert overview["summary"]["order_count"] == 1
+
+        # The marker makes it a one time cost: running it again changes nothing.
+        store._backfill_decision_actions()
+        assert store.admin_ai_strategy_overview({})["summary"]["signal_count"] == 1
+
+
 def test_overview_window_hides_older_rows(tmp_path: Path) -> None:
     app = _app(tmp_path, "stats-window.db")
     with TestClient(app) as client:
