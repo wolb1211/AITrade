@@ -2950,6 +2950,9 @@ class SqliteStore:
                 "status": deployment["status"],
                 "run_enabled": bool(deployment.get("run_enabled", 1) or 0),
                 "blocked_login": str(deployment.get("blocked_login") or ""),
+                # The account the EA bound itself to, shown beside the key so an
+                # operator can tell which terminal is running it.
+                "mt_login": str(deployment.get("mt_login") or ""),
                 "analysis_count": 0,
                 "signal_count": 0,
                 "order_count": 0,
@@ -3378,6 +3381,9 @@ class SqliteStore:
                 "account_provider": "",
                 "account_server": "",
                 "account_type": "",
+                # The account the EA bound itself to, for the key list of one
+                # official strategy.
+                "mt_login": str(deployment.get("mt_login") or ""),
                 "symbol": "",
                 "analysis_count": 0,
                 "signal_count": 0,
