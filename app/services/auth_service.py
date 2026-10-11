@@ -165,6 +165,17 @@ class UserAuthService:
         except RuntimeError as exc:
             self._raise_store_error(exc)
 
+    def agent_deployment_detail(self, token: str, *, deployment_id: str) -> dict[str, Any]:
+        """Statistics for one key belonging to a user this agent referred."""
+        user = self.me(token)
+        try:
+            return self.store.agent_deployment_detail(
+                agent_user_id=int(user["id"]),
+                deployment_id=deployment_id,
+            )
+        except RuntimeError as exc:
+            self._raise_store_error(exc)
+
     def update_strategy_ai(self, token: str, *, deployment_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         user = self.me(token)
         try:
@@ -777,5 +788,7 @@ class UserAuthService:
             "strategy_key_limit_reached": 409,
             "invalid_invite_code": 400,
             "agent_required": 403,
+            # An agent may only read the keys of users they referred.
+            "not_your_referral": 403,
         }
         raise AuthError(code, statuses.get(code, 400)) from exc

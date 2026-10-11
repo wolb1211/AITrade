@@ -6509,6 +6509,11 @@ class SqliteStore:
                 "created_at": str(row["created_at"] or ""),
             })
         total = int(summary["total"] or 0) if summary else 0
+        # Each referred user carries their strategy keys, so the agent centre can
+        # show what is running without a second round trip per row.
+        deployments_by_user = self.agent_referred_deployments([int(item["id"]) for item in items])
+        for item in items:
+            item["deployments"] = deployments_by_user.get(str(item["id"]), [])
         return {
             "agent_level": int(agent.get("agent_level") or 0),
             "invite_code": str(agent.get("invite_code") or ""),
@@ -6522,6 +6527,157 @@ class SqliteStore:
             "pages": max(1, (total + normalized_size - 1) // normalized_size),
             "total": total,
             "list": items,
+        }
+
+    def agent_referred_deployments(self, user_ids: list[int]) -> dict[str, list[dict[str, Any]]]:
+        """The strategy keys of the given users, each with its cumulative counters.
+
+        The agent centre shows a referred user's keys so the agent can see what is
+        running; the counters come from the same batched lookup the client portal
+        uses, so the page stays one round trip.
+        """
+        grouped: dict[str, list[dict[str, Any]]] = {str(user_id): [] for user_id in user_ids}
+        if not user_ids:
+            return grouped
+        placeholders = ", ".join("?" for _ in user_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, user_id, strategy_code, strategy_name, status, mt_login,
+                       config_json, updated_at
+                FROM deployments
+                WHERE user_id IN ({placeholders}) AND status <> 'deleted'
+                ORDER BY updated_at DESC
+                """,
+                [str(user_id) for user_id in user_ids],
+            ).fetchall()
+        stats_by_deployment = self.deployment_runtime_stats_map([str(row["id"]) for row in rows])
+        for row in rows:
+            try:
+                config = json.loads(str(row["config_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            stats = stats_by_deployment.get(str(row["id"])) or {}
+            grouped.setdefault(str(row["user_id"]), []).append({
+                "id": str(row["id"]),
+                "name": str(row["strategy_name"] or ""),
+                "strategy_code": str(row["strategy_code"] or ""),
+                "deployment_key": str(config.get("deployment_key") or ""),
+                "status": str(row["status"] or ""),
+                "mt_login": str(row["mt_login"] or ""),
+                "analysis_count": int(stats.get("analysis_count") or 0),
+                "signal_count": int(stats.get("signal_count") or 0),
+                "order_count": int(stats.get("order_count") or 0),
+                "pnl": round(float(stats.get("pnl") or 0), 2),
+                "tokens": int(stats.get("official_tokens_used") or 0) + int(stats.get("custom_tokens_used") or 0),
+                "updated_at": str(row["updated_at"] or ""),
+            })
+        return grouped
+
+    def agent_deployment_detail(self, *, agent_user_id: int, deployment_id: str) -> dict[str, Any]:
+        """One referred key's statistics, for the agent centre.
+
+        Only a key belonging to a user this agent referred is readable: an agent can
+        watch their own referrals' keys and nothing else.
+        """
+        with self._connect() as connection:
+            deployment = connection.execute(
+                "SELECT * FROM deployments WHERE id = ?",
+                (str(deployment_id),),
+            ).fetchone()
+            if deployment is None or str(deployment["status"] or "") == "deleted":
+                raise RuntimeError("deployment_not_found")
+            owner = connection.execute(
+                "SELECT id, email, nickname, referrer_user_id FROM users WHERE id = ?",
+                (str(deployment["user_id"]),),
+            ).fetchone()
+            if owner is None or int(owner["referrer_user_id"] or 0) != int(agent_user_id):
+                raise RuntimeError("not_your_referral")
+            decision_row = connection.execute(
+                """
+                SELECT COALESCE(SUM(analysis_count), 0) AS analysis_count,
+                       COALESCE(SUM(signal_count), 0) AS signal_count,
+                       COALESCE(SUM(order_count), 0) AS order_count
+                FROM mt_decision_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
+                """,
+                (str(deployment_id),),
+            ).fetchone()
+            order_row = connection.execute(
+                """
+                SELECT COALESCE(SUM(order_count), 0) AS order_count,
+                       COALESCE(SUM(win_count), 0) AS win_count,
+                       COALESCE(SUM(loss_count), 0) AS loss_count,
+                       COALESCE(SUM(net_profit), 0) AS pnl,
+                       COUNT(DISTINCT CASE WHEN symbol <> '' THEN symbol END) AS symbol_count
+                FROM mt_order_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
+                """,
+                (str(deployment_id),),
+            ).fetchone()
+            curve_rows = connection.execute(
+                """
+                SELECT bucket_start, COALESCE(SUM(net_profit), 0) AS change_amount
+                FROM mt_order_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
+                GROUP BY bucket_start
+                ORDER BY bucket_start
+                """,
+                (str(deployment_id),),
+            ).fetchall()
+            usage_row = connection.execute(
+                """
+                SELECT COALESCE(SUM(official_tokens), 0) AS official_tokens,
+                       COALESCE(SUM(custom_tokens), 0) AS custom_tokens
+                FROM ai_usage_logs
+                WHERE deployment_id = ?
+                """,
+                (str(deployment_id),),
+            ).fetchone()
+
+        closed_count = int(order_row["order_count"] or 0) if order_row else 0
+        win_count = int(order_row["win_count"] or 0) if order_row else 0
+        loss_count = int(order_row["loss_count"] or 0) if order_row else 0
+        curve: list[dict[str, Any]] = []
+        cumulative = 0.0
+        for row in curve_rows:
+            change = round(float(row["change_amount"] or 0), 2)
+            cumulative = round(cumulative + change, 2)
+            curve.append({
+                "time": datetime.fromtimestamp(int(row["bucket_start"]), LOCAL_TIMEZONE).strftime("%Y-%m-%d"),
+                "change": change,
+                "pnl": cumulative,
+            })
+        return {
+            "deployment": {
+                "id": str(deployment["id"]),
+                "name": str(deployment["strategy_name"] or ""),
+                "strategy_code": str(deployment["strategy_code"] or ""),
+                "status": str(deployment["status"] or ""),
+                "mt_login": str(deployment["mt_login"] or ""),
+                "updated_at": str(deployment["updated_at"] or ""),
+            },
+            "owner": {
+                "id": int(owner["id"]),
+                "email": self._masked_email(str(owner["email"] or "")),
+                "nickname": str(owner["nickname"] or ""),
+            },
+            "summary": {
+                "analysis_count": int(decision_row["analysis_count"] or 0) if decision_row else 0,
+                "signal_count": int(decision_row["signal_count"] or 0) if decision_row else 0,
+                "ai_order_count": int(decision_row["order_count"] or 0) if decision_row else 0,
+                "closed_count": closed_count,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate": round((win_count / closed_count) * 100, 2) if closed_count else 0.0,
+                "pnl": round(float(order_row["pnl"] or 0), 2) if order_row else 0.0,
+                "symbol_count": int(order_row["symbol_count"] or 0) if order_row else 0,
+                "official_tokens": int(usage_row["official_tokens"] or 0) if usage_row else 0,
+                "custom_tokens": int(usage_row["custom_tokens"] or 0) if usage_row else 0,
+            },
+            "curve": curve,
         }
 
     def get_auth_user_by_email(self, email: str) -> dict[str, Any] | None:

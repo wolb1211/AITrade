@@ -1673,6 +1673,20 @@ def create_auth_router(
         token = bearer_token(authorization)
         return execute(lambda: auth_service.agent_dashboard(token, page=page, size=size))
 
+    @router.post("/agent/deployment")
+    def agent_deployment_detail(
+        payload: dict[str, object],
+        authorization: str = Header(default=""),
+    ) -> dict[str, object]:
+        """Statistics of one key owned by a user this agent referred."""
+        token = bearer_token(authorization)
+        deployment_id = str(payload.get("deployment_id") or "").strip()
+        if not deployment_id:
+            raise HTTPException(status_code=400, detail="deployment_id_required")
+        return execute(
+            lambda: auth_service.agent_deployment_detail(token, deployment_id=deployment_id)
+        )
+
     @router.post("/strategies")
     def create_user_strategy(
         payload: dict[str, object],
