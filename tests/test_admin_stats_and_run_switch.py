@@ -179,6 +179,32 @@ def test_the_day_summary_backfill_rebuilds_the_counters(tmp_path: Path) -> None:
         assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 0
 
 
+def test_run_detail_counts_agree_with_the_summary_after_detail_is_trimmed(tmp_path: Path) -> None:
+    # The per key run dialog and the statistics page must show the same numbers.
+    # The dialog used to count decision rows directly, so once the detail was
+    # trimmed it disagreed with the page that reads the day summary.
+    app = _app(tmp_path, "run-detail-counts.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        deployment = _deploy(store, "gl_run_detail_counts", _vip_user(store))
+        store.save_decision(deployment["id"], "open", "req-open-0001", {"decision_id": "dec_open", "action": "BUY"})
+        store.save_decision(deployment["id"], "position", "req-hold-0002", {"decision_id": "dec_hold", "action": "HOLD"})
+
+        # The retention cleanup removes raw rows; the counters stay.
+        with store._connect() as connection:
+            connection.execute("DELETE FROM decisions WHERE deployment_id = ?", (deployment["id"],))
+
+        detail = store.admin_deployment_order_overview(deployment["id"], period="all")
+        page = store.admin_ai_strategy_overview({})
+
+        assert detail["runtime_summary"]["analysis_count"] == 2
+        assert detail["runtime_summary"]["signal_count"] == 1
+        assert detail["runtime_summary"]["order_count"] == 1
+        assert page["summary"]["analysis_count"] == 2
+        assert page["summary"]["signal_count"] == 1
+        assert page["summary"]["order_count"] == 1
+
+
 def test_decision_detail_cleanup_keeps_days_that_are_not_summarised(tmp_path: Path) -> None:
     # Deleting a detail row before its day is summarised would lose statistics for
     # good, so an unsummarised day is kept however old it is.

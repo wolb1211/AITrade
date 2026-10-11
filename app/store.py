@@ -2362,15 +2362,26 @@ class SqliteStore:
             ).fetchone()
             if deployment is None:
                 raise RuntimeError("deployment_not_found")
-            start_iso, end_iso, _, _, _ = _period_bounds(period)
-            decision_rows = connection.execute(
+            start_iso, end_iso, start_ts, end_ts, _ = _period_bounds(period)
+            # Counted from the daily decision summary, exactly like the statistics
+            # page. Reading the decision rows here would both disagree with that
+            # page once their detail is trimmed and force every payload through
+            # Python to count one word.
+            decision_row = connection.execute(
                 """
-                SELECT endpoint, response_json
-                FROM decisions
-                WHERE deployment_id = ? AND created_at >= ? AND created_at <= ?
+                SELECT COALESCE(SUM(analysis_count), 0) AS analysis_count,
+                       COALESCE(SUM(signal_count), 0) AS signal_count,
+                       COALESCE(SUM(order_count), 0) AS order_count
+                FROM mt_decision_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
+                  AND bucket_start >= ? AND bucket_start <= ?
                 """,
-                (deployment_id, start_iso, end_iso),
-            ).fetchall()
+                (
+                    deployment_id,
+                    _bucket_timestamp(int(start_ts), "day"),
+                    _bucket_timestamp(int(end_ts), "day"),
+                ),
+            ).fetchone()
             usage = connection.execute(
                 """
                 SELECT COALESCE(SUM(input_tokens), 0) input_tokens,
@@ -2383,19 +2394,9 @@ class SqliteStore:
                 """,
                 (deployment_id, start_iso, end_iso),
             ).fetchone()
-        analysis_count = len(decision_rows)
-        signal_count = 0
-        order_count = 0
-        for row in decision_rows:
-            try:
-                payload = json.loads(str(row["response_json"] or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            action = str(payload.get("action") or "").upper()
-            if action and action != "HOLD":
-                signal_count += 1
-            if str(row["endpoint"] or "") == "open" and action in {"BUY", "SELL"}:
-                order_count += 1
+        analysis_count = int(decision_row["analysis_count"] or 0) if decision_row else 0
+        signal_count = int(decision_row["signal_count"] or 0) if decision_row else 0
+        order_count = int(decision_row["order_count"] or 0) if decision_row else 0
         result = self.list_user_orders(
             user_id=int(deployment["user_id"]),
             deployment_id=deployment_id,
