@@ -2344,8 +2344,8 @@ def _mt5_business_error_description(
         "invalid_deployment_account": "MT 账号无效，请检查账号后重试",
         "insufficient_balance": "AI 余额不足，策略分析已停止，请充值后继续使用",
         # Not an access error: the key itself is fine, an operator stopped it. The
-        # text is what the EA reads, and acting on it is the EA's job.
-        "deployment_blocked": "该策略已被管理员暂停运行，请联系管理员",
+        # text lands on the EA panel next to the account, so it is kept short.
+        "deployment_blocked": "此账号已暂停运行，请联系管理员",
         "screenshot_required": "EA未提供策略所需截图，本次分析已停止",
         "unsupported_screenshot_type": "截图格式不支持，请使用PNG、JPEG或WebP",
         "invalid_screenshot_base64": "截图Base64数据无效，本次分析已停止",

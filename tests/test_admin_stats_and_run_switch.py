@@ -165,7 +165,7 @@ def test_stopping_a_key_is_reported_in_the_init_status(tmp_path: Path) -> None:
 
         # The key still authenticates and still gets its config: the stop is told,
         # not enforced, and the EA acts on the text.
-        assert "管理员暂停" in init_status()
+        assert "此账号已暂停运行" in init_status()
 
         store.set_deployment_run_enabled(deployment["id"], True)
         assert init_status() == "active"
@@ -189,7 +189,7 @@ def test_stopping_a_key_is_reported_in_the_regime_description(tmp_path: Path) ->
 
         assert response.status_code == 200, response.text
         body = response.json()
-        assert "管理员暂停" in body["description"]
+        assert "此账号已暂停运行" in body["description"]
         # The read itself is still produced.
         assert body["short"]["trend"] in {"bull", "bear", "range", "unknown"}
 
