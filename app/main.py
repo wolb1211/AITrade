@@ -81,24 +81,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         store.initialize()
-        store.cleanup_expired_ai_usage_details()
-        store.cleanup_expired_ai_response_cache()
-        store.cleanup_expired_order_details()
-        store.cleanup_expired_decision_details()
         if resolved.environment != "production":
             store.ensure_demo_deployment(resolved.demo_deployment_key)
 
-        async def cleanup_usage_details_daily() -> None:
-            while True:
-                await asyncio.sleep(60 * 60)
-                await asyncio.to_thread(store.cleanup_expired_ai_response_cache)
-                if datetime.now(timezone.utc).hour != 3:
-                    continue
-                await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
-                await asyncio.to_thread(store.cleanup_expired_order_details)
-                await asyncio.to_thread(store.cleanup_expired_decision_details)
+        async def cleanup_details_daily() -> None:
+            """Trim expired details off the request path.
 
-        cleanup_task = asyncio.create_task(cleanup_usage_details_daily())
+            This used to run before the app served, which was fine while the
+            retention was a year. After it changed to a week the first start has
+            months of detail to remove, and doing that first left the platform
+            answering 502 for minutes. The first pass now starts shortly after the
+            app is up, and the daily schedule is unchanged.
+            """
+            first_pass = True
+            while True:
+                await asyncio.sleep(30 if first_pass else 60 * 60)
+                try:
+                    await asyncio.to_thread(store.cleanup_expired_ai_response_cache)
+                    if first_pass or datetime.now(timezone.utc).hour == 3:
+                        await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
+                        await asyncio.to_thread(store.cleanup_expired_order_details)
+                        await asyncio.to_thread(store.cleanup_expired_decision_details)
+                        first_pass = False
+                except Exception:  # noqa: BLE001 - a cleanup must never kill the app
+                    logging.getLogger("gainlab.store").exception(
+                        "detail cleanup failed; it will retry on the next pass"
+                    )
+
+        cleanup_task = asyncio.create_task(cleanup_details_daily())
         try:
             yield
         finally:
