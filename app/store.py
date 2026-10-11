@@ -5164,6 +5164,40 @@ class SqliteStore:
                 deleted += len(removable)
         return deleted
 
+    def cleanup_expired_strategy_outcomes(self, *, batch_size: int = 5000, max_batches: int = 100) -> int:
+        """Delete old per-order attribution rows.
+
+        One row per closed order, so without this it grows forever. It shares the
+        order detail retention: like the deals it describes, this platform keeps it
+        as a recent view and the EA's statement is the authoritative record.
+        """
+        cutoff = int(
+            (datetime.now(timezone.utc) - timedelta(days=self.get_order_detail_retention_days())).timestamp()
+        )
+        normalized_batch = max(1, min(10000, int(batch_size)))
+        deleted = 0
+        for _ in range(max_batches):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id FROM strategy_trade_outcomes
+                    WHERE close_time > 0 AND close_time < ?
+                    ORDER BY close_time
+                    LIMIT ?
+                    """,
+                    (cutoff, normalized_batch),
+                ).fetchall()
+                if not rows:
+                    break
+                ids = [str(row["id"]) for row in rows]
+                placeholders = ", ".join("?" for _ in ids)
+                connection.execute(
+                    f"DELETE FROM strategy_trade_outcomes WHERE id IN ({placeholders})",
+                    ids,
+                )
+                deleted += len(ids)
+        return deleted
+
     def get_ai_cache_settings(self) -> dict[str, Any]:
         values: dict[str, Any] = {"enabled": True, "ttl_seconds": 120}
         with self._connect() as connection:

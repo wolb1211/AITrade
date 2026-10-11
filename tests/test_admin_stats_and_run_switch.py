@@ -179,6 +179,40 @@ def test_the_day_summary_backfill_rebuilds_the_counters(tmp_path: Path) -> None:
         assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 0
 
 
+def test_strategy_outcomes_are_trimmed_with_the_order_detail(tmp_path: Path) -> None:
+    # One attribution row per closed order, so it grows forever without a cleanup.
+    # It shares the order detail retention: a recent view is kept, history is not.
+    app = _app(tmp_path, "outcomes-cleanup.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        deployment = _deploy(store, "gl_outcomes_cleanup", _vip_user(store))
+        now = datetime.now(timezone.utc)
+        stamps = {
+            "outcome_old": int((now - timedelta(days=30)).timestamp()),
+            "outcome_new": int((now - timedelta(days=1)).timestamp()),
+        }
+        with store._connect() as connection:
+            for outcome_id, stamp in stamps.items():
+                connection.execute(
+                    """
+                    INSERT INTO strategy_trade_outcomes (
+                        id, deployment_id, deal_id, setup_code, close_time, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'TREND', ?, ?, ?)
+                    """,
+                    (outcome_id, deployment["id"], outcome_id, stamp, now.isoformat(), now.isoformat()),
+                )
+
+        deleted = store.cleanup_expired_strategy_outcomes()
+
+        with store._connect() as connection:
+            remaining = {
+                str(row["id"])
+                for row in connection.execute("SELECT id FROM strategy_trade_outcomes").fetchall()
+            }
+        assert deleted == 1
+        assert remaining == {"outcome_new"}
+
+
 def test_run_detail_counts_agree_with_the_summary_after_detail_is_trimmed(tmp_path: Path) -> None:
     # The per key run dialog and the statistics page must show the same numbers.
     # The dialog used to count decision rows directly, so once the detail was

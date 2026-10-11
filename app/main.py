@@ -102,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
                         await asyncio.to_thread(store.cleanup_expired_order_details)
                         await asyncio.to_thread(store.cleanup_expired_decision_details)
+                        await asyncio.to_thread(store.cleanup_expired_strategy_outcomes)
                         first_pass = False
                 except Exception:  # noqa: BLE001 - a cleanup must never kill the app
                     logging.getLogger("gainlab.store").exception(
