@@ -41,6 +41,8 @@ def _vip_user(store) -> str:
 
 
 def _deploy(store, key: str, user_id: str, code: str = "GL_ARBITRAGE_V1") -> dict:
+    # deployment_key in the config is what the client writes; the portal listing
+    # filters on it.
     store.upsert_web_deployment(
         key,
         user_id=user_id,
@@ -49,7 +51,7 @@ def _deploy(store, key: str, user_id: str, code: str = "GL_ARBITRAGE_V1") -> dic
         status="active",
         symbol="XAUUSD",
         timeframe="M15",
-        config={"fixed_lot": 0.01},
+        config={"deployment_key": key, "fixed_lot": 0.01},
     )
     return store.find_deployment_by_key(key)
 
@@ -177,6 +179,33 @@ def test_the_day_summary_backfill_rebuilds_the_counters(tmp_path: Path) -> None:
             connection.execute("DELETE FROM mt_decision_time_summaries")
         store._backfill_decision_summaries()
         assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 0
+
+
+def test_portal_counts_survive_detail_trimming(tmp_path: Path) -> None:
+    # The client's strategy list shows cumulative counts. It used to read the
+    # decision rows themselves, so once the detail was trimmed those numbers would
+    # quietly shrink; they come from the day summary now, and the batched lookup the
+    # portal uses must agree with the single-deployment one.
+    app = _app(tmp_path, "portal-counts.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        user_id = _vip_user(store)
+        deployment = _deploy(store, "gl_portal_counts", user_id)
+        store.save_decision(deployment["id"], "open", "req-open-0001", {"decision_id": "dec_open", "action": "BUY"})
+        store.save_decision(deployment["id"], "position", "req-hold-0002", {"decision_id": "dec_hold", "action": "HOLD"})
+
+        with store._connect() as connection:
+            connection.execute("DELETE FROM decisions WHERE deployment_id = ?", (deployment["id"],))
+
+        batched = store.deployment_runtime_stats_map([deployment["id"]])[deployment["id"]]
+        single = store.deployment_runtime_stats(deployment["id"])
+        assert batched == single
+        assert (batched["analysis_count"], batched["signal_count"], batched["order_count"]) == (2, 1, 1)
+
+        portal = store.get_user_portal_data(int(user_id))
+        item = next(row for row in portal["strategies"] if row["id"] == deployment["id"])
+        assert (item["analysis_count"], item["signal_count"], item["order_count"]) == (2, 1, 1)
+        assert portal["summary"]["analysis_count"] == 2
 
 
 def test_strategy_outcomes_are_trimmed_with_the_order_detail(tmp_path: Path) -> None:

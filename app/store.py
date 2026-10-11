@@ -2179,6 +2179,13 @@ class SqliteStore:
         return self._deployment_row(updated)
 
     def deployment_runtime_stats(self, deployment_id: str) -> dict[str, Any]:
+        """Analysis, signal and order counts plus tokens and profit for one key.
+
+        The counts come from the daily decision summary rather than the decision
+        rows: the summary is maintained as decisions are written, so it is both
+        exact and tiny, while reading the rows meant loading every payload of the
+        key and parsing it in Python just to count one word.
+        """
         stats = {
             "analysis_count": 0,
             "signal_count": 0,
@@ -2188,14 +2195,16 @@ class SqliteStore:
             "pnl": 0.0,
         }
         with self._connect() as connection:
-            decision_rows = connection.execute(
+            decision_row = connection.execute(
                 """
-                SELECT endpoint, response_json
-                FROM decisions
-                WHERE deployment_id = ?
+                SELECT COALESCE(SUM(analysis_count), 0) AS analysis_count,
+                       COALESCE(SUM(signal_count), 0) AS signal_count,
+                       COALESCE(SUM(order_count), 0) AS order_count
+                FROM mt_decision_time_summaries
+                WHERE deployment_id = ? AND bucket_type = 'day'
                 """,
                 (deployment_id,),
-            ).fetchall()
+            ).fetchone()
             usage_row = connection.execute(
                 """
                 SELECT
@@ -2215,23 +2224,88 @@ class SqliteStore:
                 (deployment_id,),
             ).fetchone()
 
-        stats["analysis_count"] = len(decision_rows)
-        for row in decision_rows:
-            try:
-                payload = json.loads(row["response_json"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            action = str(payload.get("action") or "").upper()
-            if action and action != "HOLD":
-                stats["signal_count"] += 1
-            if row["endpoint"] == "open" and action in {"BUY", "SELL"}:
-                stats["order_count"] += 1
+        if decision_row is not None:
+            stats["analysis_count"] = int(decision_row["analysis_count"] or 0)
+            stats["signal_count"] = int(decision_row["signal_count"] or 0)
+            stats["order_count"] = int(decision_row["order_count"] or 0)
 
         if usage_row is not None:
             stats["official_tokens_used"] = int(usage_row["official_tokens_used"] or 0)
             stats["custom_tokens_used"] = int(usage_row["custom_tokens_used"] or 0)
 
         stats["pnl"] = round(float(history_summary["net_profit"] or 0), 2) if history_summary else 0.0
+        return stats
+
+    def deployment_runtime_stats_map(self, deployment_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """The same numbers for many keys at once.
+
+        The portal lists a user's strategies and needs each one's counters; asking
+        per deployment made the page do three queries per strategy, which is what
+        made it slow. Three grouped queries answer all of them.
+        """
+        stats: dict[str, dict[str, Any]] = {
+            str(deployment_id): {
+                "analysis_count": 0,
+                "signal_count": 0,
+                "order_count": 0,
+                "official_tokens_used": 0,
+                "custom_tokens_used": 0,
+                "pnl": 0.0,
+            }
+            for deployment_id in deployment_ids
+        }
+        ids = [str(deployment_id) for deployment_id in deployment_ids if str(deployment_id)]
+        if not ids:
+            return stats
+        placeholders = ", ".join("?" for _ in ids)
+        with self._connect() as connection:
+            for row in connection.execute(
+                f"""
+                SELECT deployment_id,
+                       COALESCE(SUM(analysis_count), 0) AS analysis_count,
+                       COALESCE(SUM(signal_count), 0) AS signal_count,
+                       COALESCE(SUM(order_count), 0) AS order_count
+                FROM mt_decision_time_summaries
+                WHERE bucket_type = 'day' AND deployment_id IN ({placeholders})
+                GROUP BY deployment_id
+                """,
+                ids,
+            ).fetchall():
+                item = stats.get(str(row["deployment_id"]))
+                if item is None:
+                    continue
+                item["analysis_count"] = int(row["analysis_count"] or 0)
+                item["signal_count"] = int(row["signal_count"] or 0)
+                item["order_count"] = int(row["order_count"] or 0)
+            for row in connection.execute(
+                f"""
+                SELECT deployment_id,
+                       COALESCE(SUM(official_tokens), 0) AS official_tokens_used,
+                       COALESCE(SUM(custom_tokens), 0) AS custom_tokens_used
+                FROM ai_usage_logs
+                WHERE deployment_id IN ({placeholders})
+                GROUP BY deployment_id
+                """,
+                ids,
+            ).fetchall():
+                item = stats.get(str(row["deployment_id"]))
+                if item is None:
+                    continue
+                item["official_tokens_used"] = int(row["official_tokens_used"] or 0)
+                item["custom_tokens_used"] = int(row["custom_tokens_used"] or 0)
+            for row in connection.execute(
+                f"""
+                SELECT deployment_id, COALESCE(SUM(net_profit), 0) AS pnl
+                FROM mt_order_time_summaries
+                WHERE bucket_type = 'day' AND deployment_id IN ({placeholders})
+                GROUP BY deployment_id
+                """,
+                ids,
+            ).fetchall():
+                item = stats.get(str(row["deployment_id"]))
+                if item is None:
+                    continue
+                item["pnl"] = round(float(row["pnl"] or 0), 2)
         return stats
 
     def deployment_detail_stats(self, deployment_id: str) -> dict[str, Any]:
@@ -5745,10 +5819,32 @@ class SqliteStore:
             "custom_tokens_used": 0,
             "pnl": 0.0,
         }
-        for deployment in self.list_web_deployments(str(user_id)):
+        deployment_rows = self.list_web_deployments(str(user_id))
+        # Everything the loop below needs is fetched once: the counters for all of
+        # the user's keys in three grouped queries, and the official strategy and AI
+        # endpoint lookups through small caches. Asking per deployment made this
+        # page issue three or more queries per strategy, which is what made it slow.
+        stats_by_deployment = self.deployment_runtime_stats_map(
+            [str(row["id"]) for row in deployment_rows]
+        )
+        official_strategy_cache: dict[str, dict[str, Any] | None] = {}
+        endpoint_cache: dict[str, dict[str, Any] | None] = {}
+        for deployment in deployment_rows:
             config = deployment["config"]
-            stats = self.deployment_runtime_stats(deployment["id"])
-            official_strategy = self.get_official_ai_strategy(deployment["strategy_code"])
+            stats = stats_by_deployment.get(str(deployment["id"])) or {
+                "analysis_count": 0,
+                "signal_count": 0,
+                "order_count": 0,
+                "official_tokens_used": 0,
+                "custom_tokens_used": 0,
+                "pnl": 0.0,
+            }
+            official_strategy_code = str(deployment["strategy_code"] or "")
+            if official_strategy_code not in official_strategy_cache:
+                official_strategy_cache[official_strategy_code] = self.get_official_ai_strategy(
+                    official_strategy_code
+                )
+            official_strategy = official_strategy_cache[official_strategy_code]
             open_ai_mode = str(config.get("open_ai_mode") or "official")
             position_ai_mode = str(config.get("position_ai_mode") or "official")
             open_ai_endpoint_id = str(config.get("open_ai_endpoint_id") or "")
@@ -5758,8 +5854,11 @@ class SqliteStore:
                     open_ai_endpoint_id = str(official_strategy.get("open_ai_endpoint_id") or "")
                 if position_ai_mode == "official" and not position_ai_endpoint_id:
                     position_ai_endpoint_id = str(official_strategy.get("position_ai_endpoint_id") or "")
-            open_ai_endpoint = self.get_ai_endpoint(open_ai_endpoint_id)
-            position_ai_endpoint = self.get_ai_endpoint(position_ai_endpoint_id)
+            for endpoint_id in (open_ai_endpoint_id, position_ai_endpoint_id):
+                if endpoint_id and endpoint_id not in endpoint_cache:
+                    endpoint_cache[endpoint_id] = self.get_ai_endpoint(endpoint_id)
+            open_ai_endpoint = endpoint_cache.get(open_ai_endpoint_id)
+            position_ai_endpoint = endpoint_cache.get(position_ai_endpoint_id)
             item = {
                 "id": deployment["id"],
                 "deployment_key": str(config.get("deployment_key") or ""),
