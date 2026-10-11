@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.store import admin_period_range
+from app.store import _bucket_timestamp, admin_period_range
 
 
 def _app(tmp_path: Path, name: str):
@@ -119,9 +119,9 @@ def test_overview_counts_signals_and_orders(tmp_path: Path) -> None:
 
 
 def test_the_action_backfill_lifts_history_out_of_the_payload(tmp_path: Path) -> None:
-    # Decisions written before the column existed carry an empty action, so they
-    # would count as neither signal nor order. The one-time backfill reads the word
-    # out of the stored payload.
+    # Decisions written before the column existed carry an empty action, and the
+    # column is what a rebuilt day summary counts. The backfill reads the word out
+    # of the stored payload.
     app = _app(tmp_path, "stats-backfill.db")
     with TestClient(app) as client:
         store = app.state.store
@@ -132,47 +132,139 @@ def test_the_action_backfill_lifts_history_out_of_the_payload(tmp_path: Path) ->
         )
         with store._connect() as connection:
             connection.execute("UPDATE decisions SET action = '' WHERE request_id = ?", ("req-old-0001",))
-
-        assert store.admin_ai_strategy_overview({})["summary"]["signal_count"] == 0
-
-        # A fresh database marks the backfill done during initialize(), because
-        # there is nothing to convert. Clearing the marker is what the first start
-        # after this ships looks like on a database that already had history.
-        with store._connect() as connection:
             connection.execute(
                 "DELETE FROM system_settings WHERE setting_key = ?",
                 ("decisions_action_backfilled",),
             )
+
         store._backfill_decision_actions()
 
-        overview = store.admin_ai_strategy_overview({})
-        assert overview["summary"]["signal_count"] == 1
-        assert overview["summary"]["order_count"] == 1
-
-        # The marker makes it a one time cost: running it again changes nothing.
-        store._backfill_decision_actions()
-        assert store.admin_ai_strategy_overview({})["summary"]["signal_count"] == 1
+        with store._connect() as connection:
+            row = connection.execute(
+                "SELECT action FROM decisions WHERE request_id = ?", ("req-old-0001",)
+            ).fetchone()
+        assert row["action"] == "BUY"
 
 
-def test_overview_window_hides_older_rows(tmp_path: Path) -> None:
+def test_the_day_summary_backfill_rebuilds_the_counters(tmp_path: Path) -> None:
+    # The statistics page reads the daily summary, so history that predates the
+    # table has to be summarised once - and the attempt has to be remembered, or it
+    # would be redone on every start.
+    app = _app(tmp_path, "stats-summary-backfill.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        deployment = _deploy(store, "gl_stats_summary", _vip_user(store))
+        store.save_decision(deployment["id"], "open", "req-one-0001", {"decision_id": "dec_one", "action": "BUY"})
+        store.save_decision(deployment["id"], "position", "req-two-0002", {"decision_id": "dec_two", "action": "HOLD"})
+
+        with store._connect() as connection:
+            connection.execute("DELETE FROM mt_decision_time_summaries")
+            connection.execute(
+                "DELETE FROM system_settings WHERE setting_key = ?",
+                ("decision_time_summaries_backfilled",),
+            )
+        assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 0
+
+        store._backfill_decision_summaries()
+
+        summary = store.admin_ai_strategy_overview({})["summary"]
+        assert summary["analysis_count"] == 2
+        assert summary["signal_count"] == 1
+        assert summary["order_count"] == 1
+
+        # The marker makes it a one time cost.
+        with store._connect() as connection:
+            connection.execute("DELETE FROM mt_decision_time_summaries")
+        store._backfill_decision_summaries()
+        assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 0
+
+
+def test_decision_detail_cleanup_keeps_days_that_are_not_summarised(tmp_path: Path) -> None:
+    # Deleting a detail row before its day is summarised would lose statistics for
+    # good, so an unsummarised day is kept however old it is.
+    app = _app(tmp_path, "stats-cleanup.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        deployment = _deploy(store, "gl_stats_cleanup", _vip_user(store))
+        old_stamp = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        store.save_decision(deployment["id"], "open", "req-summarised-0001", {"decision_id": "dec_sum", "action": "BUY"})
+        store.save_decision(deployment["id"], "open", "req-unsummarised-0002", {"decision_id": "dec_unsum", "action": "BUY"})
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE decisions SET created_at = ? WHERE request_id IN (?, ?)",
+                (old_stamp, "req-summarised-0001", "req-unsummarised-0002"),
+            )
+            # Only one of the two days gets a summary row, so only it may be removed.
+            connection.execute(
+                "DELETE FROM mt_decision_time_summaries WHERE deployment_id = ?",
+                (deployment["id"],),
+            )
+            connection.execute(
+                """
+                INSERT INTO mt_decision_time_summaries (
+                    id, user_id, deployment_id, strategy_code, bucket_type, bucket_start,
+                    analysis_count, signal_count, order_count, created_at, updated_at
+                ) VALUES (?, '', ?, 'GL_ARBITRAGE_V1', 'day', ?, 1, 1, 1, ?, ?)
+                """,
+                (
+                    "dsum_test_summarised",
+                    deployment["id"],
+                    _bucket_timestamp(int(datetime.fromisoformat(old_stamp).timestamp()), "day"),
+                    old_stamp,
+                    old_stamp,
+                ),
+            )
+            # Both rows are in the same day, so give the second one its own day.
+            connection.execute(
+                "UPDATE decisions SET created_at = ? WHERE request_id = ?",
+                ((datetime.now(timezone.utc) - timedelta(days=31)).isoformat(), "req-unsummarised-0002"),
+            )
+
+        # Outside the block: the cleanup opens its own connection and would not see
+        # uncommitted rows.
+        deleted = store.cleanup_expired_decision_details()
+
+        with store._connect() as connection:
+            remaining = {
+                str(row["request_id"])
+                for row in connection.execute("SELECT request_id FROM decisions").fetchall()
+            }
+        assert deleted == 1
+        assert remaining == {"req-unsummarised-0002"}
+
+
+def test_overview_window_filters_on_the_day_bucket(tmp_path: Path) -> None:
     app = _app(tmp_path, "stats-window.db")
     with TestClient(app) as client:
         store = app.state.store
         deployment = _deploy(store, "gl_stats_window", _vip_user(store))
         store.save_decision(deployment["id"], "open", "req-today-0001", {"decision_id": "dec_today_0001", "action": "BUY"})
-        store.save_decision(deployment["id"], "open", "req-older-0002", {"decision_id": "dec_older_0002", "action": "BUY"})
-
+        # A day from long ago, written straight into the summary as the retention
+        # cleanup would leave it.
+        old_stamp = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
         with store._connect() as connection:
             connection.execute(
-                "UPDATE decisions SET created_at = ? WHERE request_id = ?",
-                ((datetime.now(timezone.utc) - timedelta(days=60)).isoformat(), "req-older-0002"),
+                """
+                INSERT INTO mt_decision_time_summaries (
+                    id, user_id, deployment_id, strategy_code, bucket_type, bucket_start,
+                    analysis_count, signal_count, order_count, created_at, updated_at
+                ) VALUES (?, '', ?, 'GL_ARBITRAGE_V1', 'day', ?, 5, 2, 1, ?, ?)
+                """,
+                (
+                    "dsum_test_old",
+                    deployment["id"],
+                    _bucket_timestamp(int(datetime.fromisoformat(old_stamp).timestamp()), "day"),
+                    old_stamp,
+                    old_stamp,
+                ),
             )
 
-        assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 2
+        assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 6
 
         start_at, end_at = admin_period_range("today")
         windowed = store.admin_ai_strategy_overview({"start_at": start_at, "end_at": end_at})
         assert windowed["summary"]["analysis_count"] == 1
+        assert windowed["summary"]["signal_count"] == 1
 
 
 # ── the admin run switch ──────────────────────────────────────────────────────

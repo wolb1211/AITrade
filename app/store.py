@@ -616,6 +616,31 @@ class SqliteStore:
                 CREATE INDEX IF NOT EXISTS idx_mt_order_summary_deployment_bucket
                     ON mt_order_time_summaries(deployment_id, bucket_type, bucket_start);
 
+                -- Decision counts per deployment per day, mirroring the order
+                -- summaries. The statistics page reads this instead of the decision
+                -- rows, so its cost depends on deployments x days rather than on
+                -- how much history the platform has accumulated.
+                CREATE TABLE IF NOT EXISTS mt_decision_time_summaries (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT '',
+                    deployment_id TEXT NOT NULL,
+                    strategy_code TEXT NOT NULL DEFAULT '',
+                    bucket_type TEXT NOT NULL,
+                    bucket_start INTEGER NOT NULL,
+                    analysis_count INTEGER NOT NULL DEFAULT 0,
+                    signal_count INTEGER NOT NULL DEFAULT 0,
+                    order_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(deployment_id, bucket_type, bucket_start),
+                    FOREIGN KEY(deployment_id) REFERENCES deployments(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mt_decision_summary_bucket
+                    ON mt_decision_time_summaries(bucket_type, bucket_start);
+                CREATE INDEX IF NOT EXISTS idx_mt_decision_summary_deployment_bucket
+                    ON mt_decision_time_summaries(deployment_id, bucket_type, bucket_start);
+
                 CREATE TABLE IF NOT EXISTS mt_order_archived_deals (
                     account_login TEXT NOT NULL,
                     account_server TEXT NOT NULL DEFAULT '',
@@ -955,6 +980,8 @@ class SqliteStore:
         self._ensure_existing_users()
         self._ensure_official_strategy_config_defaults()
         self._backfill_decision_actions()
+        self._backfill_decision_summaries()
+        self._ensure_detail_retention_defaults()
 
     def _ensure_official_strategy_config_defaults(self) -> None:
         """Fill in newly added official strategy settings on existing rows.
@@ -1086,7 +1113,11 @@ class SqliteStore:
 
         connection.execute(
             "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
-            ("order_detail_retention_days", "365", "订单明细保存天数", now),
+            ("order_detail_retention_days", "7", "订单明细保存天数", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO system_settings (setting_key, setting_value, remark, updated_at) VALUES (?, ?, ?, ?)",
+            ("decision_detail_retention_days", "7", "决策明细保存天数（统计来自每日汇总）", now),
         )
 
     def _backfill_ai_usage_monthly_summaries(self) -> None:
@@ -1263,6 +1294,28 @@ class SqliteStore:
                 """,
                 ("order_time_summaries_backfilled", "1", "订单小时和每日汇总已初始化", now),
             )
+
+    def _ensure_detail_retention_defaults(self) -> None:
+        """Move the detail retention settings onto the current defaults.
+
+        The seeds are INSERT OR IGNORE, so a database created before a default
+        changed keeps the old number forever. Only the previous default is
+        rewritten: any other value was picked deliberately and is left alone.
+
+        Orders went from a year to a week: this platform keeps only rough
+        statistics, and the authoritative detail is the EA's own statement.
+        """
+        migrations = (("order_detail_retention_days", "365", "7"),)
+        for key, previous, current in migrations:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE system_settings
+                    SET setting_value = ?, updated_at = ?
+                    WHERE setting_key = ? AND setting_value = ?
+                    """,
+                    (current, utc_now_iso(), key, previous),
+                )
 
     def _ensure_existing_users(self) -> None:
         now = utc_now_iso()
@@ -2692,16 +2745,13 @@ class SqliteStore:
         end_at = str(filters.get("end_at") or "").strip()
 
         decision_params: list[Any] = []
-        decision_where = ""
-        if start_at or end_at:
-            clauses: list[str] = []
-            if start_at:
-                clauses.append("d.created_at >= ?")
-                decision_params.append(start_at)
-            if end_at:
-                clauses.append("d.created_at < ?")
-                decision_params.append(end_at)
-            decision_where = f"WHERE {' AND '.join(clauses)}"
+        decision_where = "WHERE bucket_type = 'day'"
+        if start_at:
+            decision_where += " AND bucket_start >= ?"
+            decision_params.append(_epoch_seconds(start_at))
+        if end_at:
+            decision_where += " AND bucket_start < ?"
+            decision_params.append(_epoch_seconds(end_at))
 
         usage_params: list[Any] = []
         usage_where = ""
@@ -2739,13 +2789,13 @@ class SqliteStore:
             decision_rows = connection.execute(
                 f"""
                 SELECT
-                    d.deployment_id,
-                    COUNT(*) AS analysis_count,
-                    COALESCE(SUM(CASE WHEN d.action NOT IN ('', 'HOLD') THEN 1 ELSE 0 END), 0) AS signal_count,
-                    COALESCE(SUM(CASE WHEN d.endpoint = 'open' AND d.action IN ('BUY', 'SELL') THEN 1 ELSE 0 END), 0) AS order_count
-                FROM decisions d
+                    deployment_id,
+                    COALESCE(SUM(analysis_count), 0) AS analysis_count,
+                    COALESCE(SUM(signal_count), 0) AS signal_count,
+                    COALESCE(SUM(order_count), 0) AS order_count
+                FROM mt_decision_time_summaries
                 {decision_where}
-                GROUP BY d.deployment_id
+                GROUP BY deployment_id
                 """,
                 decision_params,
             ).fetchall()
@@ -3739,6 +3789,56 @@ class SqliteStore:
             ).fetchone()
         return json.loads(row["response_json"]) if row else None
 
+    def _bump_decision_summary(
+        self,
+        connection: Any,
+        *,
+        deployment_id: str,
+        user_id: str,
+        strategy_code: str,
+        action: str,
+        endpoint: str,
+        now: str,
+    ) -> None:
+        """Add one decision to today's counter for this deployment.
+
+        Incremental rather than rebuilt, so the summary is complete the moment a
+        decision is stored and the statistics page never has to read the decision
+        rows themselves. A duplicate decision never reaches here, which is what
+        keeps the counts exact.
+        """
+        bucket = _bucket_timestamp(int(datetime.now(timezone.utc).timestamp()), "day")
+        signal = 1 if action and action != "HOLD" else 0
+        order = 1 if endpoint == "open" and action in {"BUY", "SELL"} else 0
+        connection.execute(
+            """
+            INSERT INTO mt_decision_time_summaries (
+                id, user_id, deployment_id, strategy_code,
+                bucket_type, bucket_start,
+                analysis_count, signal_count, order_count,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'day', ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(deployment_id, bucket_type, bucket_start) DO UPDATE SET
+                analysis_count = analysis_count + 1,
+                signal_count = signal_count + excluded.signal_count,
+                order_count = order_count + excluded.order_count,
+                strategy_code = excluded.strategy_code,
+                user_id = excluded.user_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                f"dsum_{uuid4().hex}",
+                str(user_id or ""),
+                str(deployment_id),
+                str(strategy_code or ""),
+                bucket,
+                signal,
+                order,
+                now,
+                now,
+            ),
+        )
+
     def save_decision(
         self,
         deployment_id: str,
@@ -3751,6 +3851,8 @@ class SqliteStore:
         symbol: str = "",
         timeframe: str = "",
     ) -> dict[str, Any]:
+        action = str(response.get("action") or "").strip().upper()[:16]
+        now = utc_now_iso()
         with self._connect() as connection:
             try:
                 connection.execute(
@@ -3773,16 +3875,30 @@ class SqliteStore:
                         # Stored uppercase so the statistics query can compare it
                         # without a function, which is what keeps that scan on the
                         # index.
-                        str(response.get("action") or "").strip().upper()[:16],
+                        action,
                         json.dumps(response),
-                        utc_now_iso(),
+                        now,
                     ),
+                )
+                owner = connection.execute(
+                    "SELECT user_id, strategy_code FROM deployments WHERE id = ?",
+                    (deployment_id,),
+                ).fetchone()
+                self._bump_decision_summary(
+                    connection,
+                    deployment_id=deployment_id,
+                    user_id=str(owner["user_id"]) if owner else "",
+                    strategy_code=str(owner["strategy_code"]) if owner else "",
+                    action=action,
+                    endpoint=endpoint,
+                    now=now,
                 )
                 return response
             except DatabaseIntegrityError:
                 existing = self.get_decision(deployment_id, endpoint, request_id)
                 if existing is None:
                     raise
+                # A repeated request must not be counted twice.
                 return existing
 
     def save_heartbeat(self, deployment_id: str, payload: dict[str, Any]) -> None:
@@ -4845,15 +4961,207 @@ class SqliteStore:
             return 60
 
     def get_order_detail_retention_days(self) -> int:
+        """How long raw order details are kept after their day is summarised.
+
+        The floor used to be 30 days, from when the details were also the only
+        record of a trade. The permanent day summaries now carry the statistics and
+        the authoritative detail is the EA's own statement, so a week is a valid
+        choice and the floor only guards against nonsense values.
+        """
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT setting_value FROM system_settings WHERE setting_key = ?",
                 ("order_detail_retention_days",),
             ).fetchone()
         try:
-            return max(30, min(3650, int(str(row["setting_value"])))) if row else 365
+            return max(1, min(3650, int(str(row["setting_value"])))) if row else 7
         except (TypeError, ValueError):
-            return 365
+            return 7
+
+    def _backfill_decision_summaries(self) -> None:
+        """Build the daily decision counters for history, once.
+
+        Marked so it happens on one start. The grouping is done in SQL and keyed on
+        the stored action column, so it does not have to parse the payloads.
+        """
+        marker = "decision_time_summaries_backfilled"
+        with self._connect() as connection:
+            done = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                (marker,),
+            ).fetchone()
+            if done is not None:
+                return
+        started = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            pending = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM mt_decision_time_summaries"
+                ).fetchone()["n"] or 0
+            )
+            if pending == 0:
+                # Nothing summarised yet: rebuild every day from the decisions that
+                # are still stored. The bucket is the UTC+8 day, matching every
+                # other daily figure in the admin.
+                days = connection.execute(
+                    """
+                    SELECT DISTINCT d.deployment_id, p.strategy_code, p.user_id,
+                           SUBSTR(d.created_at, 1, 10) AS day
+                    FROM decisions d
+                    LEFT JOIN deployments p ON p.id = d.deployment_id
+                    """
+                ).fetchall()
+                logger.info("building decision day summaries for %d deployment days", len(days))
+                for row in days:
+                    rows = connection.execute(
+                        """
+                        SELECT action, endpoint, COUNT(*) AS n
+                        FROM decisions
+                        WHERE deployment_id = ? AND SUBSTR(created_at, 1, 10) = ?
+                        GROUP BY action, endpoint
+                        """,
+                        (row["deployment_id"], row["day"]),
+                    ).fetchall()
+                    analysis = sum(int(item["n"] or 0) for item in rows)
+                    signal = sum(
+                        int(item["n"] or 0)
+                        for item in rows
+                        if str(item["action"] or "") not in ("", "HOLD")
+                    )
+                    orders = sum(
+                        int(item["n"] or 0)
+                        for item in rows
+                        if str(item["endpoint"] or "") == "open"
+                        and str(item["action"] or "") in ("BUY", "SELL")
+                    )
+                    stamp = _bucket_timestamp(
+                        int(datetime.fromisoformat(f"{row['day']}T00:00:00+00:00").timestamp()),
+                        "day",
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO mt_decision_time_summaries (
+                            id, user_id, deployment_id, strategy_code,
+                            bucket_type, bucket_start,
+                            analysis_count, signal_count, order_count,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 'day', ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(deployment_id, bucket_type, bucket_start) DO UPDATE SET
+                            analysis_count = excluded.analysis_count,
+                            signal_count = excluded.signal_count,
+                            order_count = excluded.order_count,
+                            strategy_code = excluded.strategy_code,
+                            user_id = excluded.user_id,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            f"dsum_{uuid4().hex}",
+                            str(row["user_id"] or ""),
+                            str(row["deployment_id"]),
+                            str(row["strategy_code"] or ""),
+                            stamp,
+                            analysis,
+                            signal,
+                            orders,
+                            utc_now_iso(),
+                            utc_now_iso(),
+                        ),
+                    )
+            logger.info(
+                "decision day summaries ready in %ss",
+                round((datetime.now(timezone.utc) - started).total_seconds(), 1),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (marker, "1", "决策每日汇总回填标记，只做一次", utc_now_iso()),
+            )
+
+    def get_decision_detail_retention_days(self) -> int:
+        """How long raw decision rows are kept after their day is summarised."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("decision_detail_retention_days",),
+            ).fetchone()
+        try:
+            return max(1, min(3650, int(str(row["setting_value"])))) if row else 7
+        except (TypeError, ValueError):
+            return 7
+
+    def cleanup_expired_decision_details(self, *, batch_size: int = 5000, max_batches: int = 100) -> int:
+        """Delete old decision rows, but only once their day is summarised.
+
+        Same rule as the order details: the daily counter must already exist for
+        that deployment and day, otherwise the row is kept. That way a missing or
+        failed summary can never turn into lost statistics - the worst case is a
+        detail row that stays a little longer.
+        """
+        cutoff_iso = (
+            datetime.now(timezone.utc) - timedelta(days=self.get_decision_detail_retention_days())
+        ).isoformat()
+        normalized_batch = max(1, min(10000, int(batch_size)))
+        deleted = 0
+        for _ in range(max_batches):
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, deployment_id, created_at
+                    FROM decisions
+                    WHERE created_at < ?
+                    ORDER BY created_at
+                    LIMIT ?
+                    """,
+                    (cutoff_iso, normalized_batch),
+                ).fetchall()
+                if not rows:
+                    break
+                batch_buckets: dict[tuple[str, int], bool] = {}
+                for row in rows:
+                    try:
+                        stamp = int(datetime.fromisoformat(str(row["created_at"])).timestamp())
+                    except (TypeError, ValueError):
+                        continue
+                    batch_buckets[(str(row["deployment_id"]), _bucket_timestamp(stamp, "day"))] = False
+                # Only the days present in this batch are looked up, so the check
+                # costs one small query per batch instead of reading the whole
+                # summary table every time.
+                for deployment_id, bucket_start in list(batch_buckets):
+                    found = connection.execute(
+                        """
+                        SELECT 1 FROM mt_decision_time_summaries
+                        WHERE deployment_id = ? AND bucket_type = 'day' AND bucket_start = ?
+                        """,
+                        (deployment_id, bucket_start),
+                    ).fetchone()
+                    batch_buckets[(deployment_id, bucket_start)] = found is not None
+                removable: list[str] = []
+                for row in rows:
+                    try:
+                        stamp = int(datetime.fromisoformat(str(row["created_at"])).timestamp())
+                    except (TypeError, ValueError):
+                        continue
+                    if batch_buckets.get((str(row["deployment_id"]), _bucket_timestamp(stamp, "day"))):
+                        removable.append(str(row["id"]))
+                if not removable:
+                    # Nothing this batch can be removed safely, and older rows are
+                    # older still, so stop rather than loop.
+                    break
+                for start in range(0, len(removable), 500):
+                    chunk = removable[start:start + 500]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    connection.execute(
+                        f"DELETE FROM decisions WHERE id IN ({placeholders})",
+                        chunk,
+                    )
+                deleted += len(removable)
+        return deleted
 
     def get_ai_cache_settings(self) -> dict[str, Any]:
         values: dict[str, Any] = {"enabled": True, "ttl_seconds": 120}
@@ -7332,6 +7640,7 @@ class MySQLStore(SqliteStore):
             "execution_reports",
             "mt5_history_deals",
             "mt_order_time_summaries",
+            "mt_decision_time_summaries",
             "mt_order_archived_deals",
             "strategy_trade_outcomes",
             "ai_templates",
@@ -7369,9 +7678,34 @@ class MySQLStore(SqliteStore):
         self._backfill_ai_cache_stats()
         self._backfill_order_time_summaries()
         self._backfill_decision_actions()
+        self._backfill_decision_summaries()
+        self._ensure_detail_retention_defaults()
 
     def _ensure_mysql_order_summary_table(self) -> None:
         with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mt_decision_time_summaries (
+                    id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL DEFAULT '',
+                    deployment_id VARCHAR(128) NOT NULL,
+                    strategy_code VARCHAR(64) NOT NULL DEFAULT '',
+                    bucket_type VARCHAR(8) NOT NULL,
+                    bucket_start BIGINT NOT NULL,
+                    analysis_count BIGINT NOT NULL DEFAULT 0,
+                    signal_count BIGINT NOT NULL DEFAULT 0,
+                    order_count BIGINT NOT NULL DEFAULT 0,
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_mt_decision_summary_dimension (deployment_id, bucket_type, bucket_start),
+                    KEY idx_mt_decision_summary_bucket (bucket_type, bucket_start),
+                    KEY idx_mt_decision_summary_deployment_bucket (deployment_id, bucket_type, bucket_start),
+                    CONSTRAINT fk_mt_decision_summary_deployment
+                        FOREIGN KEY (deployment_id) REFERENCES deployments(id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mt_order_time_summaries (
@@ -7689,7 +8023,15 @@ class MySQLStore(SqliteStore):
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
                 """,
-                ("order_detail_retention_days", "365", "订单明细保存天数", now),
+                ("order_detail_retention_days", "7", "订单明细保存天数", now),
+            )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET setting_key = excluded.setting_key
+                """,
+                ("decision_detail_retention_days", "7", "决策明细保存天数（统计来自每日汇总）", now),
             )
 
     def _ensure_mysql_user_api_keys_table(self) -> None:
