@@ -83,6 +83,84 @@ def backfill_arbitrage_config(config: Any) -> dict[str, Any]:
     return merged
 
 
+def _epoch_seconds(value: str) -> int:
+    """Epoch seconds for an ISO timestamp.
+
+    Used for the day bucketed order table, whose bucket_start is an epoch. A value
+    that cannot be parsed becomes 0, which makes an unusable bound filter nothing
+    out rather than silently hiding every row.
+    """
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+# Windows the admin statistics page offers. "all" has no bound at all.
+ADMIN_STAT_PERIODS = ("today", "yesterday", "week", "7d", "month", "custom", "all")
+
+
+def admin_period_range(period: str, start: str = "", end: str = "") -> tuple[str, str]:
+    """UTC window for one admin statistics choice, as (start_at, end_at).
+
+    "Today" has to mean the operator's today: rows are stored in UTC while the
+    admin reads a Chinese clock, so the boundaries are built in UTC+8 and only then
+    converted. end_at is exclusive, which is why a custom end date is advanced one
+    day. An all time window returns empty strings, which the queries read as "no
+    filter".
+    """
+    chosen = str(period or "").strip().lower() or "today"
+    if chosen not in ADMIN_STAT_PERIODS:
+        chosen = "today"
+    if chosen == "all":
+        return "", ""
+
+    now_local = datetime.now(LOCAL_TIMEZONE)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_local = today_start
+    end_local: datetime | None = None
+    if chosen == "yesterday":
+        start_local = today_start - timedelta(days=1)
+        end_local = today_start
+    elif chosen == "week":
+        # Monday based, matching how the rest of the admin reads a week.
+        start_local = today_start - timedelta(days=today_start.weekday())
+    elif chosen == "7d":
+        start_local = today_start - timedelta(days=6)
+    elif chosen == "month":
+        start_local = today_start.replace(day=1)
+    elif chosen == "custom":
+        parsed_start = _local_date(start)
+        parsed_end = _local_date(end)
+        if parsed_start is None and parsed_end is None:
+            # Nothing usable was sent, so fall back to the default window instead
+            # of querying all of history.
+            start_local = today_start
+        else:
+            start_local = parsed_start or parsed_end or today_start
+            if parsed_end is not None:
+                end_local = parsed_end + timedelta(days=1)
+
+    def to_utc(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat()
+
+    return to_utc(start_local), to_utc(end_local) if end_local is not None else ""
+
+
+def _local_date(value: str) -> datetime | None:
+    """Midnight local time for a YYYY-MM-DD input, or None when it is unusable."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").replace(tzinfo=LOCAL_TIMEZONE)
+    except (TypeError, ValueError):
+        return None
+
+
 class DbRow(dict[str, Any]):
     def __init__(self, columns: list[str], values: tuple[Any, ...]) -> None:
         super().__init__(zip(columns, values, strict=False))
@@ -426,6 +504,13 @@ class SqliteStore:
                     mt_platform TEXT,
                     mt_login TEXT,
                     mt_server TEXT,
+                    -- Admin owned run switch. status belongs to the user (they may
+                    -- stop their own strategy); this one they can neither see as a
+                    -- control nor change, so an admin can stop a key that must not
+                    -- trade. blocked_login records the account it was stopped for,
+                    -- so binding a different account clears the stop.
+                    run_enabled INTEGER NOT NULL DEFAULT 1,
+                    blocked_login TEXT NOT NULL DEFAULT '',
                     config_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -833,10 +918,23 @@ class SqliteStore:
                     UNIQUE(deployment_id, login, server),
                     FOREIGN KEY(deployment_id) REFERENCES deployments(id)
                 );
+
+                -- The admin统计 page reads decisions inside a time window, so the
+                -- window needs an index: without one every load scans the whole
+                -- table and the page times out once the platform has history.
+                CREATE INDEX IF NOT EXISTS idx_decisions_created_at
+                    ON decisions(created_at);
+                CREATE INDEX IF NOT EXISTS idx_decisions_deployment_created
+                    ON decisions(deployment_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_created_at
+                    ON ai_usage_logs(created_at);
+                CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_deployment_created
+                    ON ai_usage_logs(deployment_id, created_at);
                 """
             )
             self._ensure_mt5_history_columns(connection)
             self._ensure_decision_columns(connection)
+            self._ensure_deployment_columns(connection)
             self._ensure_ai_usage_columns(connection)
             self._ensure_ai_usage_monthly_columns(connection)
             self._ensure_ai_model_columns(connection)
@@ -1210,6 +1308,20 @@ class SqliteStore:
             "account_server": "ALTER TABLE decisions ADD COLUMN account_server TEXT NOT NULL DEFAULT ''",
             "symbol": "ALTER TABLE decisions ADD COLUMN symbol TEXT NOT NULL DEFAULT ''",
             "timeframe": "ALTER TABLE decisions ADD COLUMN timeframe TEXT NOT NULL DEFAULT ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                connection.execute(statement)
+
+    def _ensure_deployment_columns(self, connection: sqlite3.Connection) -> None:
+        """Add the admin run switch to deployments created before it existed."""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(deployments)").fetchall()
+        }
+        migrations = {
+            "run_enabled": "ALTER TABLE deployments ADD COLUMN run_enabled INTEGER NOT NULL DEFAULT 1",
+            "blocked_login": "ALTER TABLE deployments ADD COLUMN blocked_login TEXT NOT NULL DEFAULT ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -2470,12 +2582,67 @@ class SqliteStore:
             ),
         }
 
+    def _decision_action_expression(self) -> str:
+        """SQL for the decision payload's action word.
+
+        Reading it in the query is what keeps this page fast: it used to load
+        every decision row with its whole JSON into Python and parse it there just
+        to count one word, so the cost grew with all history and the request
+        eventually exceeded the admin's ten second timeout. MySQL spells the JSON
+        functions differently, hence the override on MySQLStore.
+        """
+        return "json_extract(d.response_json, '$.action')"
+
     def admin_ai_strategy_overview(self, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Totals and per strategy rows for the admin statistics page.
+
+        start_at/end_at bound the decision, usage and order figures. Balance,
+        recharge and platform AI charges are current state, not activity, so they
+        stay platform wide - the page says so under the filters.
+        """
         filters = filters or {}
         billing_settings = self.get_ai_billing_settings()
         credit_limit = Decimal(str(billing_settings["credit_limit"]))
         warning_threshold = Decimal(str(billing_settings["low_balance_threshold"]))
         month_start = datetime.now(timezone.utc).strftime("%Y-%m-01T00:00:00+00:00")
+        start_at = str(filters.get("start_at") or "").strip()
+        end_at = str(filters.get("end_at") or "").strip()
+        action_expression = self._decision_action_expression()
+
+        decision_params: list[Any] = []
+        decision_where = ""
+        if start_at or end_at:
+            clauses: list[str] = []
+            if start_at:
+                clauses.append("d.created_at >= ?")
+                decision_params.append(start_at)
+            if end_at:
+                clauses.append("d.created_at < ?")
+                decision_params.append(end_at)
+            decision_where = f"WHERE {' AND '.join(clauses)}"
+
+        usage_params: list[Any] = []
+        usage_where = ""
+        if start_at or end_at:
+            clauses = []
+            if start_at:
+                clauses.append("created_at >= ?")
+                usage_params.append(start_at)
+            if end_at:
+                clauses.append("created_at < ?")
+                usage_params.append(end_at)
+            usage_where = f"WHERE {' AND '.join(clauses)}"
+
+        order_clauses = ["bucket_type = 'day'"]
+        order_params: list[Any] = []
+        if start_at:
+            order_clauses.append("bucket_start >= ?")
+            order_params.append(_epoch_seconds(start_at))
+        if end_at:
+            order_clauses.append("bucket_start < ?")
+            order_params.append(_epoch_seconds(end_at))
+        order_where = " AND ".join(order_clauses)
+
         with self._connect() as connection:
             deployments = [
                 self._deployment_row(row)
@@ -2483,19 +2650,25 @@ class SqliteStore:
                     """
                     SELECT *
                     FROM deployments
-                    WHERE config_json LIKE '%deployment_key%'
                     ORDER BY updated_at DESC
                     """
                 ).fetchall()
             ]
             decision_rows = connection.execute(
-                """
-                SELECT d.deployment_id, d.endpoint, d.response_json
+                f"""
+                SELECT
+                    d.deployment_id,
+                    COUNT(*) AS analysis_count,
+                    COALESCE(SUM(CASE WHEN UPPER(COALESCE({action_expression}, '')) NOT IN ('', 'HOLD') THEN 1 ELSE 0 END), 0) AS signal_count,
+                    COALESCE(SUM(CASE WHEN d.endpoint = 'open' AND UPPER(COALESCE({action_expression}, '')) IN ('BUY', 'SELL') THEN 1 ELSE 0 END), 0) AS order_count
                 FROM decisions d
-                """
+                {decision_where}
+                GROUP BY d.deployment_id
+                """,
+                decision_params,
             ).fetchall()
             usage_rows = connection.execute(
-                """
+                f"""
                 SELECT
                     deployment_id,
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -2504,8 +2677,10 @@ class SqliteStore:
                     COALESCE(SUM(official_tokens), 0) AS official_tokens,
                     COALESCE(SUM(custom_tokens), 0) AS custom_tokens
                 FROM ai_usage_logs
+                {usage_where}
                 GROUP BY deployment_id
-                """
+                """,
+                usage_params,
             ).fetchall()
             wallet_user_row = connection.execute(
                 """
@@ -2536,12 +2711,13 @@ class SqliteStore:
                 (month_start,),
             ).fetchone()
             history_rows = connection.execute(
-                """
+                f"""
                 SELECT deployment_id, COALESCE(SUM(net_profit), 0) net_profit
                 FROM mt_order_time_summaries
-                WHERE bucket_type = 'day'
+                WHERE {order_where}
                 GROUP BY deployment_id
-                """
+                """,
+                order_params,
             ).fetchall()
             # The admin filters by user, so the display name travels with the row.
             user_rows = connection.execute(
@@ -2565,6 +2741,8 @@ class SqliteStore:
                 "symbol": deployment.get("symbol") or "",
                 "timeframe": deployment.get("timeframe") or "",
                 "status": deployment["status"],
+                "run_enabled": bool(deployment.get("run_enabled", 1) or 0),
+                "blocked_login": str(deployment.get("blocked_login") or ""),
                 "analysis_count": 0,
                 "signal_count": 0,
                 "order_count": 0,
@@ -2595,23 +2773,20 @@ class SqliteStore:
         total_signals = 0
         total_orders = 0
         for row in decision_rows:
-            deployment_id = row["deployment_id"]
-            item = by_deployment.get(deployment_id)
+            # The counts arrive already aggregated per deployment, so nothing here
+            # depends on how much history exists.
+            item = by_deployment.get(row["deployment_id"])
             if item is None:
                 continue
-            item["analysis_count"] += 1
-            total_analysis += 1
-            try:
-                payload = json.loads(row["response_json"])
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            action = str(payload.get("action") or "").upper()
-            if action and action != "HOLD":
-                item["signal_count"] += 1
-                total_signals += 1
-            if row["endpoint"] == "open" and action in {"BUY", "SELL"}:
-                item["order_count"] += 1
-                total_orders += 1
+            analysis_count = int(row["analysis_count"] or 0)
+            signal_count = int(row["signal_count"] or 0)
+            order_count = int(row["order_count"] or 0)
+            item["analysis_count"] = analysis_count
+            item["signal_count"] = signal_count
+            item["order_count"] = order_count
+            total_analysis += analysis_count
+            total_signals += signal_count
+            total_orders += order_count
 
         total_input_tokens = 0
         total_output_tokens = 0
@@ -3395,7 +3570,12 @@ class SqliteStore:
         return deployment
 
     def set_deployment_login(self, raw_key: str, login: str) -> dict[str, Any] | None:
-        """Set or clear the MT login from the strategy editor."""
+        """Set or clear the MT login from the strategy editor.
+
+        Changing the account also clears an admin stop: the stop is about the
+        account that was found unacceptable, so pointing the key at another one
+        starts it again by default. The operator can stop the new one too.
+        """
         normalized_login = str(login or "").strip()
         key_hash = hash_deployment_key(raw_key)
         with self._connect() as connection:
@@ -3411,7 +3591,55 @@ class SqliteStore:
                 "SELECT * FROM deployments WHERE key_hash = ?",
                 (key_hash,),
             ).fetchone()
+            if row is not None:
+                blocked_login = str(row["blocked_login"] or "").strip()
+                # Only a real, different account clears the stop. Clearing the
+                # binding must not, or unbinding and rebinding the same account
+                # would be a way around it.
+                if blocked_login and normalized_login and blocked_login != normalized_login:
+                    connection.execute(
+                        """
+                        UPDATE deployments
+                        SET run_enabled = 1, blocked_login = '', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (utc_now_iso(), row["id"]),
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM deployments WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
         return self._deployment_row(row) if row else None
+
+    def set_deployment_run_enabled(self, deployment_id: str, enabled: bool) -> dict[str, Any] | None:
+        """Admin owned run switch for one deployment key.
+
+        Stopping records the account it was stopped for, so a later account change
+        re-enables it without anyone having to remember. Turning it back on clears
+        that record. The row is read first because the MySQL cursor has no
+        rowcount.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM deployments WHERE id = ?",
+                (str(deployment_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            blocked_login = str(row["mt_login"] or "").strip() if not enabled else ""
+            connection.execute(
+                """
+                UPDATE deployments
+                SET run_enabled = ?, blocked_login = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, blocked_login, utc_now_iso(), str(deployment_id)),
+            )
+            updated = connection.execute(
+                "SELECT * FROM deployments WHERE id = ?",
+                (str(deployment_id),),
+            ).fetchone()
+        return self._deployment_row(updated) if updated else None
 
     def get_decision(
         self,
@@ -7002,6 +7230,7 @@ class MySQLStore(SqliteStore):
         self._ensure_mysql_guide_article_table()
         self._ensure_mysql_order_summary_table()
         self._ensure_mysql_strategy_outcome_table()
+        self._ensure_mysql_deployment_columns()
         required_tables = {
             "users",
             "email_verification_codes",
@@ -7043,6 +7272,7 @@ class MySQLStore(SqliteStore):
             raise RuntimeError(f"mysql_schema_missing_tables:{','.join(missing)}")
         self._ensure_mysql_decision_columns()
         self._ensure_mysql_history_indexes()
+        self._ensure_mysql_analytics_indexes()
         self._ensure_mysql_ai_usage_columns()
         self._ensure_mysql_official_strategy_columns()
         self._ensure_mysql_gl_trend_strategy_seed()
@@ -7559,6 +7789,58 @@ class MySQLStore(SqliteStore):
             for index_name, statement in history_indexes.items():
                 if index_name not in indexes:
                     connection.execute(statement)
+
+    def _decision_action_expression(self) -> str:
+        # MySQL spells the JSON helpers differently from SQLite; the aggregate in
+        # admin_ai_strategy_overview is otherwise identical.
+        return "JSON_UNQUOTE(JSON_EXTRACT(d.response_json, '$.action'))"
+
+    def _ensure_mysql_deployment_columns(self) -> None:
+        """Add the admin run switch to deployments created before it existed."""
+        migrations = {
+            "run_enabled": "ALTER TABLE deployments ADD COLUMN run_enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER mt_server",
+            "blocked_login": "ALTER TABLE deployments ADD COLUMN blocked_login VARCHAR(64) NOT NULL DEFAULT '' AFTER run_enabled",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'deployments'
+                """
+            ).fetchall()
+            columns = {str(row["COLUMN_NAME"]) for row in rows}
+            for column, statement in migrations.items():
+                if column not in columns:
+                    connection.execute(statement)
+
+    def _ensure_mysql_analytics_indexes(self) -> None:
+        """Index the time windows the admin statistics page reads.
+
+        Adding the index on a large table takes a moment on the first start after
+        this ships; every later start skips it. Without it the overview scans the
+        whole decisions table and the page times out.
+        """
+        wanted = {
+            "idx_decisions_created_at": "CREATE INDEX idx_decisions_created_at ON decisions(created_at)",
+            "idx_decisions_deployment_created": "CREATE INDEX idx_decisions_deployment_created ON decisions(deployment_id, created_at)",
+            "idx_ai_usage_logs_created_at": "CREATE INDEX idx_ai_usage_logs_created_at ON ai_usage_logs(created_at)",
+            "idx_ai_usage_logs_deployment_created": "CREATE INDEX idx_ai_usage_logs_deployment_created ON ai_usage_logs(deployment_id, created_at)",
+        }
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT TABLE_NAME, INDEX_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                """
+            ).fetchall()
+            existing = {(str(row["TABLE_NAME"]), str(row["INDEX_NAME"])) for row in rows}
+            for index_name, statement in wanted.items():
+                table = statement.split(" ON ", 1)[1].split("(", 1)[0]
+                if (table, index_name) in existing:
+                    continue
+                connection.execute(statement)
 
     def _ensure_mysql_ai_usage_columns(self) -> None:
         migrations = {

@@ -68,7 +68,7 @@ from app.services.regime_service import (
     timeframe_features,
 )
 from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
-from app.store import ARBITRAGE_EA_CONFIG_DEFAULTS, SqliteStore
+from app.store import ARBITRAGE_EA_CONFIG_DEFAULTS, SqliteStore, admin_period_range
 from app.strategies import turtle_agent
 from app.strategies.pending_orders import cancel_stale_pending_orders
 
@@ -563,6 +563,17 @@ def create_mt5_router(
             ea_config_keys = _EA_SERVER_CONFIG_KEYS[deployment["strategy_code"]]
             defaults = official_strategy["default_config"] if official_strategy else {}
             ea_config = {**(defaults if isinstance(defaults, dict) else {}), **config}
+        # An operator stop travels as status text and nothing else: the response
+        # still carries the strategy, its config and the periods to upload, so the
+        # EA has everything it needs to decide what to do. It is not an access
+        # error, because the key and the account are fine.
+        run_blocked = not bool(deployment.get("run_enabled", 1))
+        if access_error is not None:
+            strategy_status = _mt5_business_error_description(access_error, include_code=False)
+        elif run_blocked:
+            strategy_status = _mt5_business_error_description("deployment_blocked", include_code=False)
+        else:
+            strategy_status = deployment["status"]
         return Mt5StrategyInitResponse(
             status="ok",
             protocol_version=1.0,
@@ -573,11 +584,7 @@ def create_mt5_router(
                 code=deployment["strategy_code"],
                 name=strategy_name,
                 summary=strategy_summary,
-                status=(
-                    _mt5_business_error_description(access_error, include_code=False)
-                    if access_error is not None
-                    else deployment["status"]
-                ),
+                status=strategy_status,
                 open_data_type=ea_config.get("open_data_type", "kline"),
                 open_kline_count=int(ea_config.get("open_kline_count", 200)),
                 position_data_type=ea_config.get("position_data_type", "kline"),
@@ -855,6 +862,11 @@ def create_mt5_router(
             )
             cached = False
 
+        # An operator stop is reported, not enforced: the EA reads it and decides.
+        if not bool(deployment.get("run_enabled", 1)):
+            blocked_note = _mt5_business_error_description("deployment_blocked", include_code=False)
+            read = {**read, "description": f"{blocked_note}。{read.get('description', '')}"}
+
         valid_until = (
             datetime.now(timezone.utc) + timedelta(seconds=REGIME_CACHE_SECONDS)
         ).isoformat()
@@ -970,7 +982,39 @@ def create_admin_ai_router(
             key: str(payload.get(key) or "").strip()
             for key in ("user_id", "username", "strategy_code", "deployment_key")
         }
+        # The window is computed here rather than in the SQL: "today" means the
+        # operator's today (UTC+8) while the rows are stored in UTC.
+        start_at, end_at = admin_period_range(
+            str(payload.get("period") or "today"),
+            str(payload.get("start_at") or ""),
+            str(payload.get("end_at") or ""),
+        )
+        filters["start_at"] = start_at
+        filters["end_at"] = end_at
         return ok(store.admin_ai_strategy_overview(filters))
+
+    @router.post("/deployment/run-state")
+    def deployment_run_state(payload: dict[str, object] | None = None) -> dict[str, object]:
+        """Admin run switch for one strategy key.
+
+        Stopping is not a delete and not the user's own status switch: it tells
+        every EA of that key that an operator stopped it, while the key, its
+        account and its history stay exactly as they are.
+        """
+        payload = payload or {}
+        deployment_id = str(payload.get("deployment_id") or "").strip()
+        if not deployment_id:
+            raise HTTPException(status_code=400, detail="deployment_id_required")
+        enabled = bool(payload.get("enabled"))
+        updated = store.set_deployment_run_enabled(deployment_id, enabled)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="deployment_not_found")
+        return ok({
+            "id": updated["id"],
+            "run_enabled": bool(updated.get("run_enabled", 1)),
+            "blocked_login": str(updated.get("blocked_login") or ""),
+            "mt_login": str(updated.get("mt_login") or ""),
+        }, "saved" if enabled else "stopped")
 
     @router.post("/user/list")
     def user_list(payload: dict[str, object] | None = None) -> dict[str, object]:
@@ -2299,6 +2343,9 @@ def _mt5_business_error_description(
         "deployment_account_mismatch": "当前 MT 账号与策略绑定账号不一致，请在用户中心修改绑定账号",
         "invalid_deployment_account": "MT 账号无效，请检查账号后重试",
         "insufficient_balance": "AI 余额不足，策略分析已停止，请充值后继续使用",
+        # Not an access error: the key itself is fine, an operator stopped it. The
+        # text is what the EA reads, and acting on it is the EA's job.
+        "deployment_blocked": "该策略已被管理员暂停运行，请联系管理员",
         "screenshot_required": "EA未提供策略所需截图，本次分析已停止",
         "unsupported_screenshot_type": "截图格式不支持，请使用PNG、JPEG或WebP",
         "invalid_screenshot_base64": "截图Base64数据无效，本次分析已停止",
