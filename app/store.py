@@ -2977,7 +2977,8 @@ class SqliteStore:
         wanted_name = str(filters.get("username") or "").strip().lower()
         wanted_code = str(filters.get("strategy_code") or "").strip().lower()
         wanted_key = str(filters.get("deployment_key") or "").strip().lower()
-        if wanted_user or wanted_name or wanted_code or wanted_key:
+        wanted_status = str(filters.get("status") or "").strip().lower()
+        if wanted_user or wanted_name or wanted_code or wanted_key or wanted_status:
             by_deployment = {
                 deployment_id: item
                 for deployment_id, item in by_deployment.items()
@@ -2985,6 +2986,7 @@ class SqliteStore:
                 and (not wanted_name or wanted_name in str(item["username"]).lower())
                 and (not wanted_code or wanted_code in str(item["strategy_code"]).lower())
                 and (not wanted_key or wanted_key in str(item["deployment_key"]).lower())
+                and (not wanted_status or wanted_status == str(item["status"]).lower())
             }
 
         total_analysis = 0
@@ -3256,7 +3258,13 @@ class SqliteStore:
             ],
         }
 
-    def admin_official_strategy_detail(self, strategy_id: str, *, period: str = "all") -> dict[str, Any]:
+    def admin_official_strategy_detail(
+        self,
+        strategy_id: str,
+        *,
+        period: str = "all",
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         strategy = self.get_official_ai_strategy(strategy_id)
         if strategy is None:
             raise RuntimeError("official_strategy_not_found")
@@ -3264,6 +3272,7 @@ class SqliteStore:
             str(strategy["code"]),
             period=period,
             strategy_name=str(strategy["name"] or ""),
+            filters=filters,
         )
         return {
             "strategy": strategy,
@@ -3276,19 +3285,49 @@ class SqliteStore:
         *,
         period: str = "all",
         strategy_name: str = "",
+        filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        filters = filters or {}
+        wanted_user = str(filters.get("user_id") or "").strip()
+        wanted_name = str(filters.get("username") or "").strip().lower()
+        wanted_status = str(filters.get("status") or "").strip().lower()
         start_iso, end_iso, start_ts, end_ts, bucket = _period_bounds(period)
+        deployment_clauses = ["strategy_code = ?"]
+        deployment_params: list[Any] = [strategy_code]
+        if wanted_user:
+            # Same loose match as the statistics page, so typing part of an id works.
+            deployment_clauses.append("user_id LIKE ?")
+            deployment_params.append(f"%{wanted_user}%")
+        if wanted_status:
+            deployment_clauses.append("status = ?")
+            deployment_params.append(wanted_status)
         with self._connect() as connection:
+            if wanted_name:
+                matched_users = connection.execute(
+                    """
+                    SELECT id FROM users
+                    WHERE LOWER(email) LIKE ? OR LOWER(nickname) LIKE ?
+                    """,
+                    (f"%{wanted_name}%", f"%{wanted_name}%"),
+                ).fetchall()
+                matched_ids = [str(row["id"]) for row in matched_users]
+                if not matched_ids:
+                    deployment_clauses.append("1 = 0")
+                else:
+                    deployment_clauses.append(
+                        f"user_id IN ({', '.join('?' for _ in matched_ids)})"
+                    )
+                    deployment_params.extend(matched_ids)
             deployments = [
                 self._deployment_row(row)
                 for row in connection.execute(
-                    """
+                    f"""
                     SELECT *
                     FROM deployments
-                    WHERE strategy_code = ?
+                    WHERE {' AND '.join(deployment_clauses)}
                     ORDER BY updated_at DESC
                     """,
-                    (strategy_code,),
+                    deployment_params,
                 ).fetchall()
             ]
             decision_rows = connection.execute(
@@ -3544,6 +3583,10 @@ class SqliteStore:
         total_custom_tokens = 0
         for row in usage_rows:
             item = by_deployment.get(row["deployment_id"])
+            if item is None:
+                # Filtered out: counting it in the totals would make the cards
+                # disagree with the list underneath them.
+                continue
             input_tokens = int(row["input_tokens"] or 0)
             output_tokens = int(row["output_tokens"] or 0)
             official_tokens = int(row["official_tokens"] or 0)
@@ -3554,7 +3597,7 @@ class SqliteStore:
             total_tokens += row_total_tokens
             total_official_tokens += official_tokens
             total_custom_tokens += custom_tokens
-            if item is not None:
+            if item is not None:  # always true here; kept as the guard for this block
                 deployment_stats = deployment_usage_stats.setdefault(
                     str(row["deployment_id"] or ""),
                     {
@@ -3610,6 +3653,10 @@ class SqliteStore:
         account_trade_stats: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         account_symbols: dict[tuple[str, str, str], set[str]] = {}
         for row in history_rows:
+            item = by_deployment.get(row["deployment_id"])
+            if item is None:
+                # Filtered out: it must not reach the totals or the curve either.
+                continue
             profit = float(row["net_profit"] or 0)
             close_order_count = int(row["close_order_count"] or 0)
             total_pnl += profit
@@ -3617,8 +3664,7 @@ class SqliteStore:
             close_time = int(row["close_time"] or 0)
             bucket_key = _time_bucket(close_time, bucket)
             pnl_buckets[bucket_key] = round(pnl_buckets.get(bucket_key, 0.0) + profit, 2)
-            item = by_deployment.get(row["deployment_id"])
-            if item is not None:
+            if item is not None:  # always true here; kept as the guard for this block
                 active_deployments.add(row["deployment_id"])
                 item["last_active_at"] = max(str(item["last_active_at"] or ""), str(row["updated_at"] or ""))
                 item["pnl"] = round(float(item["pnl"]) + profit, 2)
@@ -3634,8 +3680,7 @@ class SqliteStore:
                 ),
             )
             account_key = (*account_base_key, symbol)
-            account_stats = account_trade_stats.setdefault(
-                account_key,
+            account_stats = account_trade_stats.setdefault(                account_key,
                 {
                     "pnl": 0.0,
                     "close_order_count": 0,

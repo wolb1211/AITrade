@@ -980,7 +980,7 @@ def create_admin_ai_router(
         payload = payload or {}
         filters = {
             key: str(payload.get(key) or "").strip()
-            for key in ("user_id", "username", "strategy_code", "deployment_key")
+            for key in ("user_id", "username", "strategy_code", "deployment_key", "status")
         }
         # The window is computed here rather than in the SQL: "today" means the
         # operator's today (UTC+8) while the rows are stored in UTC.
@@ -1238,6 +1238,10 @@ def create_admin_ai_router(
             return ok(store.admin_official_strategy_detail(
                 strategy_id,
                 period=str(payload.get("period") or "all").strip(),
+                filters={
+                    key: str(payload.get(key) or "").strip()
+                    for key in ("user_id", "username", "status")
+                },
             ))
         except RuntimeError as exc:
             if str(exc) == "official_strategy_not_found":
