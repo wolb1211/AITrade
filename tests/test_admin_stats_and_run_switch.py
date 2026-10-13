@@ -181,6 +181,30 @@ def test_the_day_summary_backfill_rebuilds_the_counters(tmp_path: Path) -> None:
         assert store.admin_ai_strategy_overview({})["summary"]["analysis_count"] == 0
 
 
+def test_regime_analysis_counts_as_an_analysis(tmp_path: Path) -> None:
+    # The arbitrage EA trades on its own and writes no decision row, so its only
+    # billed work is the regime read. Counting it keeps the analysis figure in line
+    # with the token figure instead of sitting at zero forever.
+    app = _app(tmp_path, "regime-count.db")
+    with TestClient(app) as client:
+        store = app.state.store
+        deployment = _deploy(store, "gl_regime_count", _vip_user(store))
+
+        store.record_ai_analysis(deployment["id"])
+        store.record_ai_analysis(deployment["id"])
+
+        stats = store.deployment_runtime_stats(deployment["id"])
+        assert stats["analysis_count"] == 2
+        # Counting an analysis must not invent a signal or an order.
+        assert stats["signal_count"] == 0
+        assert stats["order_count"] == 0
+
+        # The official strategy page reads the same counter.
+        detail = store.admin_official_strategy_detail("GL_ARBITRAGE_V1", period="all")
+        assert detail["summary"]["analysis_count"] == 2
+        assert detail["summary"]["signal_count"] == 0
+
+
 def test_portal_counts_survive_detail_trimming(tmp_path: Path) -> None:
     # The client's strategy list shows cumulative counts. It used to read the
     # decision rows themselves, so once the detail was trimmed those numbers would

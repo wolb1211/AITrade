@@ -979,8 +979,16 @@ class SqliteStore:
         self._backfill_order_time_summaries()
         self._ensure_existing_users()
         self._ensure_official_strategy_config_defaults()
-        self._backfill_decision_actions()
-        self._backfill_decision_summaries()
+        # See the MySQL path: a failing one time conversion logs and continues.
+        for backfill in (
+            self._backfill_decision_actions,
+            self._backfill_decision_summaries,
+            self._backfill_regime_analysis_counts,
+        ):
+            try:
+                backfill()
+            except Exception:  # noqa: BLE001 - a backfill must never block startup
+                logger.exception("backfill %s failed; continuing without it", backfill.__name__)
         self._ensure_detail_retention_defaults()
 
     def _ensure_official_strategy_config_defaults(self) -> None:
@@ -3479,6 +3487,46 @@ class SqliteStore:
                 if row["endpoint"] == "open" and action in {"BUY", "SELL"}:
                     account_stat["order_count"] = int(account_stat["order_count"] or 0) + 1
 
+        # The headline counters come from the daily summary, which also counts the
+        # analyses an EA makes through Regime without writing a decision. Without
+        # this the arbitrage strategy showed zero analyses while its token usage
+        # kept climbing. The decision rows above are still needed for the
+        # per-account and per-symbol breakdown.
+        with self._connect() as connection:
+            summary_rows = connection.execute(
+                """
+                SELECT deployment_id,
+                       COALESCE(SUM(analysis_count), 0) AS analysis_count,
+                       COALESCE(SUM(signal_count), 0) AS signal_count,
+                       COALESCE(SUM(order_count), 0) AS order_count
+                FROM mt_decision_time_summaries
+                WHERE strategy_code = ? AND bucket_type = 'day'
+                  AND bucket_start >= ? AND bucket_start <= ?
+                GROUP BY deployment_id
+                """,
+                (strategy_code, _bucket_timestamp(int(start_ts), "day"), _bucket_timestamp(int(end_ts), "day")),
+            ).fetchall()
+        summary_counts = {
+            str(row["deployment_id"]): (
+                int(row["analysis_count"] or 0),
+                int(row["signal_count"] or 0),
+                int(row["order_count"] or 0),
+            )
+            for row in summary_rows
+        }
+        if summary_counts:
+            total_analysis = 0
+            total_signals = 0
+            total_orders = 0
+            for deployment_id, item in by_deployment.items():
+                counts = summary_counts.get(str(deployment_id))
+                if counts is None:
+                    counts = (0, 0, 0)
+                item["analysis_count"], item["signal_count"], item["order_count"] = counts
+                total_analysis += counts[0]
+                total_signals += counts[1]
+                total_orders += counts[2]
+
         for row in activity_rows:
             item = by_deployment.get(row["deployment_id"])
             if item is None:
@@ -3919,6 +3967,107 @@ class SqliteStore:
                 now,
             ),
         )
+
+    def _backfill_regime_analysis_counts(self) -> None:
+        """Count the analyses that happened before they were counted.
+
+        Regime calls were billed from the start but never added to the analysis
+        counter, so history has to be lifted out of the usage log once. Guarded by a
+        marker: running it twice would double every figure.
+        """
+        marker = "regime_analysis_counts_backfilled"
+        with self._connect() as connection:
+            done = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                (marker,),
+            ).fetchone()
+            if done is not None:
+                return
+            rows = connection.execute(
+                """
+                SELECT deployment_id, SUBSTR(created_at, 1, 10) AS day, COUNT(*) AS calls
+                FROM ai_usage_logs
+                WHERE endpoint = 'regime' AND COALESCE(provider_called, 1) = 1
+                GROUP BY deployment_id, SUBSTR(created_at, 1, 10)
+                """
+            ).fetchall()
+            if rows:
+                logger.info("backfilling %d regime analysis days", len(rows))
+            for row in rows:
+                try:
+                    stamp = int(
+                        datetime.fromisoformat(f"{row['day']}T00:00:00+00:00").timestamp()
+                    )
+                except (TypeError, ValueError):
+                    continue
+                bucket = _bucket_timestamp(stamp, "day")
+                calls = int(row["calls"] or 0)
+                if bucket <= 0 or calls <= 0:
+                    continue
+                owner = connection.execute(
+                    "SELECT user_id, strategy_code FROM deployments WHERE id = ?",
+                    (str(row["deployment_id"]),),
+                ).fetchone()
+                now = utc_now_iso()
+                connection.execute(
+                    """
+                    INSERT INTO mt_decision_time_summaries (
+                        id, user_id, deployment_id, strategy_code,
+                        bucket_type, bucket_start,
+                        analysis_count, signal_count, order_count,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'day', ?, ?, 0, 0, ?, ?)
+                    ON CONFLICT(deployment_id, bucket_type, bucket_start) DO UPDATE SET
+                        analysis_count = analysis_count + excluded.analysis_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        f"dsum_{uuid4().hex}",
+                        str(owner["user_id"]) if owner else "",
+                        str(row["deployment_id"]),
+                        str(owner["strategy_code"]) if owner else "",
+                        bucket,
+                        calls,
+                        now,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (marker, "1", "regime 分析次数回填标记，只做一次", utc_now_iso()),
+            )
+
+    def record_ai_analysis(self, deployment_id: str) -> None:
+        """Count one AI analysis that produced no decision.
+
+        The arbitrage EA trades on its own and only calls init and regime, so it
+        writes no decision row. Its regime calls are real, billed analyses though,
+        which is why the token figures moved while the analysis counter stayed at
+        zero. Counting them in the same daily counter keeps every page consistent.
+        """
+        now = utc_now_iso()
+        with self._connect() as connection:
+            owner = connection.execute(
+                "SELECT user_id, strategy_code FROM deployments WHERE id = ?",
+                (str(deployment_id),),
+            ).fetchone()
+            self._bump_decision_summary(
+                connection,
+                deployment_id=str(deployment_id),
+                user_id=str(owner["user_id"]) if owner else "",
+                strategy_code=str(owner["strategy_code"]) if owner else "",
+                # An analysis is not a signal: only a real decision can be one.
+                action="",
+                endpoint="regime",
+                now=now,
+            )
 
     def save_decision(
         self,
@@ -7973,8 +8122,18 @@ class MySQLStore(SqliteStore):
         self._backfill_ai_usage_monthly_summaries()
         self._backfill_ai_cache_stats()
         self._backfill_order_time_summaries()
-        self._backfill_decision_actions()
-        self._backfill_decision_summaries()
+        # Each of these is a one time conversion of existing rows. A failure must
+        # not take the service down with it: the worst case is a counter that stays
+        # at its old value and a logged traceback, not an API that will not start.
+        for backfill in (
+            self._backfill_decision_actions,
+            self._backfill_decision_summaries,
+            self._backfill_regime_analysis_counts,
+        ):
+            try:
+                backfill()
+            except Exception:  # noqa: BLE001 - a backfill must never block startup
+                logger.exception("backfill %s failed; continuing without it", backfill.__name__)
         self._ensure_detail_retention_defaults()
 
     def _ensure_mysql_order_summary_table(self) -> None:

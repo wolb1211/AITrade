@@ -2022,6 +2022,14 @@ def _refresh_regime_read(
             result = None
         if result is not None and isinstance(result.content, dict):
             ai_content = result.content
+            # A call that really went to the provider is a billed analysis, so it
+            # counts even though the arbitrage EA writes no decision row. A cache
+            # hit costs nothing and is not counted.
+            if not bool(getattr(result, "cached", False)):
+                try:
+                    store.record_ai_analysis(str(deployment["id"]))
+                except Exception as exc:  # noqa: BLE001 - counting must never break the read
+                    logger.warning("regime analysis not counted: %s: %s", type(exc).__name__, exc)
 
     features_by_label = {
         label: dict(period.get("features") or {}) for label, period in ai_periods.items()
