@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+from time import perf_counter
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
@@ -122,6 +123,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    @application.middleware("http")
+    async def add_response_time_header(request: Request, call_next):
+        """Report how long the server itself took on every response.
+
+        Reported as a header so a slow page can be split into "the server was
+        slow" and "the connection was slow" without server access: a 0.9 kB reply
+        that took eleven seconds in the browser but carries x-response-ms: 4 is a
+        network problem, not a query problem.
+        """
+        started = perf_counter()
+        response = await call_next(request)
+        response.headers["x-response-ms"] = str(max(1, round((perf_counter() - started) * 1000)))
+        return response
 
     application.add_middleware(
         CORSMiddleware,
