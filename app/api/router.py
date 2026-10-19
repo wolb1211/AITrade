@@ -1032,6 +1032,19 @@ def create_admin_ai_router(
             agent_level=agent_level,
         ))
 
+    @router.post("/user/detail")
+    def user_detail(payload: dict[str, object]) -> dict[str, object]:
+        """Everything the operator needs about one platform user."""
+        raw_user_id = str(payload.get("user_id") or "").strip()
+        if not raw_user_id.isdigit():
+            raise HTTPException(status_code=400, detail="user_id_required")
+        try:
+            return ok(store.admin_user_detail(int(raw_user_id)))
+        except RuntimeError as exc:
+            if str(exc) == "user_not_found":
+                raise HTTPException(status_code=404, detail="user_not_found") from exc
+            raise
+
     @router.post("/user/referrals")
     def user_referrals(payload: dict[str, object]) -> dict[str, object]:
         user_id = str(payload.get("user_id") or "").strip()

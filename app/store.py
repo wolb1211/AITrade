@@ -6662,6 +6662,142 @@ class SqliteStore:
         visible = local[:2] if len(local) > 1 else local[:1]
         return f"{visible}***@{domain}"
 
+    def admin_user_detail(self, user_id: int) -> dict[str, Any]:
+        """Everything an operator wants about one platform user in a single read.
+
+        Registration, who invited them, money in and out, what is deployed and how
+        it has done. The counters come from the daily summaries, so this stays cheap
+        however much history the deployment has.
+        """
+        user = self.get_user(user_id)
+        if user is None:
+            raise RuntimeError("user_not_found")
+        referrer = None
+        if user.get("referrer_user_id"):
+            referrer = self.get_user(int(user["referrer_user_id"]))
+
+        deployment_rows = self.list_web_deployments(str(user_id))
+        stats_by_deployment = self.deployment_runtime_stats_map(
+            [str(row["id"]) for row in deployment_rows]
+        )
+        strategies: list[dict[str, Any]] = []
+        totals = {
+            "analysis_count": 0,
+            "signal_count": 0,
+            "order_count": 0,
+            "official_tokens": 0,
+            "custom_tokens": 0,
+            "pnl": 0.0,
+        }
+        for deployment in deployment_rows:
+            stats = stats_by_deployment.get(str(deployment["id"])) or {}
+            official_tokens = int(stats.get("official_tokens_used") or 0)
+            custom_tokens = int(stats.get("custom_tokens_used") or 0)
+            strategies.append({
+                "id": str(deployment["id"]),
+                "name": str(deployment["strategy_name"] or ""),
+                "strategy_code": str(deployment["strategy_code"] or ""),
+                "deployment_key": str((deployment.get("config") or {}).get("deployment_key") or ""),
+                "status": str(deployment["status"] or ""),
+                "mt_login": str(deployment.get("mt_login") or ""),
+                "analysis_count": int(stats.get("analysis_count") or 0),
+                "signal_count": int(stats.get("signal_count") or 0),
+                "order_count": int(stats.get("order_count") or 0),
+                "official_tokens": official_tokens,
+                "custom_tokens": custom_tokens,
+                "total_tokens": official_tokens + custom_tokens,
+                "pnl": round(float(stats.get("pnl") or 0), 2),
+                "updated_at": str(deployment["updated_at"] or ""),
+            })
+            for field, value in (
+                ("analysis_count", stats.get("analysis_count")),
+                ("signal_count", stats.get("signal_count")),
+                ("order_count", stats.get("order_count")),
+                ("official_tokens", official_tokens),
+                ("custom_tokens", custom_tokens),
+            ):
+                totals[field] += int(value or 0)
+            totals["pnl"] = round(totals["pnl"] + float(stats.get("pnl") or 0), 2)
+
+        with self._connect() as connection:
+            wallet_row = connection.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN entry_type = 'admin_recharge' THEN amount ELSE 0 END), 0) AS total_recharge,
+                    COALESCE(SUM(CASE WHEN entry_type = 'admin_deduction' THEN -amount ELSE 0 END), 0) AS total_deduction,
+                    COALESCE(SUM(CASE WHEN entry_type = 'ai_charge' THEN -amount ELSE 0 END), 0) AS total_ai_charged,
+                    COUNT(*) AS ledger_count
+                FROM ai_balance_ledger
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            order_row = connection.execute(
+                """
+                SELECT COALESCE(SUM(order_count), 0) AS order_count,
+                       COALESCE(SUM(win_count), 0) AS win_count,
+                       COALESCE(SUM(loss_count), 0) AS loss_count,
+                       COALESCE(SUM(net_profit), 0) AS pnl,
+                       COUNT(DISTINCT CASE WHEN symbol <> '' THEN symbol END) AS symbol_count
+                FROM mt_order_time_summaries
+                WHERE user_id = ? AND bucket_type = 'day'
+                """,
+                (str(user_id),),
+            ).fetchone()
+
+        closed_count = int(order_row["order_count"] or 0) if order_row else 0
+        win_count = int(order_row["win_count"] or 0) if order_row else 0
+        return {
+            "user": {
+                "id": int(user["id"]),
+                "email": str(user["email"] or ""),
+                "nickname": str(user["nickname"] or ""),
+                "status": str(user["status"] or ""),
+                "remark": str(user.get("remark") or ""),
+                "vip_level": int(user.get("vip_level") or 0),
+                "vip_active": bool(user.get("vip_active")),
+                "vip_expires_at": str(user.get("vip_expires_at") or ""),
+                "agent_level": int(user.get("agent_level") or 0),
+                "invite_code": str(user.get("invite_code") or ""),
+                "max_strategy_keys": int(user.get("max_strategy_keys") or 0),
+                "email_verified": bool(user.get("email_verified")),
+                "last_login_at": str(user.get("last_login_at") or ""),
+                "created_at": str(user.get("created_at") or ""),
+                "referrer_user_id": int(user.get("referrer_user_id") or 0) or None,
+            },
+            "referrer": (
+                {
+                    "id": int(referrer["id"]),
+                    "email": str(referrer.get("email") or ""),
+                    "nickname": str(referrer.get("nickname") or ""),
+                }
+                if referrer
+                else None
+            ),
+            "wallet": {
+                "balance": str(user.get("ai_balance") or "0"),
+                "credit_limit": str(user.get("credit_limit") or "0"),
+                "available_balance": str(user.get("available_balance") or "0"),
+                "total_recharge": decimal_string(wallet_row["total_recharge"] if wallet_row else 0),
+                "total_deduction": decimal_string(wallet_row["total_deduction"] if wallet_row else 0),
+                "total_ai_charged": decimal_string(wallet_row["total_ai_charged"] if wallet_row else 0),
+                "ledger_count": int(wallet_row["ledger_count"] or 0) if wallet_row else 0,
+            },
+            "totals": {
+                **totals,
+                "strategy_count": len(strategies),
+                "closed_count": closed_count,
+                "win_count": win_count,
+                "loss_count": int(order_row["loss_count"] or 0) if order_row else 0,
+                "win_rate": round((win_count / closed_count) * 100, 2) if closed_count else 0.0,
+                "symbol_count": int(order_row["symbol_count"] or 0) if order_row else 0,
+                # The order summaries are cumulative; this is what an operator reads
+                # as 盈亏.
+                "order_pnl": round(float(order_row["pnl"] or 0), 2) if order_row else 0.0,
+            },
+            "strategies": strategies,
+        }
+
     def get_agent_dashboard(self, user_id: int, *, page: int = 1, size: int = 20) -> dict[str, Any]:
         agent = self.get_user(user_id)
         if agent is None:
