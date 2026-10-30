@@ -1217,15 +1217,17 @@ class SqliteStore:
         bucket_type: str,
         bucket_start: int,
         now: str,
+        allow_shrink: bool = False,
     ) -> None:
+        """Rewrite one rollup bucket from the deal detail that is still stored.
+
+        Detail rows are trimmed after the retention window while the rollups are
+        the permanent record, so a bucket can legitimately hold more orders than
+        the detail still has. Recomputing such a bucket from the leftover detail
+        would silently shrink the account's lifetime profit, so a refresh that
+        would lower the order count is refused unless the caller says otherwise.
+        """
         seconds = 3600 if bucket_type == "hour" else 86400
-        connection.execute(
-            """
-            DELETE FROM mt_order_time_summaries
-            WHERE deployment_id = ? AND bucket_type = ? AND bucket_start = ?
-            """,
-            (deployment_id, bucket_type, bucket_start),
-        )
         rows = connection.execute(
             """
             SELECT d.user_id, h.deployment_id, h.account_login, h.account_server,
@@ -1248,6 +1250,30 @@ class SqliteStore:
             """,
             (deployment_id, bucket_start, bucket_start + seconds),
         ).fetchall()
+        if not allow_shrink:
+            existing = connection.execute(
+                """
+                SELECT COALESCE(SUM(order_count), 0) orders
+                FROM mt_order_time_summaries
+                WHERE deployment_id = ? AND bucket_type = ? AND bucket_start = ?
+                """,
+                (deployment_id, bucket_type, bucket_start),
+            ).fetchone()
+            fresh_orders = sum(int(row["order_count"] or 0) for row in rows)
+            if int(existing["orders"] or 0) > fresh_orders:
+                logger.warning(
+                    "skip refreshing %s bucket %s of %s: stored %s orders, detail only has %s",
+                    bucket_type, bucket_start, deployment_id,
+                    int(existing["orders"] or 0), fresh_orders,
+                )
+                return
+        connection.execute(
+            """
+            DELETE FROM mt_order_time_summaries
+            WHERE deployment_id = ? AND bucket_type = ? AND bucket_start = ?
+            """,
+            (deployment_id, bucket_type, bucket_start),
+        )
         for source in rows:
             self._upsert_order_summary_row(connection, {
                 **dict(source),
