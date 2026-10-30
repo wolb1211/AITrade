@@ -43,6 +43,32 @@ def _section(title: str) -> None:
 def main() -> None:
     store = _connect()
     with store._connect() as conn:  # noqa: SLF001 - read only inspection
+        _section('0. 汇总表（页面读的就是它）vs 原始成交')
+        rows = conn.execute(
+            """
+            SELECT h.deployment_id,
+                   COUNT(*) deals,
+                   ROUND(COALESCE(SUM(h.net_profit), 0), 2) deals_pnl,
+                   COALESCE((
+                       SELECT SUM(s.order_count) FROM mt_order_time_summaries s
+                       WHERE s.deployment_id = h.deployment_id AND s.bucket_type = 'day'
+                   ), 0) rollup_orders,
+                   ROUND(COALESCE((
+                       SELECT SUM(s.net_profit) FROM mt_order_time_summaries s
+                       WHERE s.deployment_id = h.deployment_id AND s.bucket_type = 'day'
+                   ), 0), 2) rollup_pnl
+            FROM mt5_history_deals h
+            WHERE LOWER(h.entry) IN ('out', 'out_by', 'inout')
+            GROUP BY h.deployment_id
+            """
+        ).fetchall()
+        for row in rows:
+            print(dict(row))
+            if int(row['deals'] or 0) != int(row['rollup_orders'] or 0):
+                print('   !! 不一致：汇总表偏了，运行 scripts/rebuild_order_summaries.py')
+        if not rows:
+            print('(没有成交数据)')
+
         _section('1. 重复成交（同 deal_id 出现在多个 server 名下）')
         rows = conn.execute(
             """

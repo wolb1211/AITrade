@@ -1368,6 +1368,115 @@ class SqliteStore:
                 ("order_time_summaries_backfilled", "1", "订单小时和每日汇总已初始化", now),
             )
 
+    def rebuild_order_time_summaries(
+        self,
+        *,
+        deployment_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Recompute the hourly/daily rollups straight from mt5_history_deals.
+
+        The rollups are written one bucket at a time as deals arrive, so a bucket
+        that was written while the raw rows were duplicated keeps its inflated
+        totals forever: nothing rewrites a bucket that stops receiving deals. The
+        client and admin dashboards read these rollups, which is why their order
+        count and P&L can stay wrong even after the raw rows are repaired.
+        """
+        now = utc_now_iso()
+        where = " WHERE deployment_id = ?" if deployment_id else ""
+        scope = " AND deployment_id = ?" if deployment_id else ""
+        params: tuple[Any, ...] = (deployment_id,) if deployment_id else ()
+        with self._connect() as connection:
+            before = connection.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(order_count), 0) orders,"
+                " COALESCE(SUM(net_profit), 0) pnl FROM mt_order_time_summaries" + where,
+                params,
+            ).fetchone()
+            connection.execute("DELETE FROM mt_order_time_summaries" + where, params)
+
+            buckets: set[tuple[str, str, int]] = set()
+            time_expr = "COALESCE(NULLIF(close_time, 0), deal_time)"
+            for bucket_type, seconds in (("hour", 3600), ("day", 86400)):
+                if isinstance(connection, MySqlConnection):
+                    bucket_expr = f"FLOOR(({time_expr} + 28800) / {seconds}) * {seconds} - 28800"
+                else:
+                    bucket_expr = f"CAST(({time_expr} + 28800) / {seconds} AS INTEGER) * {seconds} - 28800"
+                rows = connection.execute(
+                    f"""
+                    SELECT DISTINCT deployment_id, {bucket_expr} bucket_start
+                    FROM mt5_history_deals
+                    WHERE LOWER(entry) IN ('out', 'out_by', 'inout')
+                      AND {time_expr} > 0{scope}
+                    """,
+                    params,
+                ).fetchall()
+                buckets.update(
+                    (str(row["deployment_id"]), bucket_type, int(row["bucket_start"]))
+                    for row in rows
+                )
+            for bucket_deployment_id, bucket_type, bucket_start in buckets:
+                self._refresh_order_summary_bucket(
+                    connection,
+                    deployment_id=bucket_deployment_id,
+                    bucket_type=bucket_type,
+                    bucket_start=bucket_start,
+                    now=now,
+                )
+            after = connection.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(order_count), 0) orders,"
+                " COALESCE(SUM(net_profit), 0) pnl FROM mt_order_time_summaries" + where,
+                params,
+            ).fetchone()
+        return {
+            "deployment_id": deployment_id or "",
+            "buckets_rebuilt": len(buckets),
+            "before_rows": int(before["c"] or 0),
+            "before_orders": int(before["orders"] or 0),
+            "before_pnl": round(float(before["pnl"] or 0), 2),
+            "after_rows": int(after["c"] or 0),
+            "after_orders": int(after["orders"] or 0),
+            "after_pnl": round(float(after["pnl"] or 0), 2),
+        }
+
+    def rebuild_order_time_summaries_once(
+        self,
+        marker_key: str = "order_summaries_rebuilt_v2",
+    ) -> dict[str, Any] | None:
+        """Rebuild the rollups a single time, then remember that it is done."""
+        now = utc_now_iso()
+        with self._connect() as connection:
+            marker = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                (marker_key,),
+            ).fetchone()
+        if marker is not None:
+            return None
+        result = self.rebuild_order_time_summaries()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    remark = excluded.remark,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    marker_key,
+                    "1",
+                    f"订单汇总按原始成交重建，重建前 {result['before_orders']} 单 / "
+                    f"{result['before_pnl']}，重建后 {result['after_orders']} 单 / "
+                    f"{result['after_pnl']}",
+                    now,
+                ),
+            )
+        logger.info(
+            "order rollups rebuilt: orders %s -> %s, pnl %s -> %s",
+            result["before_orders"], result["after_orders"],
+            result["before_pnl"], result["after_pnl"],
+        )
+        return result
+
     def _ensure_detail_retention_defaults(self) -> None:
         """Move the detail retention settings onto the current defaults.
 
