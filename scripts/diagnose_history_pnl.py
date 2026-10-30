@@ -64,8 +64,11 @@ def main() -> None:
         ).fetchall()
         for row in rows:
             print(dict(row))
-            if int(row['deals'] or 0) != int(row['rollup_orders'] or 0):
-                print('   !! 不一致：汇总表偏了，运行 scripts/rebuild_order_summaries.py')
+            gap = int(row['rollup_orders'] or 0) - int(row['deals'] or 0)
+            if gap > 0:
+                print(f'   ({gap} 单已在明细清理中被删掉，汇总保留，属正常)')
+            elif gap < 0:
+                print('   !! 汇总比明细少：有成交没进汇总，需要重建')
         if not rows:
             print('(没有成交数据)')
 

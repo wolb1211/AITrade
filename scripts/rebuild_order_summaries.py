@@ -58,8 +58,10 @@ def main() -> None:
         ).fetchone()
     print('raw deals :', dict(raw))
     print('rollup day:', dict(rollup))
-    if int(raw['deals'] or 0) != int(rollup['orders'] or 0):
-        print('!! 数量不一致，汇总表就是页面数字偏大的原因')
+    print('注：明细只保留最近若干天，更早的单已经被清掉但汇总还在，')
+    print('    所以汇总单数比原始成交「多」是正常的，不代表汇总出错。')
+    if int(raw['deals'] or 0) < int(rollup['orders'] or 0):
+        print(f'    当前差值 {int(rollup["orders"] or 0) - int(raw["deals"] or 0)} 单 = 已被清理明细的历史单')
 
     result = store.rebuild_order_time_summaries(deployment_id=deployment_id)
     print()

@@ -99,12 +99,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.sleep(30 if first_pass else 60 * 60)
                 try:
                     await asyncio.to_thread(store.cleanup_expired_ai_response_cache)
-                    if first_pass:
-                        # The order rollups had drifted from the raw deals (a
-                        # bucket written while rows were duplicated keeps its
-                        # inflated totals), so rebuild them once, off the startup
-                        # path. Later syncs keep the buckets current.
-                        await asyncio.to_thread(store.rebuild_order_time_summaries_once)
                     if first_pass or datetime.now(timezone.utc).hour == 3:
                         await asyncio.to_thread(store.cleanup_expired_ai_usage_details)
                         await asyncio.to_thread(store.cleanup_expired_order_details)
