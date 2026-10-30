@@ -399,6 +399,7 @@ class Mt5HistoryOrder(StrictModel):
     deal_id: int | str | None = None
     symbol: str = Field(min_length=1, max_length=32)
     mt_type: int | str = 0
+    entry: str = Field(default="out", max_length=16)
     volume: float = Field(ge=0)
     open_price: float = Field(ge=0)
     close_price: float = Field(ge=0)

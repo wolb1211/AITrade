@@ -1255,6 +1255,71 @@ class SqliteStore:
                 "bucket_start": bucket_start,
             }, now=now)
 
+    def _dedupe_history_deals_by_server(self) -> None:
+        """Drop the empty-server copies left behind by server-less syncs.
+
+        Older EA builds reported deals without an account identity, so the same
+        deal could be stored once with ``account_server = ''`` and once with the
+        real server name. The conflict key cannot see across the two, which
+        doubles the order count and the profit. Only rows that have a twin with a
+        real server name are removed, so nothing is lost when the account really
+        has no server recorded.
+        """
+        now = utc_now_iso()
+        with self._connect() as connection:
+            marker = connection.execute(
+                "SELECT setting_value FROM system_settings WHERE setting_key = ?",
+                ("history_deals_server_dedupe",),
+            ).fetchone()
+            if marker is not None:
+                return
+            rows = connection.execute(
+                """
+                SELECT h.id, h.deployment_id
+                FROM mt5_history_deals h
+                WHERE h.account_server = ''
+                  AND EXISTS (
+                      SELECT 1
+                      FROM mt5_history_deals o
+                      WHERE o.account_login = h.account_login
+                        AND o.account_server != ''
+                        AND o.deal_id = h.deal_id
+                  )
+                """
+            ).fetchall()
+            deployment_ids = {str(row["deployment_id"]) for row in rows}
+            for row in rows:
+                connection.execute(
+                    "DELETE FROM mt5_history_deals WHERE id = ?", (row["id"],)
+                )
+            for deployment_id in deployment_ids:
+                # The daily/hourly rollups were built from the duplicated rows;
+                # drop them so the next sync rebuilds the affected buckets.
+                connection.execute(
+                    "DELETE FROM mt_order_time_summaries WHERE deployment_id = ?",
+                    (deployment_id,),
+                )
+            connection.execute(
+                """
+                INSERT INTO system_settings (setting_key, setting_value, remark, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    "history_deals_server_dedupe",
+                    "1",
+                    f"清理无服务器名的重复成交 {len(rows)} 条",
+                    now,
+                ),
+            )
+        if rows:
+            logger.info(
+                "removed %s duplicated mt5 history deals that had no account_server",
+                len(rows),
+            )
+
     def _backfill_order_time_summaries(self) -> None:
         now = utc_now_iso()
         with self._connect() as connection:
@@ -4464,6 +4529,45 @@ class SqliteStore:
             ),
         )
 
+    def _history_account_server(
+        self,
+        connection: sqlite3.Connection | MySqlConnection,
+        *,
+        deployment_id: str,
+        account_login: str,
+    ) -> str:
+        """Return the server name already stored for this account.
+
+        Deal rows are de-duplicated on (login, server, deal_id). When the EA
+        syncs without an account identity the row lands with an empty server,
+        which no longer matches the copy written with a real server name, so the
+        same deal gets inserted twice: the order count doubles and the profit is
+        summed twice. Reusing the known server name keeps both syncs on one row.
+        """
+        row = connection.execute(
+            """
+            SELECT account_server FROM mt5_history_deals
+            WHERE deployment_id = ? AND account_login = ? AND account_server != ''
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (deployment_id, account_login),
+        ).fetchone()
+        if row is not None and row["account_server"]:
+            return str(row["account_server"])
+        row = connection.execute(
+            """
+            SELECT account_server FROM mt5_history_deals
+            WHERE account_login = ? AND account_server != ''
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (account_login,),
+        ).fetchone()
+        if row is not None and row["account_server"]:
+            return str(row["account_server"])
+        return ""
+
     def sync_mt5_history_deals(
         self,
         deployment_id: str,
@@ -4481,6 +4585,11 @@ class SqliteStore:
         affected_buckets: set[tuple[str, str, int]] = set()
 
         with self._connect() as connection:
+            account_server = account_server or self._history_account_server(
+                connection,
+                deployment_id=deployment_id,
+                account_login=account_login,
+            )
             for order in orders:
                 order_id = str(order.get("order_id") or order.get("deal_id") or "").strip()
                 if not order_id:
@@ -4495,7 +4604,7 @@ class SqliteStore:
                 if archived is not None:
                     archived_count += 1
                     continue
-                entry = "out"
+                entry = str(order.get("entry") or "out").strip().lower() or "out"
                 net_profit = _deal_net_profit(order)
                 if _is_profit_deal_entry(entry):
                     profit_deals_count += 1
@@ -8310,6 +8419,7 @@ class MySQLStore(SqliteStore):
             self._backfill_decision_actions,
             self._backfill_decision_summaries,
             self._backfill_regime_analysis_counts,
+            self._dedupe_history_deals_by_server,
         ):
             try:
                 backfill()
