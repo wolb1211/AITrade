@@ -1972,7 +1972,7 @@ class SqliteStore:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "ofs_gl_arbitrage_v2", "GL_ARBITRAGE_V2", "GL对冲套利策略 V2", "GainLab", "2.0", "active",
+                "ofs_gl_arbitrage_v2", "GL_ARBITRAGE_V2", "GL对冲套利策略V2", "GainLab", "2.0", "active",
                 "单商品对冲套利 V2：在 V1 的双向持仓与减带亏基础上，改为双均线判断，"
                 "并新增反转价差/ATR 判定、分级加仓与亏损携带。开平仓同样由 EA 本地执行。",
                 "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
@@ -9121,7 +9121,7 @@ class MySQLStore(SqliteStore):
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    "ofs_gl_arbitrage_v2", "GL_ARBITRAGE_V2", "GL对冲套利策略 V2", "GainLab", "2.0", "active",
+                    "ofs_gl_arbitrage_v2", "GL_ARBITRAGE_V2", "GL对冲套利策略V2", "GainLab", "2.0", "active",
                     "单商品对冲套利 V2：在 V1 的双向持仓与减带亏基础上，改为双均线判断，"
                     "并新增反转价差/ATR 判定、分级加仓与亏损携带。开平仓同样由 EA 本地执行。",
                     "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",

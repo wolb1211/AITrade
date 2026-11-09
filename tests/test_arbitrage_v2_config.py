@@ -79,7 +79,7 @@ def test_v2_strategy_is_seeded(tmp_path: Path) -> None:
         official = store.get_official_ai_strategy("GL_ARBITRAGE_V2")
 
         assert official is not None
-        assert official["name"] == "GL对冲套利策略 V2"
+        assert official["name"] == "GL对冲套利策略V2"
         assert official["status"] == "active"
         stored = official["default_config"]
         assert set(V2_KEYS) <= set(stored)
