@@ -68,7 +68,12 @@ from app.services.regime_service import (
     timeframe_features,
 )
 from app.services.screenshot_preview import ScreenshotError, load_preview, prepare_screenshot
-from app.store import ARBITRAGE_EA_CONFIG_DEFAULTS, SqliteStore, admin_period_range
+from app.store import (
+    ARBITRAGE_EA_CONFIG_DEFAULTS,
+    ARBITRAGE_V2_EA_CONFIG_DEFAULTS,
+    SqliteStore,
+    admin_period_range,
+)
 from app.strategies import turtle_agent
 from app.strategies.pending_orders import cancel_stale_pending_orders
 
@@ -425,13 +430,14 @@ _INIT_CONFIG_HIDDEN_MARKERS = ("key", "secret", "password", "token", "authorizat
 # EAs see exactly what they saw before.
 _EA_SERVER_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
     "GL_ARBITRAGE_V1": tuple(ARBITRAGE_EA_CONFIG_DEFAULTS),
+    "GL_ARBITRAGE_V2": tuple(ARBITRAGE_V2_EA_CONFIG_DEFAULTS),
 }
 _EA_SERVER_CONFIG_CODES = frozenset(_EA_SERVER_CONFIG_KEYS)
 
 # Strategies whose EA asks for a trend read. Only these are told which timeframes
 # to upload; every other strategy keeps the historical empty list, so no existing
 # EA starts sending bars it has no reason to send.
-_REGIME_STRATEGY_CODES = frozenset({"GL_ARBITRAGE_V1"})
+_REGIME_STRATEGY_CODES = frozenset({"GL_ARBITRAGE_V1", "GL_ARBITRAGE_V2"})
 
 
 def _mt5_init_config(

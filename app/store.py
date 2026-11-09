@@ -51,6 +51,35 @@ ARBITRAGE_EA_CONFIG_DEFAULTS: dict[str, Any] = {
     "maPeriod": 10,  # ma 周期
 }
 
+# GL_ARBITRAGE_V2 沿用 V1 的交易逻辑，参数上换成两条均线（maPeriod1 /
+# maPeriod2）并新增反转与分级加仓相关的一组输入。这里同样保持 EA 的原始
+# input 名字，不做任何改名。
+ARBITRAGE_V2_EA_CONFIG_DEFAULTS: dict[str, Any] = {
+    "fixed_lot": 0.01,  # 初始下单手数（用户可在客户端修改）
+    "addMax": 30,  # 单向最多单数
+    "addNum": 1,  # 加仓系数：初始手数 × (1 + 当前单数 × 系数)
+    "carryStart": 10,  # 盈带亏起始单数，0 = 不带单
+    "carryWin": 500.0,  # 盈带亏留利润（每单）
+    "maxLoss": 0,  # 单向止损金额
+    "step": 0.0004,  # 加仓间隔
+    "stopWin": 0.0006,  # 止盈触发值
+    "stopMove": 0.0003,  # 移动止损值
+    "orderLoss": 0.0328,  # 单笔亏损阈值
+    "addOrderTotal": 6,  # 最多加仓次数
+    "addOrderMultiple": 2.0,  # 加仓手数倍数
+    "addOrderNum": 0.3,  # 加仓手数
+    "reversalDiff": 3.0,  # 反转判定价差
+    "reversalAtr": 1.6,  # 反转判定 ATR 倍数
+    "carryLose": 0.1,  # 减带亏阈值
+    "maPeriod1": 20,  # 均线周期 1
+    "maPeriod2": 60,  # 均线周期 2
+}
+
+ARBITRAGE_EA_CONFIG_DEFAULTS_BY_CODE: dict[str, dict[str, Any]] = {
+    "GL_ARBITRAGE_V1": ARBITRAGE_EA_CONFIG_DEFAULTS,
+    "GL_ARBITRAGE_V2": ARBITRAGE_V2_EA_CONFIG_DEFAULTS,
+}
+
 # Config keys that used to configure the regime endpoint and are now hardcoded in
 # app/services/regime_service.py. They are dropped from stored rows so the init
 # response keeps describing only settings that actually do something.
@@ -61,27 +90,47 @@ OBSOLETE_STRATEGY_CONFIG_KEYS: tuple[str, ...] = (
 )
 
 
-def arbitrage_ea_config_defaults() -> dict[str, Any]:
-    """Fresh copy of the GL_ARBITRAGE_V1 seed config."""
+def arbitrage_strategy_code(code: str | None) -> str:
+    """Normalise a strategy code onto one of the arbitrage versions."""
+    normalized = str(code or "").strip().upper()
+    if normalized in ARBITRAGE_EA_CONFIG_DEFAULTS_BY_CODE:
+        return normalized
+    return "GL_ARBITRAGE_V1"
+
+
+def arbitrage_ea_config_defaults(code: str = "GL_ARBITRAGE_V1") -> dict[str, Any]:
+    """Fresh copy of the arbitrage seed config for one version."""
     return {
         "position_sizing_mode": "fixed",
-        **ARBITRAGE_EA_CONFIG_DEFAULTS,
+        **ARBITRAGE_EA_CONFIG_DEFAULTS_BY_CODE[arbitrage_strategy_code(code)],
     }
 
 
-def backfill_arbitrage_config(config: Any) -> dict[str, Any]:
+def backfill_arbitrage_config(config: Any, code: str = "GL_ARBITRAGE_V1") -> dict[str, Any]:
     """Add any missing arbitrage default to a stored config.
 
     Only missing keys are filled, so a value an admin already tuned is never
     overwritten. The seed uses INSERT IGNORE, which leaves existing rows alone,
     so this is what brings a strategy row created before a new setting existed
     up to date.
+
+    Keys that belong to the other version are dropped: V2 has no maStart while V1
+    has no maPeriod1, and shipping the other version's inputs would describe
+    settings that EA cannot read.
     """
+    normalized = arbitrage_strategy_code(code)
     merged = dict(config) if isinstance(config, dict) else {}
-    for key, value in arbitrage_ea_config_defaults().items():
+    for key, value in arbitrage_ea_config_defaults(normalized).items():
         merged.setdefault(key, value)
     for key in OBSOLETE_STRATEGY_CONFIG_KEYS:
         merged.pop(key, None)
+    own_keys = ARBITRAGE_EA_CONFIG_DEFAULTS_BY_CODE[normalized]
+    for other_code, other_keys in ARBITRAGE_EA_CONFIG_DEFAULTS_BY_CODE.items():
+        if other_code == normalized:
+            continue
+        for key in other_keys:
+            if key not in own_keys:
+                merged.pop(key, None)
     return merged
 
 
@@ -1000,25 +1049,26 @@ class SqliteStore:
         live server. Only missing keys are written, so admin tuned values stay.
         """
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT id, default_config_json FROM official_ai_strategies WHERE code = ?",
-                ("GL_ARBITRAGE_V1",),
-            ).fetchone()
-            if not row:
-                return
-            try:
-                current = json.loads(row["default_config_json"] or "{}")
-            except (TypeError, ValueError):
-                current = {}
-            if not isinstance(current, dict):
-                current = {}
-            merged = backfill_arbitrage_config(current)
-            if merged == current:
-                return
-            connection.execute(
-                "UPDATE official_ai_strategies SET default_config_json = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(merged, ensure_ascii=False), utc_now_iso(), row["id"]),
-            )
+            for code in ARBITRAGE_EA_CONFIG_DEFAULTS_BY_CODE:
+                row = connection.execute(
+                    "SELECT id, default_config_json FROM official_ai_strategies WHERE code = ?",
+                    (code,),
+                ).fetchone()
+                if not row:
+                    continue
+                try:
+                    current = json.loads(row["default_config_json"] or "{}")
+                except (TypeError, ValueError):
+                    current = {}
+                if not isinstance(current, dict):
+                    current = {}
+                merged = backfill_arbitrage_config(current, code)
+                if merged == current:
+                    continue
+                connection.execute(
+                    "UPDATE official_ai_strategies SET default_config_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(merged, ensure_ascii=False), utc_now_iso(), row["id"]),
+                )
 
     def _migrate_sqlite_user_id(self, connection: sqlite3.Connection) -> None:
         table = connection.execute(
@@ -1910,6 +1960,26 @@ class SqliteStore:
                 "kline", 200, "kline", 200, "bar", 1,
                 json.dumps(arbitrage_ea_config_defaults(), ensure_ascii=False),
                 1, 30, now, now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO official_ai_strategies (
+                id, code, name, badge, version, status, summary,
+                open_logic, position_logic, open_data_type, open_kline_count,
+                position_data_type, position_kline_count, call_mode, call_value,
+                default_config_json, enabled, sort, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ofs_gl_arbitrage_v2", "GL_ARBITRAGE_V2", "GL对冲套利策略 V2", "GainLab", "2.0", "active",
+                "单商品对冲套利 V2：在 V1 的双向持仓与减带亏基础上，改为双均线判断，"
+                "并新增反转价差/ATR 判定、分级加仓与亏损携带。开平仓同样由 EA 本地执行。",
+                "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
+                "由 EA 本地执行：按双均线与反转阈值平掉盈利腿，保留亏损腿并按规则逐步减仓。",
+                "kline", 200, "kline", 200, "bar", 1,
+                json.dumps(arbitrage_ea_config_defaults("GL_ARBITRAGE_V2"), ensure_ascii=False),
+                1, 31, now, now,
             ),
         )
 
@@ -9039,6 +9109,26 @@ class MySQLStore(SqliteStore):
                     "kline", 200, "kline", 200, "bar", 1,
                     json.dumps(arbitrage_ea_config_defaults(), ensure_ascii=False),
                     1, 30, now, now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT IGNORE INTO official_ai_strategies (
+                    id, code, name, badge, version, status, summary,
+                    open_logic, position_logic, open_data_type, open_kline_count,
+                    position_data_type, position_kline_count, call_mode, call_value,
+                    default_config_json, enabled, sort, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    "ofs_gl_arbitrage_v2", "GL_ARBITRAGE_V2", "GL对冲套利策略 V2", "GainLab", "2.0", "active",
+                    "单商品对冲套利 V2：在 V1 的双向持仓与减带亏基础上，改为双均线判断，"
+                    "并新增反转价差/ATR 判定、分级加仓与亏损携带。开平仓同样由 EA 本地执行。",
+                    "由 EA 本地执行：跟随价格方向开多或开空，双向建仓形成对冲。",
+                    "由 EA 本地执行：按双均线与反转阈值平掉盈利腿，保留亏损腿并按规则逐步减仓。",
+                    "kline", 200, "kline", 200, "bar", 1,
+                    json.dumps(arbitrage_ea_config_defaults("GL_ARBITRAGE_V2"), ensure_ascii=False),
+                    1, 31, now, now,
                 ),
             )
 
